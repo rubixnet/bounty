@@ -2,3 +2,11 @@
 //! hash-chain math, used by the daemon now and by the server from Step 4.
 //!
 //! This crate must stay free of OS, I/O and async dependencies.
+
+mod event;
+mod validate;
+
+pub use event::{
+    EndReason, EventType, HarnessId, MetricsOnly, NetworkClass, SCHEMA_VERSION, TractionEvent,
+};
+pub use validate::{EventError, ValidationError};
