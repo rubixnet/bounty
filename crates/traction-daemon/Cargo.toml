@@ -1,0 +1,11 @@
+[package]
+name = "traction-daemon"
+description = "Traction native daemon: Local Ingestion Bus, single-instance lock and SQLite WAL persistence."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# `traction-core.workspace = true` is added by the first ticket that uses it.
+[dependencies]

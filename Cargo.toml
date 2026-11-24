@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/traction-core", "crates/traction-daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+rust-version = "1.100.0"
+publish = false
+
+# Shared dependency versions are declared once here; member crates use
+# `<dep>.workspace = true`. Cargo warns on unused (workspace) dependencies,
+# so entries (including `traction-core = { path = "crates/traction-core" }`)
+# are added by the first ticket that uses them.
+[workspace.dependencies]
