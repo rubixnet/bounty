@@ -4,13 +4,13 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `TractionEvent` has every protocol field: `schema_version` (currently 1), `event_id`, `timestamp_ms`, `harness_id`, `session_id`, `parent_orchestrator_id` (optional), `event_type`, `end_reason` (optional), `cwd`, `project_id`, `model_id` (optional), `network_class`, `metrics_only`.
-- [ ] `harness_id`, `event_type`, `network_class` and `end_reason` are closed enums that use the exact protocol wire spellings.
-- [ ] `metrics_only` is a typed struct whose fields are all optional: `prompt_char_len`, `repo_symbol_hits`, `has_stacktrace`, `tool_name`, `exit_code`, `diff_lines_delta`.
-- [ ] Unknown fields are rejected both at the top level (e.g. `"prompt": "SENTINEL"`) and inside `metrics_only` (e.g. `"stdout"`).
-- [ ] A single public validation step enforces:
+- [x] `TractionEvent` has every protocol field: `schema_version` (currently 1), `event_id`, `timestamp_ms`, `harness_id`, `session_id`, `parent_orchestrator_id` (optional), `event_type`, `end_reason` (optional), `cwd`, `project_id`, `model_id` (optional), `network_class`, `metrics_only`.
+- [x] `harness_id`, `event_type`, `network_class` and `end_reason` are closed enums that use the exact protocol wire spellings.
+- [x] `metrics_only` is a typed struct whose fields are all optional: `prompt_char_len`, `repo_symbol_hits`, `has_stacktrace`, `tool_name`, `exit_code`, `diff_lines_delta`.
+- [x] Unknown fields are rejected both at the top level (e.g. `"prompt": "SENTINEL"`) and inside `metrics_only` (e.g. `"stdout"`).
+- [x] A single public validation step enforces:
   - `end_reason` is required on `TURN_END` and rejected on every other event type;
   - `tool_name` and `model_id` stay within a short length and the safe identifier character set;
   - `session_id` is bounded;
@@ -18,7 +18,7 @@
   - `project_id` matches `git:<64 hex>` or `dir:<64 hex>`;
   - `event_id` is a valid UUID;
   - numbers are integers only (no floats).
-- [ ] Tests use only the crate's public API:
+- [x] Tests use only the crate's public API:
   - every `event_type` and `harness_id` round-trips through serialize and deserialize;
   - each rejection case above has its own failing test.
-- [ ] Code and tests use glossary terms: Traction Event, Harness, Adapter, Project.
+- [x] Code and tests use glossary terms: Traction Event, Harness, Adapter, Project.
