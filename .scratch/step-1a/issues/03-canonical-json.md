@@ -4,11 +4,11 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Golden-bytes test: the `docs/protocol.md` example event produces an exact, checked-in canonical byte string.
-- [ ] Nested key order, explicit `null` for absent optional fields and the absence of whitespace are all asserted on bytes.
-- [ ] Building equal events with fields set in different orders gives identical bytes.
-- [ ] Serializing an event to canonical JSON and deserializing it back gives the original event, for every `event_type`.
-- [ ] Float values are rejected or cannot be represented.
-- [ ] No hashing is implemented (that is Step 3).
+- [x] Golden-bytes test: the `docs/protocol.md` example event produces an exact, checked-in canonical byte string.
+- [x] Nested key order, explicit `null` for absent optional fields and the absence of whitespace are all asserted on bytes.
+- [x] Building equal events with fields set in different orders gives identical bytes.
+- [x] Serializing an event to canonical JSON and deserializing it back gives the original event, for every `event_type`.
+- [x] Float values are rejected or cannot be represented.
+- [x] No hashing is implemented (that is Step 3).
