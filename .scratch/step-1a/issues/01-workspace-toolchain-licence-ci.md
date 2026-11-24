@@ -4,12 +4,12 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Rust is installed with `rustup`. `rust-toolchain.toml` pins an exact stable version (not the `stable` channel name) with the `rustfmt` and `clippy` components.
-- [ ] The repo root has the full AGPLv3 `LICENSE` text, and both crates declare `license = "AGPL-3.0-only"`.
-- [ ] The workspace lists only `traction-core` and `traction-daemon`, and shared dependency versions are declared once at the workspace level.
-- [ ] `traction-core` has no OS, I/O or async dependencies.
-- [ ] The CI workflow runs on push and pull request with a matrix of `ubuntu-latest`, `macos-latest` and `windows-latest`. It runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`.
-- [ ] All three commands pass locally.
-- [ ] No GitHub repo is created and nothing is pushed.
+- [x] Rust is installed with `rustup`. `rust-toolchain.toml` pins an exact stable version (not the `stable` channel name) with the `rustfmt` and `clippy` components.
+- [x] The repo root has the full AGPLv3 `LICENSE` text, and both crates declare `license = "AGPL-3.0-only"`.
+- [x] The workspace lists only `traction-core` and `traction-daemon`, and shared dependency versions are declared once at the workspace level.
+- [x] `traction-core` has no OS, I/O or async dependencies.
+- [x] The CI workflow runs on push and pull request with a matrix of `ubuntu-latest`, `macos-latest` and `windows-latest`. It runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`.
+- [x] All three commands pass locally.
+- [x] No GitHub repo is created and nothing is pushed.
