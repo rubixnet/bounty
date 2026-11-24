@@ -12,7 +12,6 @@
 //! `serde_json::Map` being a `BTreeMap`, because any crate in the graph
 //! enabling serde_json's `preserve_order` feature would silently change it.
 
-use serde::Serialize;
 use serde_json::Value;
 
 use crate::TractionEvent;
@@ -22,8 +21,6 @@ use crate::TractionEvent;
 pub enum CanonicalJsonError {
     /// The value contains a floating-point number.
     Float,
-    /// The value cannot be represented as JSON (e.g. a map with non-string keys).
-    Unrepresentable,
 }
 
 impl CanonicalJsonError {
@@ -31,7 +28,6 @@ impl CanonicalJsonError {
     pub fn code(self) -> &'static str {
         match self {
             CanonicalJsonError::Float => "canonical_json_float",
-            CanonicalJsonError::Unrepresentable => "canonical_json_unrepresentable",
         }
     }
 }
@@ -44,20 +40,26 @@ impl std::fmt::Display for CanonicalJsonError {
 
 impl std::error::Error for CanonicalJsonError {}
 
-/// Serialize `value` to canonical JSON bytes.
-pub fn to_canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CanonicalJsonError> {
-    let value = serde_json::to_value(value).map_err(|_| CanonicalJsonError::Unrepresentable)?;
+/// Write a JSON value as canonical JSON bytes, rejecting any float.
+///
+/// This takes a `serde_json::Value` rather than any `Serialize` type on
+/// purpose: `serde_json` turns non-finite floats (NaN, infinity) into `null`
+/// while serializing, which would hide a float from this check. A `Value`
+/// cannot hold a non-finite float, and finite ones are rejected here. Types
+/// fed into canonical JSON must therefore not contain `f32`/`f64` fields.
+pub fn canonical_json(value: &Value) -> Result<Vec<u8>, CanonicalJsonError> {
     let mut out = Vec::new();
-    write_value(&value, &mut out)?;
+    write_value(value, &mut out)?;
     Ok(out)
 }
 
 impl TractionEvent {
     /// This Traction Event's canonical JSON bytes.
     pub fn to_canonical_json(&self) -> Vec<u8> {
-        // A Traction Event has only string keys, integers, booleans, strings
-        // and nulls, so canonical serialization cannot fail.
-        to_canonical_json(self).expect("a Traction Event is always canonical-JSON representable")
+        // A Traction Event has no float fields (only string keys, integers,
+        // booleans, strings and nulls), so this cannot fail.
+        let value = serde_json::to_value(self).expect("a Traction Event always serializes");
+        canonical_json(&value).expect("a Traction Event has no floats")
     }
 }
 
