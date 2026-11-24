@@ -203,8 +203,263 @@ fn rejects_payloads_that_are_not_json() {
 }
 
 #[test]
+fn rejects_duplicate_keys() {
+    let wire = protocol_example().to_string();
+    let duplicated = wire.replacen('{', r#"{"session_id":"first","#, 1);
+    assert_eq!(
+        TractionEvent::from_json(duplicated.as_bytes()),
+        Err(EventError::Malformed)
+    );
+}
+
+#[test]
 fn rejection_codes_never_echo_the_payload() {
     let error = parse(&with("prompt", json!("SENTINEL"))).unwrap_err();
     assert!(!error.to_string().contains("SENTINEL"));
     assert!(!format!("{error:?}").contains("SENTINEL"));
+}
+
+fn assert_invalid(wire: &Value, expected: ValidationError) {
+    assert_eq!(parse(wire), Err(EventError::Invalid(expected)));
+}
+
+#[test]
+fn rejects_turn_end_without_end_reason() {
+    assert_invalid(
+        &with("end_reason", Value::Null),
+        ValidationError::MissingEndReason,
+    );
+}
+
+#[test]
+fn rejects_end_reason_on_every_non_turn_end_event() {
+    for event_type in EventType::ALL {
+        if event_type == EventType::TurnEnd {
+            continue;
+        }
+        let spelling = serde_json::to_value(event_type).unwrap();
+        assert_invalid(
+            &with("event_type", spelling),
+            ValidationError::UnexpectedEndReason,
+        );
+    }
+}
+
+#[test]
+fn rejects_unsupported_schema_version() {
+    assert_invalid(
+        &with("schema_version", json!(2)),
+        ValidationError::UnsupportedSchemaVersion,
+    );
+    assert_invalid(
+        &with("schema_version", json!(0)),
+        ValidationError::UnsupportedSchemaVersion,
+    );
+}
+
+#[test]
+fn accepts_uuid_event_ids_in_either_case() {
+    assert!(
+        parse(&with(
+            "event_id",
+            json!("019A7C2E-8B4D-7000-8000-00000000000F")
+        ))
+        .is_ok()
+    );
+    assert!(
+        parse(&with(
+            "event_id",
+            json!("6f1c1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b")
+        ))
+        .is_ok()
+    );
+}
+
+#[test]
+fn rejects_malformed_event_ids() {
+    for bad in [
+        "",
+        "not-a-uuid",
+        "019a7c2e8b4d70008000000000000001",
+        "019a7c2e-8b4d-7000-8000-00000000000",
+        "019a7c2e-8b4d-7000-8000-0000000000011",
+        "019a7c2e-8b4d-7000-8000-00000000000g",
+        "{019a7c2e-8b4d-7000-8000-000000000001}",
+        "019a7c2e_8b4d_7000_8000_000000000001",
+    ] {
+        assert_invalid(
+            &with("event_id", json!(bad)),
+            ValidationError::InvalidEventId,
+        );
+    }
+}
+
+#[test]
+fn accepts_both_project_id_forms() {
+    let hex = "a".repeat(64);
+    assert!(parse(&with("project_id", json!(format!("git:{hex}")))).is_ok());
+    assert!(parse(&with("project_id", json!(format!("dir:{hex}")))).is_ok());
+}
+
+#[test]
+fn rejects_malformed_project_ids() {
+    let hex = "0123456789abcdef".repeat(4);
+    for bad in [
+        String::new(),
+        hex.clone(),
+        format!("svn:{hex}"),
+        format!("git:{}", &hex[..63]),
+        format!("git:{hex}0"),
+        format!("git:{}", hex.to_uppercase()),
+        format!("dir:{}g", &hex[..63]),
+        format!("GIT:{hex}"),
+        format!("git: {}", &hex[..63]),
+        "dir:/home/teen/my-game".to_owned(),
+    ] {
+        assert_invalid(
+            &with("project_id", json!(bad)),
+            ValidationError::InvalidProjectId,
+        );
+    }
+}
+
+#[test]
+fn accepts_absolute_cwds_on_every_os() {
+    for good in [
+        "/",
+        "/home/teen/code/my game",
+        "C:\\Users\\teen\\code\\my-game",
+        "d:/code/my-game",
+        "\\\\server\\share\\my-game",
+    ] {
+        assert!(parse(&with("cwd", json!(good))).is_ok(), "{good}");
+    }
+}
+
+#[test]
+fn rejects_relative_cwds() {
+    for bad in [
+        "",
+        "code/my-game",
+        "./my-game",
+        "~/code/my-game",
+        "C:my-game",
+        "\\code",
+    ] {
+        assert_invalid(&with("cwd", json!(bad)), ValidationError::InvalidCwd);
+    }
+}
+
+#[test]
+fn rejects_over_long_or_control_character_cwds() {
+    let long = format!("/{}", "a".repeat(4096));
+    assert_invalid(&with("cwd", json!(long)), ValidationError::InvalidCwd);
+    assert_invalid(
+        &with("cwd", json!("/home/teen\nSENTINEL")),
+        ValidationError::InvalidCwd,
+    );
+}
+
+#[test]
+fn accepts_realistic_session_ids() {
+    for good in [
+        "5f3c8e2a-1b2c-4d3e-9f4a-0b1c2d3e4f5a",
+        "ses_7a8b9c0d1e2f3a4b5c6d7e8f",
+        "rollout-2026-11-25T10-00-00",
+    ] {
+        assert!(parse(&with("session_id", json!(good))).is_ok(), "{good}");
+    }
+}
+
+#[test]
+fn rejects_unbounded_or_unsafe_session_ids() {
+    for bad in [
+        String::new(),
+        "s".repeat(129),
+        "fix the bug in main.rs".to_owned(),
+        "session\nSENTINEL".to_owned(),
+        "../../etc/passwd".to_owned(),
+    ] {
+        assert_invalid(
+            &with("session_id", json!(bad)),
+            ValidationError::InvalidSessionId,
+        );
+    }
+}
+
+#[test]
+fn rejects_unbounded_or_unsafe_parent_orchestrator_ids() {
+    for bad in [String::new(), "p".repeat(129), "please refactor".to_owned()] {
+        assert_invalid(
+            &with("parent_orchestrator_id", json!(bad)),
+            ValidationError::InvalidParentOrchestratorId,
+        );
+    }
+}
+
+#[test]
+fn accepts_realistic_tool_names_and_model_ids() {
+    for tool in ["Bash", "mcp__github__create_issue", "apply_patch", "read"] {
+        assert!(
+            parse(&with_metric("tool_name", json!(tool))).is_ok(),
+            "{tool}"
+        );
+    }
+    for model in [
+        "claude-opus-4-1-20250805",
+        "anthropic/claude-sonnet-4.5",
+        "ollama/qwen2.5-coder:7b",
+        "gpt-5-codex",
+    ] {
+        assert!(parse(&with("model_id", json!(model))).is_ok(), "{model}");
+    }
+}
+
+#[test]
+fn rejects_over_long_tool_names() {
+    assert_invalid(
+        &with_metric("tool_name", json!("t".repeat(65))),
+        ValidationError::InvalidToolName,
+    );
+}
+
+#[test]
+fn rejects_whitespace_laden_or_unsafe_tool_names() {
+    for bad in [
+        "",
+        "Bash ",
+        "rm -rf /",
+        "Bash\tSENTINEL",
+        "Bash\nSENTINEL",
+        "tool\"x",
+    ] {
+        assert_invalid(
+            &with_metric("tool_name", json!(bad)),
+            ValidationError::InvalidToolName,
+        );
+    }
+}
+
+#[test]
+fn rejects_over_long_model_ids() {
+    assert_invalid(
+        &with("model_id", json!("m".repeat(65))),
+        ValidationError::InvalidModelId,
+    );
+}
+
+#[test]
+fn rejects_whitespace_laden_or_unsafe_model_ids() {
+    for bad in [
+        "",
+        " claude",
+        "claude  opus",
+        "claude\nSENTINEL",
+        "model@host",
+    ] {
+        assert_invalid(
+            &with("model_id", json!(bad)),
+            ValidationError::InvalidModelId,
+        );
+    }
 }

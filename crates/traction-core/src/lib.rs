@@ -9,4 +9,6 @@ mod validate;
 pub use event::{
     EndReason, EventType, HarnessId, MetricsOnly, NetworkClass, SCHEMA_VERSION, TractionEvent,
 };
-pub use validate::{EventError, ValidationError};
+pub use validate::{
+    EventError, MAX_CWD_LEN, MAX_IDENTIFIER_LEN, MAX_SESSION_ID_LEN, ValidationError,
+};
