@@ -1,0 +1,65 @@
+# Sub-Step Roadmap
+
+Each Step in `docs/steps.md` is split into sub-steps sized for one fresh session (under ~150k tokens). Run every sub-step the same way:
+
+1. Start a fresh session (`/clear`).
+2. `/grill-with-docs Step Nx from docs/roadmap.md` (skip this for 1a and 1b, which were grilled on 2026-11-24).
+3. `/to-spec` writes `.scratch/step-Nx/spec.md`.
+4. `/to-tickets` writes `.scratch/step-Nx/issues/NN-*.md`.
+5. `/clear`, then run `/implement .scratch/step-Nx/issues/NN-*.md` once per ticket, clearing context between tickets.
+6. At the end of the sub-step, run `/code-review` and tick its gate items. At the end of a Step, get human sign-off before moving on.
+
+The gates below are excerpts from `docs/steps.md`. A Step is complete only when every gate item passes on all 3 OSes in CI.
+
+## Step 1: Passive daemon and the 3 Harnesses
+
+| Sub-step | Scope | Gate items it owns |
+|---|---|---|
+| **1a: Foundation** | Install Rust (`rustup`, pinned in `rust-toolchain.toml`), AGPLv3 `LICENSE`, Cargo workspace, private GitHub repo with a 3-OS CI matrix (create it only after the human confirms). `traction-core`: `TractionEvent`, canonical JSON. `traction-daemon`: single-instance lock, SQLite WAL with a single writer, ingestion bus (UDS + `127.0.0.1:41937`, bearer token, Host/Origin checks). | Ingestion bus rejects bad token, Host and Origin. No raw text in SQLite. |
+| **1b: Project Router** | Project root resolution (git root → nearest marker → session start folder) and `--git-common-dir` worktree collapse without `index.lock`. `dir:`/`git:` IDs and migration. Folder exclusions. File watcher emitting `FILE_MUTATION` events. `.tractionignore`. | 3 repos + 1 worktree + 2 non-Git folders route correctly. `git init` migrates history. Hand edits emit `FILE_MUTATION`. |
+| **1c: Claude Code Adapter** | Install the `claude` CLI. Installer merges HTTP hooks (`timeout: 1`, `onFailure: continue`, token via `allowedEnvVars`, never `WorktreeCreate`) with a version check. `/stop-track` and `/resume-track` blocking. JSONL tailer fallback with offsets persisted. Fixtures from real runs that use synthetic prompts. | Stopped daemon doesn't block Claude. `/stop-track` halts recording. Restart resumes from saved offsets. |
+| **1d: OpenCode + Codex Adapters** | Zero-dependency `@traction/opencode-plugin` (`plugin` and `plugins` keys, 15 ms timeout, `pnpm test/typecheck`). Read-only `time_updated` poller that runs only while `opencode` is alive. Codex rollout tailer (event mapping, Windows share flags, Desktop vs CLI detection, never `*.sqlite`). Confirm the Codex error record type. | Zero duplicates across all 3 sets of fixtures. Stopped daemon doesn't block OpenCode. |
+| **1e: Controls, Auto-start, Budget** | Tray (Pause 30m/2h/Resume), hotkey, `traction pause` / `traction resume`. User-space auto-start (HKCU Run, LaunchAgent, `systemd --user`), never a Screen Recording prompt. Measure RSS and CPU in CI; split the tray into a helper process if it pushes RSS over budget. | Tray Pause halts recording. Idle RSS <15 MB, CPU <1%. |
+
+## Step 2: OS presence, Three Clocks, struggle signals
+
+| Sub-step | Scope |
+|---|---|
+| **2a: OS Presence** | Foreground window categories (without storing raw private window titles), idle timers, Wayland degradation, a way to map the focused IDE to its Project. Resolve the macOS Input Monitoring permission question. |
+| **2b: Injected HID + Cadence** | Detection of `LLKHF_INJECTED`, synthetic `CGEventSource` input and evdev/uinput input. Entropy check for robotic timing. Fixture showing jiggler time routed to Unverified Autonomous Time. |
+| **2c: Three-Clock Aggregator** | 60-second Work Buckets, the >90 s rule, `STOP_FAILURE`/`SESSION_END` close open timers, simulation test (10m agent / 0m human). |
+| **2d: Struggle Signals** | Prompt specificity (repo symbol index), friction loops, rolling 30-day comfort baseline. Gate: the verified-struggle simulation. |
+
+## Step 3: Vault, hash-chain, review and redaction
+
+| Sub-step | Scope |
+|---|---|
+| **3a: Hash-Chain in core** | Salted frame hashes, `H_n`, canonical bucket JSON, verification. Gate: tampering, deletion and insertion all fail. |
+| **3b: Snapshot Vault** | Opt-in visual proof mode, 720p WebP, dHash dedup, encrypted vault, 45-day retention, denylist (password managers, incognito, `.env`). Gate: zero frames captured while sensitive windows are focused. |
+| **3c: Offline + Review UI + Bundle** | `offline_buffered` sync, `network_class`, `/submit` filmstrip UI, Redaction, `.traction-bundle` export. Gate: redacting 3 frames still verifies. |
+
+## Step 4: Server, Anchors, DecisionEngine
+
+| Sub-step | Scope |
+|---|---|
+| **4a: Server Core** | Axum + SQLx, partitioned Postgres 17, `/v1/anchors`, `server_received_at`, merging of multi-device overlap, SSE fanout, `AuthProvider` (dev + Hack Club OIDC). |
+| **4b: Projects + GitHub + R2** | Project metadata (paths, username, owner/reviewer visibility), GitHub linking and commit fetch, Project merge, presigned R2, build provenance. |
+| **4c: HeuristicEngine + Load/Cost** | Default engine with zero network calls, load test (<50 ms p95, <512 MB), itemized cost model ≤$300 (cap $500). Gate: backdating and clock-skew detection. |
+| **4d: JevEngine** | Install the TypeSafe skill first. `v1/systemone` contract tests, `"other"` choice, score distributions, WebP→JPEG, hard spend limit with fallback, 3-way router. |
+
+## Step 5: Fraud Squad and red team
+
+| Sub-step | Scope |
+|---|---|
+| **5a: Audit Pipeline + Eligibility** | Public Linked Repo required for submission, chain/anchor verification on upload, anomaly flags. |
+| **5b: Reviewer View** | 4-track flamegraph, frame scrubber, verdicts, `ProjectDbExporter`. A minimal reviewer UI is allowed here; the Hack Club design seam is not. |
+| **5c: Red Team** | All 4 attacks automated against the live stack, plus a timed walkthrough that a reviewer finishes in under 2 minutes. |
+
+## Step 6: Frontend and expansion
+
+| Sub-step | Scope |
+|---|---|
+| **6a: Design Seam + CI Lint** | `packages/ui/src/design-seam/`, lint rule for seam violations. |
+| **6b: Landing + Install + Auth** | Install one-liners for each OS, Login with Hack Club, GitHub linking UI, Project merge UI. |
+| **6c: Profiles + Live Dashboard** | Public-by-default profiles (names only, never paths), Build Stories, Craft Breakdown, streaks, badges. |
+| **6d: Comparison + Ingestion Spec + T3 Code** | Comparison page, Open Traction Ingestion Spec, T3 Code dedup. Gate: everything in `criteria.md`. |
