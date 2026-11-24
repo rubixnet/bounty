@@ -3,9 +3,11 @@
 //!
 //! This crate must stay free of OS, I/O and async dependencies.
 
+mod canonical;
 mod event;
 mod validate;
 
+pub use canonical::{CanonicalJsonError, to_canonical_json};
 pub use event::{
     EndReason, EventType, HarnessId, MetricsOnly, NetworkClass, SCHEMA_VERSION, TractionEvent,
 };
