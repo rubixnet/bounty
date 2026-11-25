@@ -3,15 +3,15 @@
 //! Steps, in order (each one a function [`ClaudeCodeInstall::run`] calls):
 //! 1. the `claude --version` check (warns, never stops the install);
 //! 2. the `settings.json` hook merge (stops the install on a file it cannot
-//!    parse, leaving it untouched).
-//!
-//! Ticket 06 adds the command files and the `TRACTION_TOKEN` shell setup as
-//! further steps here, their options as fields of [`ClaudeCodeInstall`] and
-//! their results as fields of [`InstallReport`].
+//!    parse, leaving it untouched);
+//! 3. the `/stop-track` and `/resume-track` command files in the `commands`
+//!    folder next to `settings.json` (a user-written file of the same name is
+//!    left untouched, with a warning).
 
 use std::fmt;
 use std::path::PathBuf;
 
+use super::commands;
 use super::settings::{self, SettingsError};
 use super::version;
 use crate::claude_code::config_dir::claude_config_dir;
@@ -50,13 +50,38 @@ impl ClaudeCodeInstall {
                 error,
             }
         })?;
+        let mut warnings: Vec<String> = version.warning().into_iter().collect();
+
+        let commands_dir = self.commands_dir();
+        let commands = commands::install(&commands_dir).map_err(|error| InstallError::Write {
+            path: commands_dir.clone(),
+            error,
+        })?;
+        for path in &commands.foreign {
+            warnings.push(format!(
+                "{} was not written by Traction and was left untouched; \
+                 its command will rely on the hook's literal-text match only",
+                path.display()
+            ));
+        }
+
         Ok(InstallReport {
             settings: self.settings.clone(),
             settings_changed: outcome.changed,
             backup: outcome.backup_written,
             hooks: Hook::ALL.iter().map(|hook| hook.name()).collect(),
-            warnings: version.warning().into_iter().collect(),
+            commands: commands.installed,
+            warnings,
         })
+    }
+
+    /// The Claude `commands` folder: next to `settings.json`, which by
+    /// default is `<claude config dir>/commands`.
+    pub fn commands_dir(&self) -> PathBuf {
+        match self.settings.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join("commands"),
+            _ => PathBuf::from("commands"),
+        }
     }
 }
 
@@ -70,6 +95,8 @@ pub struct InstallReport {
     pub backup: Option<PathBuf>,
     /// The hook events Traction is installed under.
     pub hooks: Vec<&'static str>,
+    /// Traction's command files (a user-written one is a warning instead).
+    pub commands: Vec<PathBuf>,
     pub warnings: Vec<String>,
 }
 
@@ -85,6 +112,9 @@ impl fmt::Display for InstallReport {
             writeln!(f, "backup of the original: {}", backup.display())?;
         }
         writeln!(f, "hooks installed: {}", self.hooks.join(", "))?;
+        for command in &self.commands {
+            writeln!(f, "command: {}", command.display())?;
+        }
         for warning in &self.warnings {
             writeln!(f, "warning: {warning}")?;
         }
@@ -99,6 +129,11 @@ pub enum InstallError {
     NoConfigDir,
     /// `settings.json` was refused or could not be written; it is untouched.
     Settings { path: PathBuf, error: SettingsError },
+    /// A command file or profile could not be written.
+    Write {
+        path: PathBuf,
+        error: std::io::Error,
+    },
 }
 
 impl fmt::Display for InstallError {
@@ -112,6 +147,7 @@ impl fmt::Display for InstallError {
                 "{} {error}; it was left untouched, fix it and rerun the installer",
                 path.display()
             ),
+            Self::Write { path, error } => write!(f, "cannot write {}: {error}", path.display()),
         }
     }
 }

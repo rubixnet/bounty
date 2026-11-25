@@ -1,8 +1,13 @@
 //! `traction-daemon install claude-code` (Seam B): the real binary merges
-//! Traction's HTTP hooks into a temp `settings.json`, with a fake `claude`
-//! program printing chosen versions. Nothing here touches the user's real
-//! Claude Code config: every run passes `--settings` and `--claude-program`
-//! (or a temp `CLAUDE_CONFIG_DIR`).
+//! Traction's HTTP hooks into a temp `settings.json`, writes the command
+//! files next to it and the `TRACTION_TOKEN` block into temp shell
+//! profiles, with a fake `claude` program printing chosen versions.
+//!
+//! Nothing here touches the user's real config: every run passes
+//! `--settings` and `--claude-program` (or a temp `CLAUDE_CONFIG_DIR`),
+//! points `HOME`/`USERPROFILE`/`XDG_CONFIG_HOME` at a temp home so default
+//! profiles resolve inside it, and on Windows redirects the per-user env var
+//! to a scratch `HKCU` key (`--windows-env-key`) that is deleted afterwards.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -13,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use traction_daemon::CLAUDE_CODE_HOOK_PATH;
+use traction_daemon::{CLAUDE_CODE_HOOK_PATH, PauseCommand, RESUME_TRACK, STOP_TRACK};
 
 const BIN: &str = env!("CARGO_BIN_EXE_traction-daemon");
 
@@ -41,10 +46,22 @@ const TOOL_HOOKS: [&str; 4] = [
     "PostToolUseFailure",
 ];
 
-/// A temp Claude config folder plus a fake `claude` program.
+/// A temp Claude config folder and home plus a fake `claude` program.
 struct Setup {
     dir: TempDir,
     claude: PathBuf,
+    /// The scratch `HKCU` subkey standing in for `HKCU\Environment`.
+    #[cfg(windows)]
+    env_key: String,
+}
+
+#[cfg(windows)]
+impl Drop for Setup {
+    fn drop(&mut self) {
+        let _ = Command::new("reg")
+            .args(["delete", &format!("HKCU\\{}", self.env_key), "/f"])
+            .output();
+    }
 }
 
 impl Setup {
@@ -56,7 +73,41 @@ impl Setup {
     fn with_claude_output(output: &str) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let claude = fake_program(dir.path(), "claude", output);
-        Self { dir, claude }
+        fs::create_dir_all(dir.path().join("home")).unwrap();
+        Self {
+            #[cfg(windows)]
+            env_key: format!(
+                "Software\\TractionTest\\{}",
+                dir.path().file_name().unwrap().to_string_lossy()
+            ),
+            dir,
+            claude,
+        }
+    }
+
+    /// The temp home every run sees as `HOME`/`USERPROFILE`.
+    fn home(&self) -> PathBuf {
+        self.dir.path().join("home")
+    }
+
+    fn commands_dir(&self) -> PathBuf {
+        self.dir.path().join("claude").join("commands")
+    }
+
+    /// A command pointed at the temp home (and scratch registry key), with
+    /// no `--settings`.
+    fn bare_command(&self) -> Command {
+        let mut command = Command::new(BIN);
+        command
+            .args(["install", "claude-code"])
+            .env("HOME", self.home())
+            .env("USERPROFILE", self.home())
+            .env("XDG_CONFIG_HOME", self.home().join(".config"))
+            .env_remove("ZDOTDIR")
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        command.args(["--windows-env-key", &self.env_key]);
+        command
     }
 
     fn settings(&self) -> PathBuf {
@@ -84,13 +135,12 @@ impl Setup {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = self.bare_command();
         command
-            .args(["install", "claude-code", "--settings"])
+            .arg("--settings")
             .arg(self.settings())
             .arg("--claude-program")
-            .arg(&self.claude)
-            .stdin(Stdio::null());
+            .arg(&self.claude);
         command
     }
 
@@ -418,16 +468,13 @@ fn the_original_is_backed_up_once_and_never_overwritten() {
 fn the_default_settings_path_is_in_claude_config_dir() {
     let setup = Setup::new();
     let config_dir = setup.dir.path().join("custom-claude");
-    let home = setup.dir.path().join("home");
-    fs::create_dir_all(&home).unwrap();
+    let home = setup.home();
 
-    let output = Command::new(BIN)
-        .args(["install", "claude-code", "--claude-program"])
+    let output = setup
+        .bare_command()
+        .arg("--claude-program")
         .arg(&setup.claude)
         .env("CLAUDE_CONFIG_DIR", &config_dir)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .stdin(Stdio::null())
         .output()
         .unwrap();
 
@@ -436,6 +483,7 @@ fn the_default_settings_path_is_in_claude_config_dir() {
         serde_json::from_slice(&fs::read(config_dir.join("settings.json")).unwrap()).unwrap();
     assert_eq!(traction_entries(&settings, "Stop").len(), 1);
     assert!(!home.join(".claude").exists());
+    assert!(config_dir.join("commands").join("stop-track.md").exists());
 }
 
 #[test]
@@ -594,4 +642,79 @@ fn send_hook_request(
         return Err(std::io::ErrorKind::UnexpectedEof.into());
     }
     Ok(status)
+}
+
+// ---- Command files ------------------------------------------------------
+
+/// The frontmatter and body of a command file.
+fn split_command_file(text: &str) -> (&str, &str) {
+    let rest = text
+        .strip_prefix("---\n")
+        .expect("frontmatter opens the file");
+    let end = rest.find("\n---\n").expect("frontmatter closes");
+    (&rest[..end], &rest[end + "\n---\n".len()..])
+}
+
+#[test]
+fn both_command_files_are_written_model_proof_with_the_shared_body() {
+    let setup = Setup::new();
+
+    setup.install_ok();
+
+    for command in PauseCommand::ALL {
+        let text = fs::read_to_string(setup.commands_dir().join(command.file_name)).unwrap();
+        let (frontmatter, body) = split_command_file(&text);
+        let lines: Vec<&str> = frontmatter.lines().collect();
+        assert!(
+            lines.contains(&format!("description: {}", command.description).as_str()),
+            "{text}"
+        );
+        assert!(lines.contains(&"disable-model-invocation: true"), "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with('#') && line.contains("traction")),
+            "a Traction marker comment in the frontmatter: {text}"
+        );
+        // Exactly the shared one-line body, nothing for the model to follow.
+        assert_eq!(body, format!("{}\n", command.body), "{text}");
+    }
+}
+
+#[test]
+fn traction_command_files_are_rewritten_on_rerun() {
+    let setup = Setup::new();
+    setup.install_ok();
+    let stop = setup.commands_dir().join("stop-track.md");
+    let first = fs::read_to_string(&stop).unwrap();
+    // An older Traction version's file: marked, different body.
+    fs::write(&stop, first.replace(STOP_TRACK.body, "Traction: old body.")).unwrap();
+
+    let output = setup.install_ok();
+
+    assert_eq!(fs::read_to_string(&stop).unwrap(), first);
+    assert!(!stderr(&output).contains("warning"), "{}", stderr(&output));
+}
+
+#[test]
+fn a_user_written_command_file_is_left_untouched_with_a_warning() {
+    const MINE: &str = "---\ndescription: my own stop-track\n---\nDo my thing.\n";
+    let setup = Setup::new();
+    fs::create_dir_all(setup.commands_dir()).unwrap();
+    fs::write(setup.commands_dir().join("stop-track.md"), MINE).unwrap();
+
+    let output = setup.install_ok();
+
+    assert_eq!(
+        fs::read_to_string(setup.commands_dir().join("stop-track.md")).unwrap(),
+        MINE
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("stop-track.md") && err.contains("literal-text match only"),
+        "{err}"
+    );
+    // The other one is still Traction's.
+    let resume = fs::read_to_string(setup.commands_dir().join("resume-track.md")).unwrap();
+    assert!(resume.ends_with(&format!("{}\n", RESUME_TRACK.body)));
 }
