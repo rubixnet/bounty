@@ -8,6 +8,7 @@
 //! `safe.bareRepository=explicit` needs Git >= 2.38 (older Git ignores it).
 
 use crate::log;
+use crate::paths;
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -93,18 +94,18 @@ impl Git {
     pub fn with_program(program: &Path, home: Option<&Path>) -> Self {
         Self {
             program: program.to_owned(),
-            home: home.map(canonical_or_raw),
+            home: home.map(paths::canonical_or_lexical),
             timeout: GIT_TIMEOUT,
             unavailable_logged: AtomicBool::new(false),
         }
     }
 
     /// The work tree's top-level folder containing `folder`, as Git prints
-    /// it (forward slashes on Windows).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Router collapses worktrees via common_dir")
-    )]
+    /// it (forward slashes on Windows). Production never needs it on its
+    /// own (the Router collapses worktrees via [`Git::common_dir`]); every
+    /// query still runs the same `$HOME` check through
+    /// [`Git::checked_top_level`].
+    #[cfg(test)]
     pub fn top_level(&self, folder: &Path) -> Result<PathBuf, GitError> {
         self.checked_top_level(folder)
     }
@@ -146,17 +147,20 @@ impl Git {
     /// parent first (before Git runs at all), then confirmed from
     /// [`GitQuery::TopLevel`].
     fn checked_top_level(&self, folder: &Path) -> Result<PathBuf, GitError> {
-        let folder_canon = std::fs::canonicalize(folder).map_err(|_| GitError::NotARepo)?;
-        if let Some(home) = &self.home {
-            let dot_git_parent = folder_canon
-                .ancestors()
-                .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok());
-            if dot_git_parent == Some(home.as_path()) {
-                return Err(GitError::HomeRooted);
-            }
+        let folder_canon = paths::canonicalize(folder).ok_or(GitError::NotARepo)?;
+        let is_home = |dir: &Path| {
+            self.home
+                .as_deref()
+                .is_some_and(|home| paths::same(dir, home))
+        };
+        let dot_git_parent = folder_canon
+            .ancestors()
+            .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok());
+        if dot_git_parent.is_some_and(is_home) {
+            return Err(GitError::HomeRooted);
         }
         let top = PathBuf::from(self.run(GitQuery::TopLevel, folder)?);
-        if self.home.as_ref() == Some(&canonical_or_raw(&top)) {
+        if is_home(&paths::canonical_or_lexical(&top)) {
             return Err(GitError::HomeRooted);
         }
         Ok(top)
@@ -195,10 +199,6 @@ impl Git {
             Err(RunError::Failed) => Err(GitError::NotARepo),
         }
     }
-}
-
-fn canonical_or_raw(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
 /// A full SHA-1 or SHA-256 object id.
@@ -506,8 +506,12 @@ mod tests {
         repo
     }
 
+    /// Git prints paths its own way (forward slashes on Windows).
     fn same_path(a: &Path, b: &Path) -> bool {
-        std::fs::canonicalize(a).unwrap() == std::fs::canonicalize(b).unwrap()
+        paths::same(
+            &paths::canonicalize(a).unwrap(),
+            &paths::canonicalize(b).unwrap(),
+        )
     }
 
     #[test]
