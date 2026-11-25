@@ -46,6 +46,14 @@ _Avoid_: Repo, workspace, directory
 The folder that identifies a Project: its Git repo root if it has one, otherwise the folder the work was created in.
 _Avoid_: cwd, working directory
 
+**Attribution Window**:
+A span of event timestamps in which one Harness session claims the `FILE_MUTATION`s in its current Project: a hook window (tool call inside an open turn), a log-tailed turn window, or the trailing fallback window after a log-tailed session's events.
+_Avoid_: Fallback window (that is only one kind), grace period, hold
+
+**Manual Work**:
+A `FILE_MUTATION` in a Project that falls outside every Attribution Window, so it carries no Harness, no session and `network_class: manual`.
+_Avoid_: Unattributed edit, human edit, hand-written code
+
 **Linked Repo**:
 The hosted GitHub repository a user has attached to a Project from the website.
 _Avoid_: Remote, origin, connected repo

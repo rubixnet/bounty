@@ -26,6 +26,10 @@ pub const GLOBAL_IGNORE_FILE: &str = "ignored-folders";
 /// it (`docs/protocol.md` section 2): a delivery-lag buffer, so late
 /// log-tailed events can still claim the edit. Not an attribution window.
 pub const LOG_TAIL_HOLD: Duration = Duration::from_secs(5);
+/// The single short fallback attribution window (`docs/protocol.md`
+/// section 2): a log-tailed session that has never reported a turn boundary
+/// claims a `FILE_MUTATION` stamped within this long after one of its events.
+pub const LOG_TAIL_TRAILING_WINDOW: Duration = Duration::from_secs(30);
 /// Files the watcher may hold per Project at once; past this, the oldest
 /// held mutation of that Project is decided early (bounded memory).
 pub const DEFAULT_WATCHER_PENDING_CAP: usize = 1024;
@@ -112,12 +116,15 @@ impl Default for WriterSettings {
 }
 
 /// File watcher tuning. Production always uses the defaults; the fields are
-/// public only so tests can shorten the hold or shrink the cap.
+/// public only so tests can shorten the hold or the trailing window, or
+/// shrink the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WatcherSettings {
     /// Test-only override of [`LOG_TAIL_HOLD`].
     pub hold: Duration,
+    /// Test-only override of [`LOG_TAIL_TRAILING_WINDOW`].
+    pub trailing_window: Duration,
     /// Held files per Project before the oldest is decided early.
     pub pending_cap: usize,
 }
@@ -126,6 +133,7 @@ impl Default for WatcherSettings {
     fn default() -> Self {
         Self {
             hold: LOG_TAIL_HOLD,
+            trailing_window: LOG_TAIL_TRAILING_WINDOW,
             pending_cap: DEFAULT_WATCHER_PENDING_CAP,
         }
     }

@@ -4,10 +4,10 @@
 
 **Blocked by:** 07
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Hook window attributes; edit after `TOOL_POST` or `TURN_END` is manual.
-- [ ] Log-tailed turn attributes; after `TURN_END` manual; late `PROMPT_SUBMIT` within hold claims, after hold does not.
-- [ ] Trailing fallback for `harness_db_poll` session: within window attributed, beyond manual (test override keeps the ratio).
-- [ ] Project A window never claims a Project B edit; precedence test; live-only restart test.
-- [ ] `LOG_TAIL_TRAILING_WINDOW` is one public constant documented in `protocol.md`; optionally add **Attribution Window** and **Manual Work** to `GLOSSARY.md`.
+- [x] Hook window attributes; edit after `TOOL_POST` or `TURN_END` is manual.
+- [x] Log-tailed turn attributes; after `TURN_END` manual; late `PROMPT_SUBMIT` within hold claims, after hold does not.
+- [x] Trailing fallback for `harness_db_poll` session: within window attributed, beyond manual (test override keeps the ratio).
+- [x] Project A window never claims a Project B edit; precedence test; live-only restart test.
+- [x] `LOG_TAIL_TRAILING_WINDOW` is one public constant documented in `protocol.md`; optionally add **Attribution Window** and **Manual Work** to `GLOSSARY.md`.
