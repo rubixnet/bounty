@@ -18,6 +18,11 @@ http-body-util.workspace = true
 rusqlite.workspace = true
 getrandom.workspace = true
 subtle.workspace = true
+notify.workspace = true
+ignore.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

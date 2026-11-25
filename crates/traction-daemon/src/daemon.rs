@@ -3,7 +3,8 @@
 //! the writer and returns once everything accepted is committed.
 //!
 //! Threads: one runs a single-threaded tokio runtime serving the bus, one is
-//! the Project Router, one is the SQLite writer. Startup order matters: data
+//! the Project Router, one is the file watcher (plus the OS watch backend's
+//! own), one is the SQLite writer. Startup order matters: data
 //! folder, single-instance lock, token, device secret, database (and the
 //! stored registry), listener, writer, Router, server. Nothing
 //! in the data folder (token, device secret, database, later the socket) is
@@ -33,6 +34,7 @@ use crate::secret::DeviceSecret;
 #[cfg(unix)]
 use crate::socket::{self, SocketError, SocketFile};
 use crate::token::BusToken;
+use crate::watcher::{self, WatcherThread, Watches};
 use crate::writer::{self, WriterThread};
 use crate::{http, log, storage};
 
@@ -41,6 +43,7 @@ pub struct DaemonHandle {
     local_addr: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
+    watcher: Option<WatcherThread>,
     router: Option<RouterThread>,
     writer: Option<WriterThread>,
     #[cfg(unix)]
@@ -107,7 +110,8 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         &config.data_dir.join(GLOBAL_IGNORE_FILE),
     );
     let git = Git::with_program(&config.git_program, exclusions.home());
-    let router = Router::new(
+    let (watches, notifications) = Watches::new(exclusions.clone());
+    let mut router = Router::new(
         git,
         exclusions,
         device_secret,
@@ -116,10 +120,35 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         aliases,
         sessions,
     );
+    // Re-attach every stored (non-merged) Project before anything can edit
+    // unobserved; later registrations attach on the Router thread before
+    // they are answered.
+    for project in router.projects() {
+        watches.attach(project);
+    }
+    let hook_watches = watches.clone();
+    router.add_project_hook(Box::new(move |project| match &project.merged_into {
+        Some(_) => hook_watches.detach(&project.project_id),
+        None => hook_watches.attach(project),
+    }));
     let (router_sender, router_thread) = match router::spawn(router, config.writer.queue_capacity) {
         Ok(spawned) => spawned,
         Err(error) => {
             // The Router (and its writer sender) was dropped.
+            let _ = writer_thread.join();
+            return Err(StartError::Runtime(error));
+        }
+    };
+    let watcher_thread = match watcher::spawn(
+        watches,
+        notifications,
+        router_sender.clone(),
+        config.watcher,
+    ) {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(router_sender);
+            let _ = router_thread.join();
             let _ = writer_thread.join();
             return Err(StartError::Runtime(error));
         }
@@ -147,8 +176,9 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let server = match server {
         Ok(server) => server,
         Err(error) => {
-            // The closure (and its Router sender) was dropped; let the
-            // Router, then the writer, exit.
+            // The closure (and its Router sender) was dropped; flush the
+            // watcher, then let the Router, then the writer, exit.
+            let _ = watcher_thread.stop();
             let _ = router_thread.join();
             let _ = writer_thread.join();
             return Err(StartError::Runtime(error));
@@ -159,6 +189,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         local_addr,
         shutdown: Some(shutdown_tx),
         server: Some(server),
+        watcher: Some(watcher_thread),
         router: Some(router_thread),
         writer: Some(writer_thread),
         #[cfg(unix)]
@@ -221,6 +252,9 @@ impl DaemonHandle {
             let _ = shutdown.send(());
         }
         let server = self.server.take().map(JoinHandle::join);
+        // Held mutations are decided and handed to the Router while it (and
+        // the writer) still run.
+        let watcher = self.watcher.take().map(WatcherThread::stop);
         // The bus is gone, so the Router drains its queue and exits. A writer
         // stuck retrying a full failed batch is told to give up first, so a
         // Router blocked on it is released.
@@ -231,6 +265,9 @@ impl DaemonHandle {
         let writer = self.writer.take().map(WriterThread::join);
         if matches!(server, Some(Err(_))) {
             return Err(ShutdownError::ServerPanicked);
+        }
+        if matches!(watcher, Some(Err(_))) {
+            return Err(ShutdownError::WatcherPanicked);
         }
         if matches!(router, Some(Err(_))) {
             return Err(ShutdownError::RouterPanicked);
@@ -350,6 +387,7 @@ impl std::error::Error for StartError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownError {
     ServerPanicked,
+    WatcherPanicked,
     RouterPanicked,
     WriterPanicked,
 }
@@ -358,6 +396,7 @@ impl fmt::Display for ShutdownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ServerPanicked => f.write_str("the bus thread panicked"),
+            Self::WatcherPanicked => f.write_str("the file watcher thread panicked"),
             Self::RouterPanicked => f.write_str("the Project Router thread panicked"),
             Self::WriterPanicked => f.write_str("the SQLite writer thread panicked"),
         }
