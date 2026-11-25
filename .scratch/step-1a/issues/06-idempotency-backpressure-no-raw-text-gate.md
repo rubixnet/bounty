@@ -4,13 +4,13 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `event_id` is the primary key, and inserts are idempotent. Sending the same event twice returns `202` both times (never `500` or another error), and exactly one row is stored.
-- [ ] The writer commits a batch when it reaches a size threshold, as well as on the 5-second timer.
-- [ ] When the writer channel is full, the bus returns `503` immediately instead of blocking the caller. A test can trigger this case.
-- [ ] Events accepted just before a graceful shutdown are present after it.
-- [ ] Sentinel test:
+- [x] `event_id` is the primary key, and inserts are idempotent. Sending the same event twice returns `202` both times (never `500` or another error), and exactly one row is stored.
+- [x] The writer commits a batch when it reaches a size threshold, as well as on the 5-second timer.
+- [x] When the writer channel is full, the bus returns `503` immediately instead of blocking the caller. A test can trigger this case.
+- [x] Events accepted just before a graceful shutdown are present after it.
+- [x] Sentinel test:
   - events that try to carry a sentinel string through unknown top-level or `metrics_only` fields return `400`;
   - valid events are also sent, then the daemon is shut down;
   - a scan of every table and column finds zero copies of the sentinel;
