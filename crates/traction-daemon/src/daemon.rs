@@ -129,7 +129,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     }
     let hook_watches = watches.clone();
     router.add_project_hook(Box::new(move |project| match &project.merged_into {
-        Some(_) => hook_watches.detach(&project.project_id),
+        Some(into) => hook_watches.merge(&project.project_id, into),
         None => hook_watches.attach(project),
     }));
     let (router_sender, router_thread) = match router::spawn(router, config.writer.queue_capacity) {

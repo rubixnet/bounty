@@ -217,10 +217,9 @@ fn after_migration_hand_edits_land_under_the_git_project() {
     assert_eq!(daemon.caller().post_event(&event).status, 202);
     assert_eq!(register(&daemon, &notes), git_id);
     let db = daemon.live_db();
-    // The fixture's own `git init`/commit writes race the watcher hand-over
-    // (FSEvents may deliver them after the `dir:` watch is gone), so this
-    // test asserts only on a file created after the migration. Let those
-    // fixture writes settle (several holds) before taking the baseline.
+    // The fixture's own `git init`/commit writes may be decided under either
+    // ID, so this test asserts only on a file created after the migration.
+    // Let those fixture writes settle (several holds) before the baseline.
     std::thread::sleep(Duration::from_secs(3));
     let created_under_git = |db: &rusqlite::Connection| {
         stored_mutations(db)
@@ -246,6 +245,39 @@ fn after_migration_hand_edits_land_under_the_git_project() {
     });
     assert_manual(&removed, &git_id, &notes);
     assert_ne!(git_id, dir_id);
+}
+
+#[test]
+fn an_edit_made_right_before_the_migration_is_still_recorded() {
+    let daemon = TestDaemon::start_with(fast_watcher);
+    let notes = fixtures::folder(&daemon.home().join("handover"), &[]);
+    register(&daemon, &notes);
+    fixtures::repo(&notes, None);
+    let git_id = fixtures::git_id(&notes, None);
+    let db = daemon.live_db();
+    // Let the fixture's own writes be decided (under the `dir:` ID).
+    std::thread::sleep(Duration::from_secs(3));
+    let created_under_git = |db: &rusqlite::Connection| {
+        stored_mutations(db)
+            .iter()
+            .filter(|row| {
+                row.project_id.as_deref() == Some(git_id.as_str())
+                    && row.mutation_kind.as_deref() == Some("created")
+            })
+            .count()
+    };
+    let baseline = created_under_git(&db);
+
+    // The edit's notification is still in flight (or held) when the event
+    // that migrates the Project arrives: the watch is handed over in place,
+    // so the edit is neither lost nor dropped as predating a new watch.
+    fs::write(notes.join("in-flight.txt"), "edited at the hand-over").unwrap();
+    let event = routed_event(1, "PROMPT_SUBMIT", "s-1", Some(&notes));
+    assert_eq!(daemon.caller().post_event(&event).status, 202);
+
+    common::poll_until(common::WATCH_DEADLINE, "the hand-over edit", || {
+        (created_under_git(&db) > baseline).then_some(())
+    });
 }
 
 /// Valid in a file name on every OS and never part of any fixture path.
