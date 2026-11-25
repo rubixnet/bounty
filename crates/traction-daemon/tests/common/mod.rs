@@ -1,8 +1,8 @@
 //! Shared Seam 2 helper: a real in-process daemon on a fresh temp data folder
-//! and an ephemeral loopback port, plus a raw HTTP/1.1 client.
+//! and an ephemeral loopback port, plus a raw HTTP/1.1 caller.
 //!
 //! Tests interact only through HTTP, the token file the daemon wrote and a
-//! read-only SQLite connection opened after shutdown. The client writes raw
+//! read-only SQLite connection opened after shutdown. The caller writes raw
 //! request bytes so later tickets can send arbitrary (or missing) `Host`,
 //! `Origin` and `Authorization` headers.
 //!
@@ -73,9 +73,9 @@ impl TestDaemon {
         std::fs::read_to_string(self.token_path()).expect("token file")
     }
 
-    /// A client holding the daemon's real token.
-    pub fn client(&self) -> BusClient {
-        BusClient::new(self.addr, self.token())
+    /// A caller holding the daemon's real token.
+    pub fn caller(&self) -> BusCaller {
+        BusCaller::new(self.addr, self.token())
     }
 
     /// The configured Unix socket path (`<temp data dir>/daemon.sock`).
@@ -88,10 +88,10 @@ impl TestDaemon {
             .to_path_buf()
     }
 
-    /// A client holding the real token that talks over the Unix socket.
+    /// A caller holding the real token that talks over the Unix socket.
     #[cfg(unix)]
-    pub fn socket_client(&self) -> BusClient {
-        self.client().via_socket(self.socket_path())
+    pub fn socket_caller(&self) -> BusCaller {
+        self.caller().via_socket(self.socket_path())
     }
 
     /// Graceful shutdown: flushes pending events, then stops. Idempotent.
@@ -154,9 +154,9 @@ pub fn test_config(data_dir: &Path) -> DaemonConfig {
     config
 }
 
-/// Raw HTTP/1.1 client for the Local Ingestion Bus.
+/// Raw HTTP/1.1 caller for the Local Ingestion Bus.
 #[derive(Clone)]
-pub struct BusClient {
+pub struct BusCaller {
     addr: SocketAddr,
     token: String,
     endpoint: Endpoint,
@@ -170,8 +170,8 @@ enum Endpoint {
     Unix(PathBuf),
 }
 
-impl BusClient {
-    /// A client for a daemon started outside [`TestDaemon`] (e.g. the binary).
+impl BusCaller {
+    /// A caller for a daemon started outside [`TestDaemon`] (e.g. the binary).
     pub fn new(addr: SocketAddr, token: String) -> Self {
         Self {
             addr,
@@ -180,7 +180,7 @@ impl BusClient {
         }
     }
 
-    /// The same client, but sending over the Unix socket at `path`. Requests
+    /// The same caller, but sending over the Unix socket at `path`. Requests
     /// still carry the HTTP `Host` header unless a test removes it.
     #[cfg(unix)]
     pub fn via_socket(mut self, path: PathBuf) -> Self {

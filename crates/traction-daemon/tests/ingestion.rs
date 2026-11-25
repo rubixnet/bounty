@@ -12,7 +12,7 @@ use common::{TestDaemon, event_id, stored_event_count, valid_event};
 fn accepted_event_returns_202_and_is_stored_after_shutdown() {
     let mut daemon = TestDaemon::start();
 
-    let response = daemon.client().post_event(&valid_event(1));
+    let response = daemon.caller().post_event(&valid_event(1));
 
     assert_eq!(response.status, 202);
     let db = daemon.shutdown_and_open_db();
@@ -26,10 +26,10 @@ fn accepted_event_returns_202_and_is_stored_after_shutdown() {
 #[test]
 fn every_accepted_event_is_stored_and_the_database_is_in_wal_mode() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
 
     for n in 0..25 {
-        assert_eq!(client.post_event(&valid_event(n)).status, 202, "event {n}");
+        assert_eq!(caller.post_event(&valid_event(n)).status, 202, "event {n}");
     }
 
     let db = daemon.shutdown_and_open_db();
@@ -47,7 +47,7 @@ fn every_accepted_event_is_stored_and_the_database_is_in_wal_mode() {
 #[test]
 fn stored_row_holds_the_validated_fields_as_typed_columns() {
     let mut daemon = TestDaemon::start();
-    assert_eq!(daemon.client().post_event(&valid_event(7)).status, 202);
+    assert_eq!(daemon.caller().post_event(&valid_event(7)).status, 202);
 
     let db = daemon.shutdown_and_open_db();
     let row = db
@@ -125,7 +125,7 @@ fn missing_authorization_is_401_and_nothing_is_stored() {
     let mut daemon = TestDaemon::start();
 
     let response = daemon
-        .client()
+        .caller()
         .request("POST", "/v1/event")
         .without_header("Authorization")
         .body(valid_event(1))
@@ -138,8 +138,8 @@ fn missing_authorization_is_401_and_nothing_is_stored() {
 #[test]
 fn wrong_token_is_401_and_nothing_is_stored() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
-    let token = client.token().to_owned();
+    let caller = daemon.caller();
+    let token = caller.token().to_owned();
     let last = token.chars().last().expect("non-empty token");
     let flipped = if last == '0' { '1' } else { '0' };
     let off_by_last_char = format!("{}{flipped}", &token[..token.len() - 1]);
@@ -153,7 +153,7 @@ fn wrong_token_is_401_and_nothing_is_stored() {
         token.clone(),
     ];
     for authorization in &wrong_tokens {
-        let response = client
+        let response = caller
             .request("POST", "/v1/event")
             .header("Authorization", authorization)
             .body(valid_event(1))

@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 use crate::bus::{Bus, Transport};
 use crate::log;
 
-/// A client must finish sending request headers within this time.
+/// A caller must finish sending request headers within this time.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// On shutdown, in-flight requests get this long to finish.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -98,7 +98,7 @@ where
         .serve_connection(io, service);
     let connection = graceful.watch(connection);
     tokio::spawn(async move {
-        // Client-side errors (resets, timeouts) are routine; nothing to log.
+        // Caller-side errors (resets, timeouts) are routine; nothing to log.
         let _ = connection.await;
     });
 }

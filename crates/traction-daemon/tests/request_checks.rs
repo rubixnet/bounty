@@ -5,12 +5,12 @@
 mod common;
 
 use common::{
-    BusClient, BusResponse, TestDaemon, stored_event_count, valid_event, valid_event_value,
+    BusCaller, BusResponse, TestDaemon, stored_event_count, valid_event, valid_event_value,
 };
 use traction_daemon::MAX_BODY_BYTES;
 
-fn own_host(client: &BusClient, name: &str) -> String {
-    format!("{name}:{}", client.port())
+fn own_host(caller: &BusCaller, name: &str) -> String {
+    format!("{name}:{}", caller.port())
 }
 
 fn assert_rejected(response: &BusResponse, status: u16, code: &str) {
@@ -23,8 +23,8 @@ fn assert_rejected(response: &BusResponse, status: u16, code: &str) {
 #[test]
 fn foreign_host_is_refused_with_403_even_with_a_valid_token() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
-    let port = client.port();
+    let caller = daemon.caller();
+    let port = caller.port();
 
     for host in [
         format!("evil.example:{port}"),
@@ -35,7 +35,7 @@ fn foreign_host_is_refused_with_403_even_with_a_valid_token() {
         format!("127.0.0.2:{port}"),
         format!("127.0.0.1.evil.example:{port}"),
     ] {
-        let response = client
+        let response = caller
             .request("POST", "/v1/event")
             .header("Host", &host)
             .body(valid_event(1))
@@ -52,7 +52,7 @@ fn missing_host_is_refused_with_403() {
     let daemon = TestDaemon::start();
 
     let response = daemon
-        .client()
+        .caller()
         .request("POST", "/v1/event")
         .without_header("Host")
         .body(valid_event(1))
@@ -64,15 +64,15 @@ fn missing_host_is_refused_with_403() {
 #[test]
 fn both_loopback_host_spellings_on_the_bound_port_are_accepted() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
 
     for (n, name) in ["127.0.0.1", "localhost", "LocalHost"]
         .into_iter()
         .enumerate()
     {
-        let response = client
+        let response = caller
             .request("POST", "/v1/event")
-            .header("Host", &own_host(&client, name))
+            .header("Host", &own_host(&caller, name))
             .body(valid_event(n as u32))
             .send();
         assert_eq!(response.status, 202, "Host {name}: {}", response.body);
@@ -87,7 +87,7 @@ fn host_is_checked_before_the_token() {
     let daemon = TestDaemon::start();
 
     let response = daemon
-        .client()
+        .caller()
         .request("POST", "/v1/event")
         .header("Host", "evil.example")
         .without_header("Authorization")
@@ -102,8 +102,8 @@ fn host_is_checked_before_the_token() {
 #[test]
 fn foreign_origin_is_refused_with_403_even_with_a_valid_token() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
-    let port = client.port();
+    let caller = daemon.caller();
+    let port = caller.port();
 
     for origin in [
         "https://evil.example".to_owned(),
@@ -114,7 +114,7 @@ fn foreign_origin_is_refused_with_403_even_with_a_valid_token() {
         format!("http://evil.example:{port}"),
         String::new(),
     ] {
-        let response = client
+        let response = caller
             .request("POST", "/v1/event")
             .header("Origin", &origin)
             .body(valid_event(1))
@@ -129,10 +129,10 @@ fn foreign_origin_is_refused_with_403_even_with_a_valid_token() {
 #[test]
 fn the_daemons_own_origin_and_no_origin_are_allowed() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
-    let port = client.port();
+    let caller = daemon.caller();
+    let port = caller.port();
 
-    let no_origin = client.post_event(&valid_event(0));
+    let no_origin = caller.post_event(&valid_event(0));
     assert_eq!(no_origin.status, 202, "{}", no_origin.body);
     for (n, origin) in [
         format!("http://127.0.0.1:{port}"),
@@ -141,7 +141,7 @@ fn the_daemons_own_origin_and_no_origin_are_allowed() {
     .into_iter()
     .enumerate()
     {
-        let response = client
+        let response = caller
             .request("POST", "/v1/event")
             .header("Origin", &origin)
             .body(valid_event(n as u32 + 1))
@@ -156,9 +156,9 @@ fn the_daemons_own_origin_and_no_origin_are_allowed() {
 #[test]
 fn origin_is_checked_before_the_token_and_after_the_host() {
     let daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
 
-    let bad_origin_no_token = client
+    let bad_origin_no_token = caller
         .request("POST", "/v1/event")
         .header("Origin", "https://evil.example")
         .without_header("Authorization")
@@ -166,7 +166,7 @@ fn origin_is_checked_before_the_token_and_after_the_host() {
         .send();
     assert_rejected(&bad_origin_no_token, 403, "forbidden_origin");
 
-    let bad_host_and_origin = client
+    let bad_host_and_origin = caller
         .request("POST", "/v1/event")
         .header("Host", "evil.example")
         .header("Origin", "https://evil.example")
@@ -180,43 +180,43 @@ fn origin_is_checked_before_the_token_and_after_the_host() {
 #[test]
 fn unknown_path_returns_404_only_once_authorized() {
     let daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
 
-    let unauthenticated = client
+    let unauthenticated = caller
         .request("POST", "/admin")
         .without_header("Authorization")
         .send();
     assert_rejected(&unauthenticated, 401, "unauthorized");
 
-    let foreign_host = client
+    let foreign_host = caller
         .request("POST", "/admin")
         .header("Host", "evil.example")
         .send();
     assert_rejected(&foreign_host, 403, "forbidden_host");
 
-    let authorized = client.request("POST", "/admin").send();
+    let authorized = caller.request("POST", "/admin").send();
     assert_rejected(&authorized, 404, "not_found");
 }
 
 #[test]
 fn wrong_method_on_the_event_path_returns_405_only_once_authorized() {
     let daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
 
-    let unauthenticated = client
+    let unauthenticated = caller
         .request("GET", "/v1/event")
         .without_header("Authorization")
         .send();
     assert_rejected(&unauthenticated, 401, "unauthorized");
 
-    let foreign_origin = client
+    let foreign_origin = caller
         .request("PUT", "/v1/event")
         .header("Origin", "null")
         .send();
     assert_rejected(&foreign_origin, 403, "forbidden_origin");
 
     for method in ["GET", "PUT", "DELETE"] {
-        let authorized = client.request(method, "/v1/event").send();
+        let authorized = caller.request(method, "/v1/event").send();
         assert_rejected(&authorized, 405, "method_not_allowed");
     }
 }
@@ -236,7 +236,7 @@ fn body_over_the_cap_returns_413_and_is_not_stored() {
     let mut daemon = TestDaemon::start();
 
     let response = daemon
-        .client()
+        .caller()
         .post_event(&padded_event(1, MAX_BODY_BYTES + 1));
 
     assert_rejected(&response, 413, "body_too_large");
@@ -248,7 +248,7 @@ fn body_over_the_cap_returns_413_and_is_not_stored() {
 fn body_exactly_at_the_cap_is_accepted() {
     let mut daemon = TestDaemon::start();
 
-    let response = daemon.client().post_event(&padded_event(1, MAX_BODY_BYTES));
+    let response = daemon.caller().post_event(&padded_event(1, MAX_BODY_BYTES));
 
     assert_eq!(response.status, 202, "{}", response.body);
     let db = daemon.shutdown_and_open_db();
@@ -260,7 +260,7 @@ fn oversized_body_without_a_token_returns_401() {
     let daemon = TestDaemon::start();
 
     let response = daemon
-        .client()
+        .caller()
         .request("POST", "/v1/event")
         .without_header("Authorization")
         .body(padded_event(1, MAX_BODY_BYTES + 1))
@@ -280,25 +280,25 @@ const WITHIN_DRAIN_BOUND: usize = 48 * 1024;
 #[test]
 fn early_refusal_reads_the_unread_body_and_closes_without_a_reset() {
     let daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
     let body = " ".repeat(WITHIN_DRAIN_BOUND);
 
     for _ in 0..3 {
-        let no_token = client
+        let no_token = caller
             .request("POST", "/v1/event")
             .without_header("Authorization")
             .body(&body)
             .send_expecting_clean_close();
         assert_rejected(&no_token, 401, "unauthorized");
 
-        let foreign_host = client
+        let foreign_host = caller
             .request("POST", "/v1/event")
             .header("Host", "evil.example")
             .body(&body)
             .send_expecting_clean_close();
         assert_rejected(&foreign_host, 403, "forbidden_host");
 
-        let too_large = client
+        let too_large = caller
             .request("POST", "/v1/event")
             .body(&body)
             .send_expecting_clean_close();
@@ -314,7 +314,7 @@ fn early_refusal_answers_a_caller_that_withholds_its_body() {
     let started = std::time::Instant::now();
 
     let response = daemon
-        .client()
+        .caller()
         .request("POST", "/v1/event")
         .without_header("Authorization")
         .body(" ".repeat(WITHIN_DRAIN_BOUND))
@@ -335,7 +335,7 @@ fn malformed_json_returns_400_without_echoing_the_input() {
     let daemon = TestDaemon::start();
 
     let response = daemon
-        .client()
+        .caller()
         .post_event(&format!("{{\"event_id\": \"{MARKER}\", oops"));
 
     assert_rejected(&response, 400, "malformed_event");
@@ -348,7 +348,7 @@ fn unknown_field_returns_400_without_echoing_the_input() {
     let mut event = valid_event_value(1);
     event["raw_prompt"] = serde_json::Value::String(MARKER.to_owned());
 
-    let response = daemon.client().post_event(&event.to_string());
+    let response = daemon.caller().post_event(&event.to_string());
 
     assert_rejected(&response, 400, "malformed_event");
     assert!(!response.body.contains(MARKER));
@@ -357,7 +357,7 @@ fn unknown_field_returns_400_without_echoing_the_input() {
 #[test]
 fn failed_validation_returns_400_with_its_reason_code_without_echoing_the_input() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
     let cases = [
         ("cwd", format!("relative/{MARKER}"), "invalid_cwd"),
         (
@@ -371,7 +371,7 @@ fn failed_validation_returns_400_with_its_reason_code_without_echoing_the_input(
     for (field, value, code) in cases {
         let mut event = valid_event_value(1);
         event[field] = serde_json::Value::String(value);
-        let response = client.post_event(&event.to_string());
+        let response = caller.post_event(&event.to_string());
         assert_rejected(&response, 400, code);
         assert!(!response.body.contains(MARKER));
     }

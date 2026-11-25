@@ -65,10 +65,10 @@ fn hold_write_lock(daemon: &TestDaemon) -> Connection {
 #[test]
 fn the_same_event_sent_twice_is_accepted_twice_and_stored_once() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
 
     for _ in 0..2 {
-        let response = client.post_event(&valid_event(1));
+        let response = caller.post_event(&valid_event(1));
         assert_eq!(response.status, 202, "{}", response.body);
     }
 
@@ -81,13 +81,13 @@ fn a_retry_after_the_first_copy_was_committed_is_accepted_and_ignored() {
     // `max_batch = 1` commits every event on its own, so the second copy
     // meets an already stored row rather than a duplicate in the same batch.
     let mut daemon = TestDaemon::start_with(|config| config.max_batch = 1);
-    let client = daemon.client();
+    let caller = daemon.caller();
 
-    assert_eq!(client.post_event(&valid_event(1)).status, 202);
+    assert_eq!(caller.post_event(&valid_event(1)).status, 202);
     wait_for_stored_events(&daemon, 1);
-    let retry = client.post_event(&valid_event(1));
+    let retry = caller.post_event(&valid_event(1));
     assert_eq!(retry.status, 202, "{}", retry.body);
-    assert_eq!(client.post_event(&valid_event(2)).status, 202);
+    assert_eq!(caller.post_event(&valid_event(2)).status, 202);
 
     let db = daemon.shutdown_and_open_db();
     assert_eq!(stored_event_count(&db), 2);
@@ -96,13 +96,13 @@ fn a_retry_after_the_first_copy_was_committed_is_accepted_and_ignored() {
 #[test]
 fn a_duplicate_does_not_overwrite_the_stored_event() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
 
     let first = valid_event_value(1);
     let mut retry = first.clone();
     retry["timestamp_ms"] = serde_json::json!(1);
-    assert_eq!(client.post_event(&first.to_string()).status, 202);
-    assert_eq!(client.post_event(&retry.to_string()).status, 202);
+    assert_eq!(caller.post_event(&first.to_string()).status, 202);
+    assert_eq!(caller.post_event(&retry.to_string()).status, 202);
 
     let db = daemon.shutdown_and_open_db();
     let timestamp: i64 = db
@@ -120,10 +120,10 @@ fn a_full_batch_is_committed_without_waiting_for_the_timer() {
     // The test config's timer is 60 s, so a commit inside the deadline can
     // only come from the size threshold.
     let daemon = TestDaemon::start_with(|config| config.max_batch = 3);
-    let client = daemon.client();
+    let caller = daemon.caller();
 
     for n in 0..3 {
-        assert_eq!(client.post_event(&valid_event(n)).status, 202);
+        assert_eq!(caller.post_event(&valid_event(n)).status, 202);
     }
 
     wait_for_stored_events(&daemon, 3);
@@ -135,9 +135,9 @@ fn a_partial_batch_is_committed_by_the_timer() {
         config.commit_interval = Duration::from_millis(100);
         config.max_batch = 1000;
     });
-    let client = daemon.client();
+    let caller = daemon.caller();
 
-    assert_eq!(client.post_event(&valid_event(1)).status, 202);
+    assert_eq!(caller.post_event(&valid_event(1)).status, 202);
 
     wait_for_stored_events(&daemon, 1);
 }
@@ -148,7 +148,7 @@ fn a_full_writer_queue_answers_503_at_once_and_loses_nothing_accepted() {
         config.max_batch = 1;
         config.writer_queue_capacity = 1;
     });
-    let client = daemon.client();
+    let caller = daemon.caller();
     let lock = hold_write_lock(&daemon);
 
     // While the writer is stuck, it holds at most one event and the queue
@@ -157,7 +157,7 @@ fn a_full_writer_queue_answers_503_at_once_and_loses_nothing_accepted() {
     let mut busy = None;
     for n in 0..3 {
         let sent = Instant::now();
-        let response = client.post_event(&valid_event(n));
+        let response = caller.post_event(&valid_event(n));
         match response.status {
             202 => accepted += 1,
             503 => {
@@ -186,10 +186,10 @@ fn a_batch_whose_commit_fails_is_retried_not_dropped() {
         config.commit_interval = Duration::from_millis(100);
         config.max_batch = 1;
     });
-    let client = daemon.client();
+    let caller = daemon.caller();
     let lock = hold_write_lock(&daemon);
 
-    assert_eq!(client.post_event(&valid_event(1)).status, 202);
+    assert_eq!(caller.post_event(&valid_event(1)).status, 202);
     // Longer than SQLite's 5 s busy timeout, so the first commit fails.
     thread::sleep(Duration::from_secs(7));
     drop(lock);
@@ -202,10 +202,10 @@ fn a_batch_whose_commit_fails_is_retried_not_dropped() {
 #[test]
 fn events_accepted_just_before_shutdown_are_stored() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.client();
+    let caller = daemon.caller();
 
     for n in 0..100 {
-        assert_eq!(client.post_event(&valid_event(n)).status, 202);
+        assert_eq!(caller.post_event(&valid_event(n)).status, 202);
     }
 
     let db = daemon.shutdown_and_open_db();
@@ -217,7 +217,7 @@ fn raw_text_sent_through_unknown_fields_never_reaches_disk() {
     // One full batch of valid events, so they are committed to the WAL while
     // the daemon is still running and the WAL file can be scanned too.
     let mut daemon = TestDaemon::start_with(|config| config.max_batch = 20);
-    let client = daemon.client();
+    let caller = daemon.caller();
 
     let mut smuggled = Vec::new();
     let mut top_level = valid_event_value(100);
@@ -237,12 +237,12 @@ fn raw_text_sent_through_unknown_fields_never_reaches_disk() {
     smuggled.push(nested);
 
     for event in &smuggled {
-        let response = client.post_event(&event.to_string());
+        let response = caller.post_event(&event.to_string());
         assert_eq!(response.status, 400, "{event}: {}", response.body);
         assert!(!response.body.contains(SENTINEL), "rejection echoes input");
     }
     for n in 0..20 {
-        assert_eq!(client.post_event(&valid_event(n)).status, 202);
+        assert_eq!(caller.post_event(&valid_event(n)).status, 202);
     }
     wait_for_stored_events(&daemon, 20);
     let scanned_live = assert_no_file_contains_sentinel(daemon.data_dir(), SkipShm::Yes);

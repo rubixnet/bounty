@@ -35,20 +35,20 @@ fn a_rejected_second_start_leaves_the_first_daemon_serving() {
     assert!(try_start_on(first.data_dir(), |_| {}).is_err());
 
     assert_eq!(first.token(), token_before, "token untouched");
-    assert_eq!(first.client().post_event(&valid_event(1)).status, 202);
+    assert_eq!(first.caller().post_event(&valid_event(1)).status, 202);
 }
 
 #[test]
 fn a_new_start_succeeds_after_the_first_daemon_shuts_down() {
     let mut first = TestDaemon::start();
-    assert_eq!(first.client().post_event(&valid_event(1)).status, 202);
+    assert_eq!(first.caller().post_event(&valid_event(1)).status, 202);
     first.shutdown();
 
     let second = try_start_on(first.data_dir(), |_| {}).expect("lock released on shutdown");
     second.shutdown().expect("graceful shutdown");
 
     let restarted = first.restart();
-    assert_eq!(restarted.client().post_event(&valid_event(2)).status, 202);
+    assert_eq!(restarted.caller().post_event(&valid_event(2)).status, 202);
 }
 
 #[test]
@@ -65,8 +65,8 @@ fn different_data_folders_run_side_by_side() {
     let first = TestDaemon::start();
     let second = TestDaemon::start();
 
-    assert_eq!(first.client().post_event(&valid_event(1)).status, 202);
-    assert_eq!(second.client().post_event(&valid_event(1)).status, 202);
+    assert_eq!(first.caller().post_event(&valid_event(1)).status, 202);
+    assert_eq!(second.caller().post_event(&valid_event(1)).status, 202);
 }
 
 #[test]

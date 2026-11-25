@@ -9,7 +9,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
-use common::{BusClient, TestDaemon, event_id, stored_event_count, try_start_on, valid_event};
+use common::{BusCaller, TestDaemon, event_id, stored_event_count, try_start_on, valid_event};
 use traction_daemon::{MAX_BODY_BYTES, StartError};
 
 fn read_token(data_dir: &Path) -> String {
@@ -20,7 +20,7 @@ fn read_token(data_dir: &Path) -> String {
 fn a_valid_event_over_the_socket_returns_202_and_is_stored() {
     let mut daemon = TestDaemon::start();
 
-    let response = daemon.socket_client().post_event(&valid_event(1));
+    let response = daemon.socket_caller().post_event(&valid_event(1));
 
     assert_eq!(response.status, 202, "{}", response.body);
     let db = daemon.shutdown_and_open_db();
@@ -34,17 +34,17 @@ fn a_valid_event_over_the_socket_returns_202_and_is_stored() {
 #[test]
 fn a_wrong_or_missing_token_over_the_socket_returns_401_and_nothing_is_stored() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.socket_client();
-    let mut wrong = client.token().to_owned();
+    let caller = daemon.socket_caller();
+    let mut wrong = caller.token().to_owned();
     let last = wrong.pop().expect("non-empty token");
     wrong.push(if last == 'a' { 'b' } else { 'a' });
 
-    let wrong_token = client
+    let wrong_token = caller
         .request("POST", "/v1/event")
         .header("Authorization", &format!("Bearer {wrong}"))
         .body(valid_event(1))
         .send();
-    let missing_token = client
+    let missing_token = caller
         .request("POST", "/v1/event")
         .without_header("Authorization")
         .body(valid_event(2))
@@ -78,28 +78,28 @@ fn the_socket_file_is_a_socket_with_mode_0600() {
 #[test]
 fn the_socket_skips_only_the_host_check() {
     let mut daemon = TestDaemon::start();
-    let client = daemon.socket_client();
+    let caller = daemon.socket_caller();
 
-    let no_host = client
+    let no_host = caller
         .request("POST", "/v1/event")
         .without_header("Host")
         .body(valid_event(1))
         .send();
-    let foreign_host = client
+    let foreign_host = caller
         .request("POST", "/v1/event")
         .header("Host", "evil.example:41937")
         .body(valid_event(2))
         .send();
-    let foreign_origin = client
+    let foreign_origin = caller
         .request("POST", "/v1/event")
         .header("Origin", "http://evil.example")
         .body(valid_event(3))
         .send();
-    let too_large = client
+    let too_large = caller
         .request("POST", "/v1/event")
         .body(vec![b' '; MAX_BODY_BYTES + 1])
         .send();
-    let invalid = client.post_event("{}");
+    let invalid = caller.post_event("{}");
 
     assert_eq!(no_host.status, 202, "{}", no_host.body);
     assert_eq!(foreign_host.status, 202, "{}", foreign_host.body);
@@ -120,10 +120,10 @@ fn a_stale_socket_left_by_a_dead_daemon_is_replaced() {
     drop(UnixListener::bind(&path).expect("stale socket"));
 
     let daemon = try_start_on(data_dir.path(), |_| {}).expect("daemon replaces the stale socket");
-    let client =
-        BusClient::new(daemon.local_addr(), read_token(data_dir.path())).via_socket(path.clone());
+    let caller =
+        BusCaller::new(daemon.local_addr(), read_token(data_dir.path())).via_socket(path.clone());
 
-    assert_eq!(client.post_event(&valid_event(1)).status, 202);
+    assert_eq!(caller.post_event(&valid_event(1)).status, 202);
     let mode = std::fs::symlink_metadata(&path)
         .expect("socket")
         .permissions()
@@ -146,7 +146,7 @@ fn a_live_socket_is_never_replaced() {
         result.err()
     );
     assert_eq!(
-        other.socket_client().post_event(&valid_event(1)).status,
+        other.socket_caller().post_event(&valid_event(1)).status,
         202
     );
 }
@@ -182,7 +182,7 @@ fn a_second_daemon_without_the_lock_leaves_the_socket_alone() {
         .ino();
     assert_eq!(after, inode);
     assert_eq!(
-        daemon.socket_client().post_event(&valid_event(1)).status,
+        daemon.socket_caller().post_event(&valid_event(1)).status,
         202
     );
 }

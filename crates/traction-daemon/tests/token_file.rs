@@ -19,7 +19,7 @@ fn first_start_writes_a_32_byte_hex_token_that_authenticates() {
     let daemon = TestDaemon::start();
 
     assert_is_token(&daemon.token());
-    assert_eq!(daemon.client().post_event(&valid_event(1)).status, 202);
+    assert_eq!(daemon.caller().post_event(&valid_event(1)).status, 202);
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn restart_reuses_the_same_token() {
     let daemon = daemon.restart();
 
     assert_eq!(daemon.token(), before);
-    assert_eq!(daemon.client().post_event(&valid_event(1)).status, 202);
+    assert_eq!(daemon.caller().post_event(&valid_event(1)).status, 202);
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn malformed_token_file_is_regenerated_on_start() {
 
     let regenerated = daemon.token();
     assert_is_token(&regenerated);
-    assert_eq!(daemon.client().post_event(&valid_event(1)).status, 202);
+    assert_eq!(daemon.caller().post_event(&valid_event(1)).status, 202);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

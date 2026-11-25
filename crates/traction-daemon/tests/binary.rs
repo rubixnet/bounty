@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::BusClient;
+use common::BusCaller;
 #[cfg(unix)]
 use common::{open_db_read_only, stored_event_count, valid_event};
 
@@ -78,9 +78,9 @@ impl RunningDaemon {
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
-    fn client(&self, data_dir: &Path) -> BusClient {
+    fn caller(&self, data_dir: &Path) -> BusCaller {
         let token = std::fs::read_to_string(data_dir.join("daemon.token")).expect("token file");
-        BusClient::new(self.addr, token)
+        BusCaller::new(self.addr, token)
     }
 
     #[cfg(unix)]
@@ -149,9 +149,9 @@ fn binary_on_a_taken_port_prints_one_line_and_exits_non_zero() {
 fn assert_signal_flushes_accepted_events(signal: &str) {
     let data_dir = tempfile::tempdir().expect("temp data folder");
     let mut daemon = RunningDaemon::spawn(data_dir.path());
-    let client = daemon.client(data_dir.path());
+    let caller = daemon.caller(data_dir.path());
     for n in 1..=3 {
-        assert_eq!(client.post_event(&valid_event(n)).status, 202);
+        assert_eq!(caller.post_event(&valid_event(n)).status, 202);
     }
 
     // The default commit interval (5 s) has not elapsed: only the graceful
@@ -190,8 +190,8 @@ fn the_lock_is_released_when_the_daemon_is_killed() {
 
 #[cfg(unix)]
 fn assert_socket_accepts_events(daemon: &RunningDaemon, data_dir: &Path, socket: &Path) {
-    let client = daemon.client(data_dir).via_socket(socket.to_path_buf());
-    assert_eq!(client.post_event(&valid_event(1)).status, 202);
+    let caller = daemon.caller(data_dir).via_socket(socket.to_path_buf());
+    assert_eq!(caller.post_event(&valid_event(1)).status, 202);
 }
 
 #[cfg(unix)]
