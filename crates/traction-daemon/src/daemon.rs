@@ -120,6 +120,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         aliases,
         sessions,
     );
+    router.set_attribution_timing(config.watcher.trailing_window, config.watcher.hold);
     // Re-attach every stored (non-merged) Project before anything can edit
     // unobserved; later registrations attach on the Router thread before
     // they are answered.

@@ -41,6 +41,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use traction_core::{NetworkClass, TractionEvent, dir_project_id, git_project_id};
 
+use crate::attribution::Attribution;
+use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW};
 use crate::exclusions::{Exclusions, has_project_marker};
 use crate::git::Git;
 use crate::log;
@@ -135,6 +137,8 @@ pub struct Router {
     git_stamps: HashMap<PathBuf, Option<Option<Stamp>>>,
     sessions: HashMap<(&'static str, String), SessionState>,
     hooks: Vec<ProjectHook>,
+    /// In-memory attribution windows (never persisted).
+    windows: Attribution,
     writer_gone_logged: bool,
 }
 
@@ -191,8 +195,16 @@ impl Router {
             git_stamps: HashMap::new(),
             sessions,
             hooks: Vec::new(),
+            windows: Attribution::new(LOG_TAIL_TRAILING_WINDOW, LOG_TAIL_HOLD),
             writer_gone_logged: false,
         }
+    }
+
+    /// Replaces the attribution windows' timing (test overrides of
+    /// [`LOG_TAIL_TRAILING_WINDOW`] and [`LOG_TAIL_HOLD`]). Call before any
+    /// event is routed.
+    pub fn set_attribution_timing(&mut self, trailing_window: Duration, hold: Duration) {
+        self.windows = Attribution::new(trailing_window, hold);
     }
 
     /// Adds a hook told about every Project registered from now on.
@@ -582,12 +594,24 @@ impl Router {
     /// The watcher builds every mutation as manual work (no Harness, no
     /// session, `network_class: manual`). This is the single attribution
     /// decision point: it runs on the Router thread, after every event the
-    /// bus accepted before the hold ended, so window state built from those
-    /// events (step 1b ticket 08) can claim the edit here by copying the
-    /// winning session's `harness_id`, `session_id` and `network_class`.
+    /// bus accepted before the hold ended, so the window covering the
+    /// mutation's timestamp on its own Project (if any) claims it by
+    /// copying the winning session's `harness_id`, `session_id` and
+    /// `network_class`.
     fn attribute(&self, mutation: &mut TractionEvent) {
         debug_assert!(mutation.harness_id.is_none() && mutation.session_id.is_none());
         mutation.network_class = NetworkClass::Manual;
+        let Some(project) = mutation.project_id.as_deref() else {
+            return;
+        };
+        let claim = self
+            .windows
+            .claim(mutation.timestamp_ms, |id| self.final_id(id) == project);
+        if let Some(claim) = claim {
+            mutation.harness_id = Some(claim.harness_id);
+            mutation.session_id = Some(claim.session_id);
+            mutation.network_class = claim.network_class;
+        }
     }
 
     /// Attributes a watcher `FILE_MUTATION`, re-checks it against the
@@ -615,6 +639,8 @@ impl Router {
         let Some(event) = self.route(event) else {
             return;
         };
+        self.windows
+            .observe(&event, u64::try_from(now_ms()).unwrap_or_default());
         match EventRow::try_from(event) {
             Ok(row) => self.write(WriteOp::Event(Box::new(row))),
             // The bus ran `EventRow::check` before accepting it.
