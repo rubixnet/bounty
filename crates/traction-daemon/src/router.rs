@@ -33,7 +33,7 @@
 //! copy of the registry and sessions, loaded from SQLite at startup and
 //! updated as it queues writes, and never reads SQLite afterwards.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -41,7 +41,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
-use traction_core::{HarnessId, NetworkClass, TractionEvent, dir_project_id, git_project_id};
+use traction_core::{
+    AttributionSource, EventType, HarnessId, NetworkClass, TractionEvent, dir_project_id,
+    git_project_id,
+};
 
 use crate::attribution::Attribution;
 use crate::claude_code::pause::PauseAction;
@@ -55,8 +58,8 @@ use crate::paths::{self, is_within, same};
 use crate::pause::Pauses;
 use crate::secret::DeviceSecret;
 use crate::storage::{
-    EventRow, MigrationRow, ProjectKind, ProjectRow, SessionRow, StoredRegistry, WriteOp,
-    final_alias,
+    EventRow, MigrationRow, ProjectKind, ProjectRow, SessionRow, StoredRegistry, TailedBatch,
+    TailerStartRow, TranscriptOffset, WriteOp, final_alias,
 };
 use crate::writer::WriterSender;
 
@@ -159,6 +162,8 @@ pub struct Router {
     /// The `.git` entry last seen at each `dir:` Root.
     git_entries: HashMap<PathBuf, GitEntry>,
     sessions: HashMap<(HarnessId, String), SessionState>,
+    /// Sessions with a stored (or queued) `SESSION_START`.
+    started: HashSet<(HarnessId, String)>,
     /// Session Pause spans, loaded at startup.
     pauses: Pauses,
     hooks: Vec<ProjectHook>,
@@ -180,6 +185,7 @@ impl Router {
             projects,
             aliases,
             sessions,
+            started_sessions,
             pauses,
         } = stored;
         let pinned = projects
@@ -223,6 +229,7 @@ impl Router {
             pinned,
             git_entries: HashMap::new(),
             sessions,
+            started: started_sessions.into_iter().collect(),
             pauses: Pauses::new(pauses),
             hooks: Vec::new(),
             windows: Attribution::new(&WatcherSettings::default()),
@@ -677,19 +684,71 @@ impl Router {
 
     /// Routes `event` and queues it for the writer.
     fn handle_event(&mut self, event: TractionEvent) {
-        let Some(event) = self.route(event) else {
-            return;
-        };
+        if let Some(row) = self.routed_row(event) {
+            self.write(WriteOp::Event(Box::new(row)));
+        }
+    }
+
+    /// Routes `event`, feeds it to the attribution windows and converts it
+    /// to a row. `None` when it is dropped.
+    fn routed_row(&mut self, event: TractionEvent) -> Option<EventRow> {
+        if event.event_type == EventType::SessionStart
+            && let (Some(harness), Some(session)) = (event.harness_id, &event.session_id)
+        {
+            self.started.insert((harness, session.clone()));
+        }
+        let event = self.route(event)?;
         self.windows
             .observe(&event, u64::try_from(now_ms()).unwrap_or_default());
         if self.is_paused(&event) {
-            return;
+            return None;
         }
         match EventRow::try_from(event) {
-            Ok(row) => self.write(WriteOp::Event(Box::new(row))),
-            // The bus ran `EventRow::check` before accepting it.
-            Err(_) => log::warn("dropped a routed event that does not fit the events table"),
+            Ok(row) => Some(row),
+            // The bus ran `EventRow::check` before accepting it, and the
+            // daemon's own Adapters build only rows that fit.
+            Err(_) => {
+                log::warn("dropped a routed event that does not fit the events table");
+                None
+            }
         }
+    }
+
+    /// Whether a tailed (`harness_log`) event is stored. A synthesized
+    /// `SESSION_START` is dropped once one is stored for its session.
+    ///
+    /// A tailed record inside a paused span is already dropped by
+    /// [`Self::routed_row`] (pause spans compare the record's own
+    /// timestamp). Ticket 08 extends this single decision point with hook
+    /// coverage: a tailed record inside a run's
+    /// `[first_hook_ms, last_alive_ms]` is dropped here too.
+    fn keeps_tailed(&self, event: &TractionEvent) -> bool {
+        debug_assert_eq!(event.attribution_source, AttributionSource::HarnessLog);
+        match (event.event_type, event.harness_id, &event.session_id) {
+            (EventType::SessionStart, Some(harness), Some(session)) => {
+                !self.started.contains(&(harness, session.clone()))
+            }
+            _ => true,
+        }
+    }
+
+    /// Routes the events the transcript tailer read from one file and
+    /// queues them with the file's new offset as one write, so the offset
+    /// commits in the same transaction as its events. Dropped events still
+    /// advance the offset.
+    fn handle_tailed(&mut self, events: Vec<TractionEvent>, offset: TranscriptOffset) {
+        let mut rows = Vec::with_capacity(events.len());
+        for event in events {
+            if self.keeps_tailed(&event)
+                && let Some(row) = self.routed_row(event)
+            {
+                rows.push(row);
+            }
+        }
+        self.write(WriteOp::Tailed(TailedBatch {
+            events: rows,
+            offset,
+        }));
     }
 }
 
@@ -754,6 +813,14 @@ enum RouterMessage {
         path: PathBuf,
         reply: oneshot::Sender<RegisterReply>,
     },
+    /// Events the transcript tailer read from one file, with the offset
+    /// just past them.
+    Tailed {
+        events: Vec<TractionEvent>,
+        offset: TranscriptOffset,
+    },
+    /// The transcript tailer's first-ever start.
+    TailerStart(TailerStartRow),
 }
 
 /// The bus side of the Router's queue. Cheap to clone; never blocks.
@@ -793,6 +860,26 @@ impl RouterSender {
             .map_err(|_| RouterBusy)
     }
 
+    /// Queues events read from one transcript with the offset just past
+    /// them, waiting while the queue is full (only the tailer thread calls
+    /// it).
+    pub fn send_tailed(
+        &self,
+        events: Vec<TractionEvent>,
+        offset: TranscriptOffset,
+    ) -> Result<(), RouterBusy> {
+        self.0
+            .send(RouterMessage::Tailed { events, offset })
+            .map_err(|_| RouterBusy)
+    }
+
+    /// Queues the tailer's first-ever start record (waits while full).
+    pub fn send_tailer_start(&self, start: TailerStartRow) -> Result<(), RouterBusy> {
+        self.0
+            .send(RouterMessage::TailerStart(start))
+            .map_err(|_| RouterBusy)
+    }
+
     fn try_send(&self, message: RouterMessage) -> Result<(), RouterBusy> {
         self.0.try_send(message).map_err(|error| match error {
             TrySendError::Full(_) | TrySendError::Disconnected(_) => RouterBusy,
@@ -829,6 +916,8 @@ fn run(mut router: Router, receiver: &Receiver<RouterMessage>) {
                 // The caller may have given up waiting; nothing to do then.
                 let _ = reply.send(router.register_path(&path));
             }
+            RouterMessage::Tailed { events, offset } => router.handle_tailed(events, offset),
+            RouterMessage::TailerStart(start) => router.write(WriteOp::TailerStart(start)),
         }
     }
 }

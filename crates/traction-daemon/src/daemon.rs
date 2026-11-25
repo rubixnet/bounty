@@ -24,6 +24,7 @@ use std::thread::{self, JoinHandle};
 use tokio::sync::oneshot;
 
 use crate::bus::Bus;
+use crate::claude_code::tailer::{self, TailerThread};
 use crate::config::{DaemonConfig, GLOBAL_IGNORE_FILE};
 use crate::exclusions::Exclusions;
 use crate::git::Git;
@@ -43,6 +44,8 @@ pub struct DaemonHandle {
     local_addr: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
+    /// The Claude transcript tailer (absent without a Claude config dir).
+    tailer: Option<TailerThread>,
     watcher: Option<WatcherThread>,
     router: Option<RouterThread>,
     writer: Option<WriterThread>,
@@ -69,6 +72,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         DeviceSecret::load_or_create(&config.data_dir).map_err(StartError::DeviceSecret)?;
     let conn = storage::open(&config.data_dir).map_err(StartError::Database)?;
     let registry = storage::load_registry(&conn).map_err(StartError::Database)?;
+    let tailer_state = storage::load_tailer_state(&conn).map_err(StartError::Database)?;
 
     // Loopback IPv4 only: never `0.0.0.0` or `::`. No fallback port.
     let listener =
@@ -144,6 +148,19 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
             return Err(StartError::Runtime(error));
         }
     };
+    let tailer_thread = match &config.claude_config_dir {
+        None => None,
+        Some(dir) => match tailer::start(dir, tailer_state, router_sender.clone()) {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                drop(router_sender);
+                let _ = watcher_thread.stop();
+                let _ = router_thread.join();
+                let _ = writer_thread.join();
+                return Err(StartError::Runtime(error));
+            }
+        },
+    };
 
     let bus = Arc::new(Bus::new(token, router_sender, local_addr.port()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -169,6 +186,9 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         Err(error) => {
             // The closure (and its Router sender) was dropped; flush the
             // watcher, then let the Router, then the writer, exit.
+            if let Some(tailer) = tailer_thread {
+                let _ = tailer.stop();
+            }
             let _ = watcher_thread.stop();
             let _ = router_thread.join();
             let _ = writer_thread.join();
@@ -180,6 +200,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         local_addr,
         shutdown: Some(shutdown_tx),
         server: Some(server),
+        tailer: tailer_thread,
         watcher: Some(watcher_thread),
         router: Some(router_thread),
         writer: Some(writer_thread),
@@ -243,6 +264,8 @@ impl DaemonHandle {
             let _ = shutdown.send(());
         }
         let server = self.server.take().map(JoinHandle::join);
+        // Every batch the tailer handed over is already queued to the Router.
+        let tailer = self.tailer.take().map(TailerThread::stop);
         // Held mutations are decided and handed to the Router while it (and
         // the writer) still run.
         let watcher = self.watcher.take().map(WatcherThread::stop);
@@ -256,6 +279,9 @@ impl DaemonHandle {
         let writer = self.writer.take().map(WriterThread::join);
         if matches!(server, Some(Err(_))) {
             return Err(ShutdownError::ServerPanicked);
+        }
+        if matches!(tailer, Some(Err(_))) {
+            return Err(ShutdownError::TailerPanicked);
         }
         if matches!(watcher, Some(Err(_))) {
             return Err(ShutdownError::WatcherPanicked);
@@ -378,6 +404,7 @@ impl std::error::Error for StartError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownError {
     ServerPanicked,
+    TailerPanicked,
     WatcherPanicked,
     RouterPanicked,
     WriterPanicked,
@@ -387,6 +414,7 @@ impl fmt::Display for ShutdownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ServerPanicked => f.write_str("the bus thread panicked"),
+            Self::TailerPanicked => f.write_str("the Claude transcript tailer thread panicked"),
             Self::WatcherPanicked => f.write_str("the file watcher thread panicked"),
             Self::RouterPanicked => f.write_str("the Project Router thread panicked"),
             Self::WriterPanicked => f.write_str("the SQLite writer thread panicked"),

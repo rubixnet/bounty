@@ -243,7 +243,7 @@ pub fn map_hook(body: &[u8], received_ms: u64) -> HookAction {
 
 /// `value` cut to [`MAX_IDENTIFIER_LEN`] bytes, kept only when it is a safe
 /// identifier (letters, digits, `.`, `_`, `-`, `:`, `/`): never prose.
-fn capped_identifier(mut value: String) -> Option<String> {
+pub(crate) fn capped_identifier(mut value: String) -> Option<String> {
     let safe = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':' | b'/');
     if value.is_empty() || !value.bytes().all(safe) {
         return None;

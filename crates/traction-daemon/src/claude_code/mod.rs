@@ -7,7 +7,13 @@
 //!   else `~/.claude`).
 //! - [`pause`]: the `/stop-track` / `/resume-track` commands (Session
 //!   Pause), shared by the hook endpoint and the installer.
+//! - [`transcript`]: one session transcript record, mapped to zero or more
+//!   content-free Traction Events.
+//! - [`tailer`]: discovers, reads and resumes transcripts, then hands the
+//!   mapped events to the Router.
 
 pub mod config_dir;
 pub mod hook;
 pub mod pause;
+pub mod tailer;
+pub mod transcript;

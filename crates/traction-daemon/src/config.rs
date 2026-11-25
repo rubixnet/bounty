@@ -74,6 +74,11 @@ pub struct DaemonConfig {
     pub git_program: PathBuf,
     /// File watcher tuning.
     pub watcher: WatcherSettings,
+    /// Claude Code's config folder, whose `projects/` the transcript tailer
+    /// watches. Default: [`crate::claude_code::config_dir::claude_config_dir`]
+    /// (the installer's rule). `None` turns the tailer off. Tests point it at a
+    /// folder under their fake home.
+    pub claude_config_dir: Option<PathBuf>,
     /// The Local Ingestion Bus Unix socket (macOS/Linux only). Default from
     /// [`default_socket_path`].
     #[cfg(unix)]
@@ -83,6 +88,7 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     /// Production defaults on the given data folder.
     pub fn new(data_dir: PathBuf) -> Self {
+        let home = std::env::home_dir().filter(|home| home.is_absolute());
         Self {
             #[cfg(unix)]
             socket_path: default_socket_path(
@@ -92,7 +98,8 @@ impl DaemonConfig {
             data_dir,
             http_port: DEFAULT_HTTP_PORT,
             writer: WriterSettings::default(),
-            home_dir: std::env::home_dir().filter(|home| home.is_absolute()),
+            claude_config_dir: crate::claude_code::config_dir::claude_config_dir(),
+            home_dir: home,
             git_program: PathBuf::from(DEFAULT_GIT_PROGRAM),
             watcher: WatcherSettings::default(),
         }
