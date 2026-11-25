@@ -7,7 +7,8 @@
 //! `--settings` and `--claude-program` (or a temp `CLAUDE_CONFIG_DIR`),
 //! points `HOME`/`USERPROFILE`/`XDG_CONFIG_HOME` at a temp home so default
 //! profiles resolve inside it, and on Windows redirects the per-user env var
-//! to a scratch `HKCU` key (`--windows-env-key`) that is deleted afterwards.
+//! to a scratch `HKCU` key (the test-only `--windows-env-key`) that is
+//! deleted afterwards, with its `HKCU\Software\TractionTest` parent once empty.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -56,12 +57,23 @@ struct Setup {
     env_key: String,
 }
 
+/// The scratch parent key every test's `HKCU` subkey sits under.
+#[cfg(windows)]
+const TEST_ENV_PARENT: &str = "Software\\TractionTest";
+
 #[cfg(windows)]
 impl Drop for Setup {
     fn drop(&mut self) {
         let _ = Command::new("reg")
             .args(["delete", &format!("HKCU\\{}", self.env_key), "/f"])
             .output();
+        // Then the parent, once no other test's subkey is left under it.
+        // `RegDeleteKeyW` refuses a key that still has subkeys, so tests
+        // running in parallel never lose theirs (unlike `reg delete /f`).
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyW};
+        let parent: Vec<u16> = TEST_ENV_PARENT.encode_utf16().chain([0]).collect();
+        // SAFETY: `parent` is a live, NUL-terminated UTF-16 buffer.
+        let _ = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, parent.as_ptr()) };
     }
 }
 
@@ -78,7 +90,7 @@ impl Setup {
         Self {
             #[cfg(windows)]
             env_key: format!(
-                "Software\\TractionTest\\{}",
+                "{TEST_ENV_PARENT}\\{}",
                 dir.path().file_name().unwrap().to_string_lossy()
             ),
             dir,

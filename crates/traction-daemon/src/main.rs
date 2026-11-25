@@ -20,7 +20,8 @@
 //!   profile (default: the existing zsh, bash, fish and PowerShell ones; any
 //!   `--profile` replaces that list), prints a summary to stdout and exits.
 //!   On Windows it also sets `TRACTION_TOKEN` under `HKCU\Environment`
-//!   (`--windows-env-key <subkey>` redirects that, for tests).
+//!   (the test-only `--windows-env-key <subkey>` redirects that to a scratch
+//!   key; it is deliberately left out of the usage text).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -133,6 +134,8 @@ fn install(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
             Some("--profile") => {
                 profiles.push(PathBuf::from(args.next().ok_or("--profile needs a path")?));
             }
+            // Test-only (the Seam B tests' scratch `HKCU` key): left out of
+            // INSTALL_USAGE so users never see or rely on it.
             #[cfg(windows)]
             Some("--windows-env-key") => {
                 install.windows_env_key = args
