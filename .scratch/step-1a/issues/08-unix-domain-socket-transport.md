@@ -4,13 +4,13 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] The socket path is configurable. It defaults to `$XDG_RUNTIME_DIR/traction.sock`, and falls back to `<data dir>/daemon.sock` when `XDG_RUNTIME_DIR` is unset.
-- [ ] The socket file mode is `0600`. A stale socket file left by a dead daemon is safely replaced only while the single-instance lock is held.
-- [ ] `POST /v1/event` over the socket uses the same token, body-size cap, validation and writer path as HTTP. It skips only the `Host` check.
-- [ ] Unix-only integration tests:
+- [x] The socket path is configurable. It defaults to `$XDG_RUNTIME_DIR/traction.sock`, and falls back to `<data dir>/daemon.sock` when `XDG_RUNTIME_DIR` is unset.
+- [x] The socket file mode is `0600`. A stale socket file left by a dead daemon is safely replaced only while the single-instance lock is held.
+- [x] `POST /v1/event` over the socket uses the same token, body-size cap, validation and writer path as HTTP. It skips only the `Host` check.
+- [x] Unix-only integration tests:
   - a valid request returns `202` and the event is persisted;
   - a bad token returns `401`;
   - the socket file mode is `0600`.
-- [ ] The daemon still builds and all tests pass on Windows, where the socket code is compiled out.
+- [x] The daemon still builds and all tests pass on Windows, where the socket code is compiled out.
