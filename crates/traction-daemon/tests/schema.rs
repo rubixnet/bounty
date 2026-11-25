@@ -56,12 +56,12 @@ fn column(db: &Connection, table: &str, name: &str) -> (String, bool) {
 }
 
 #[test]
-fn a_new_database_is_at_migration_2() {
+fn a_new_database_is_at_migration_3() {
     let mut daemon = TestDaemon::start();
 
     let db = daemon.shutdown_and_open_db();
 
-    assert_eq!(user_version(&db), 2);
+    assert_eq!(user_version(&db), 3);
 }
 
 #[test]
@@ -195,7 +195,7 @@ fn a_1a_era_database_upgrades_and_keeps_its_events() {
     handle.shutdown().expect("graceful shutdown");
 
     let db = open_db_read_only(data_dir.path());
-    assert_eq!(user_version(&db), 2);
+    assert_eq!(user_version(&db), 3);
     assert_eq!(stored_event_count(&db), 2);
     let old: (
         String,

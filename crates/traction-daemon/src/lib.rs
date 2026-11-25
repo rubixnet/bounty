@@ -35,5 +35,5 @@ pub use exclusions::{DEPENDENCY_FOLDERS, PROJECT_MARKER_EXTENSION, PROJECT_MARKE
 pub use lock::LOCK_FILE;
 pub use router::RESOLUTION_TTL;
 pub use secret::DEVICE_SECRET_FILE;
-pub use storage::DB_FILE;
+pub use storage::{DB_FILE, PROJECT_EVENT_VIEW};
 pub use token::TOKEN_FILE;

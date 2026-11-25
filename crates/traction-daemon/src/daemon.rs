@@ -66,6 +66,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         DeviceSecret::load_or_create(&config.data_dir).map_err(StartError::DeviceSecret)?;
     let conn = storage::open(&config.data_dir).map_err(StartError::Database)?;
     let projects = storage::load_projects(&conn).map_err(StartError::Database)?;
+    let aliases = storage::load_aliases(&conn).map_err(StartError::Database)?;
     let sessions = storage::load_sessions(&conn).map_err(StartError::Database)?;
 
     // Loopback IPv4 only: never `0.0.0.0` or `::`. No fallback port.
@@ -112,6 +113,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         device_secret,
         writer_sender,
         projects,
+        aliases,
         sessions,
     );
     let (router_sender, router_thread) = match router::spawn(router, config.writer.queue_capacity) {

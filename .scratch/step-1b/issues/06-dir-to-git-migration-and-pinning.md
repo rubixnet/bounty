@@ -4,9 +4,9 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Migration test: pre-migration rows byte-for-byte unchanged; alias row exists; post-migration rows (incl. late old-`dir:` event) under `git:`; alias-aware view returns both sets; all survives a restart.
-- [ ] Idempotent replay; alias chains resolved to final ID; cycles refused.
-- [ ] `.git` appearing at a known `dir:` root invalidates the cache immediately.
-- [ ] Adding `origin` after first routing doesn't change the `git:` ID.
+- [x] Migration test: pre-migration rows byte-for-byte unchanged; alias row exists; post-migration rows (incl. late old-`dir:` event) under `git:`; alias-aware view returns both sets; all survives a restart.
+- [x] Idempotent replay; alias chains resolved to final ID; cycles refused.
+- [x] `.git` appearing at a known `dir:` root invalidates the cache immediately.
+- [x] Adding `origin` after first routing doesn't change the `git:` ID.

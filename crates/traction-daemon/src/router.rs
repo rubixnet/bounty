@@ -12,9 +12,18 @@
 //! 4. resolves the folder ([`Router::resolve`]): the Git root (worktrees
 //!    collapsed through the common dir), else the nearest marker folder,
 //!    else, when the folder is inside it, the session's start folder;
-//! 5. registers a Project seen for the first time (a [`WriteOp::Project`],
+//! 5. migrates any registered `dir:` Project inside a `git:` Root it just
+//!    resolved (alias-only, one [`WriteOp::Migration`]);
+//! 6. resolves the ID through `project_alias` to its final ID, so a late
+//!    event for a migrated `dir:` Project lands under the `git:` ID;
+//! 7. registers a Project seen for the first time (a [`WriteOp::Project`],
 //!    then every [`ProjectHook`] is told); and
-//! 6. replaces any Adapter-supplied `project_id` and queues the event.
+//! 8. replaces any Adapter-supplied `project_id` and queues the event.
+//!
+//! `git:` IDs are pinned per canonical common dir: the first ID stored for
+//! a repo is reused even after `origin` changes. A `.git` entry appearing
+//! (or changing) at a `dir:` Root drops that Root's cached resolutions at
+//! once, so `git init` + first commit migrates on the next event.
 //!
 //! Registry and session writes go through the single writer, in the same
 //! channel as the events they precede. The Router keeps its own in-memory
@@ -26,6 +35,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
+use std::time::SystemTime as Stamp;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
@@ -36,7 +46,9 @@ use crate::git::Git;
 use crate::log;
 use crate::paths::{self, is_within, same};
 use crate::secret::DeviceSecret;
-use crate::storage::{EventRow, ProjectKind, ProjectRow, SessionRow, WriteOp};
+use crate::storage::{
+    EventRow, MigrationRow, ProjectKind, ProjectRow, SessionRow, WriteOp, final_alias,
+};
 use crate::writer::WriterSender;
 
 /// How long a folder's resolution is reused before Git is asked again.
@@ -62,10 +74,15 @@ pub struct RegisteredProject {
     pub kind: ProjectKind,
     /// Canonical Project Root.
     pub root: PathBuf,
+    /// Set when this `dir:` Project was just merged into the `git:` Project
+    /// with this ID: it is no longer registered and its watcher moves to
+    /// the `git:` Project (announced separately, right after, when new).
+    pub merged_into: Option<String>,
 }
 
-/// Called on the Router thread, after the registration write is queued,
-/// for every newly registered Project (the file watcher attaches here).
+/// Called on the Router thread, after the write is queued, for every newly
+/// registered Project and for every `dir:` Project merged by a migration
+/// (`merged_into` set). The file watcher attaches here.
 pub type ProjectHook = Box<dyn FnMut(&RegisteredProject) + Send>;
 
 /// Why `/v1/project` refused a path (answered as `422`).
@@ -109,6 +126,13 @@ pub struct Router {
     ttl: Duration,
     cache: HashMap<PathBuf, CacheEntry>,
     projects: HashMap<String, RegisteredProject>,
+    /// `project_alias`: old ID -> current ID.
+    aliases: HashMap<String, String>,
+    /// Pinned `git:` IDs by canonical common dir ([`pin_key`]).
+    pinned: HashMap<String, String>,
+    /// The `.git` entry last seen at each `dir:` Root: `None` when absent,
+    /// else its mtime.
+    git_stamps: HashMap<PathBuf, Option<Option<Stamp>>>,
     sessions: HashMap<(&'static str, String), SessionState>,
     hooks: Vec<ProjectHook>,
     writer_gone_logged: bool,
@@ -122,8 +146,16 @@ impl Router {
         secret: DeviceSecret,
         writer: WriterSender,
         projects: Vec<ProjectRow>,
+        aliases: Vec<(String, String)>,
         sessions: Vec<SessionRow>,
     ) -> Self {
+        let pinned = projects
+            .iter()
+            .filter_map(|row| {
+                let dir = row.git_common_dir.as_deref()?;
+                Some((pin_key(Path::new(dir)), row.project_id.clone()))
+            })
+            .collect();
         let projects = projects
             .into_iter()
             .map(|row| {
@@ -131,6 +163,7 @@ impl Router {
                     root: PathBuf::from(&row.root_path),
                     project_id: row.project_id,
                     kind: row.kind,
+                    merged_into: None,
                 };
                 (project.project_id.clone(), project)
             })
@@ -153,6 +186,9 @@ impl Router {
             ttl: RESOLUTION_TTL,
             cache: HashMap::new(),
             projects,
+            aliases: aliases.into_iter().collect(),
+            pinned,
+            git_stamps: HashMap::new(),
             sessions,
             hooks: Vec::new(),
             writer_gone_logged: false,
@@ -174,7 +210,6 @@ impl Router {
 
     /// Forgets every cached resolution of a folder at or below `root`, or
     /// resolving to `root`, so the next event asks Git again.
-    #[allow(dead_code, reason = "used by dir-to-git migration (step 1b ticket 06)")]
     pub fn invalidate(&mut self, root: &Path) {
         self.cache.retain(|folder, entry| {
             let resolves_there = entry
@@ -202,16 +237,94 @@ impl Router {
         if excluded_by_user {
             return None;
         }
-        let resolution = match &canonical_cwd {
-            Some(folder) => self.resolve(folder),
-            None => None,
+        let folder = canonical_cwd.as_deref();
+        let start_folder = start_folder.as_deref();
+        let mut resolution = self.resolve_event(folder, start_folder);
+        if let Some(root) = self.repo_appeared(resolution.as_ref()) {
+            self.invalidate(&root);
+            resolution = self.resolve_event(folder, start_folder);
         }
-        .or_else(|| self.resolve_start_folder(canonical_cwd.as_deref(), start_folder.as_deref()));
-        if let Some(resolution) = &resolution {
+        event.project_id = resolution.map(|r| self.settle(&r));
+        Some(event)
+    }
+
+    fn resolve_event(
+        &mut self,
+        folder: Option<&Path>,
+        start_folder: Option<&str>,
+    ) -> Option<Resolution> {
+        folder
+            .and_then(|folder| self.resolve(folder))
+            .or_else(|| self.resolve_start_folder(folder, start_folder))
+    }
+
+    /// The Root of a `dir:` resolution whose `.git` entry appeared or
+    /// changed since last seen (a `git init` or a first commit), so its
+    /// cached resolutions are stale.
+    fn repo_appeared(&mut self, resolution: Option<&Resolution>) -> Option<PathBuf> {
+        let resolution = resolution.filter(|r| r.kind == ProjectKind::Dir)?;
+        let stamp = std::fs::symlink_metadata(resolution.root.join(".git"))
+            .ok()
+            .map(|meta| meta.modified().ok());
+        let changed = match self.git_stamps.insert(resolution.root.clone(), stamp) {
+            Some(previous) => previous != stamp,
+            None => stamp.is_some(),
+        };
+        changed.then(|| resolution.root.clone())
+    }
+
+    /// Migrates, aliases and registers as needed; returns the final ID.
+    fn settle(&mut self, resolution: &Resolution) -> String {
+        if resolution.kind == ProjectKind::Git {
+            self.migrate_into(resolution);
+        }
+        let id = self.final_id(&resolution.project_id);
+        if id == resolution.project_id {
             self.register(resolution);
         }
-        event.project_id = resolution.map(|r| r.project_id);
-        Some(event)
+        id
+    }
+
+    /// `id` resolved through `project_alias` (itself when not aliased, or
+    /// when its chain is broken).
+    fn final_id(&self, id: &str) -> String {
+        final_alias(|current| self.aliases.get(current).cloned(), id)
+            .unwrap_or_else(|| id.to_owned())
+    }
+
+    /// Alias-only migration of every registered `dir:` Project whose Root
+    /// lies inside the `git:` Root just resolved (a `git init` + commit on
+    /// it, or a `dir:` fallback taken while Git was unavailable).
+    fn migrate_into(&mut self, resolution: &Resolution) {
+        let mut merged: Vec<RegisteredProject> = self
+            .projects
+            .values()
+            .filter(|p| p.kind == ProjectKind::Dir && is_within(&p.root, &resolution.root))
+            .cloned()
+            .collect();
+        if merged.is_empty() {
+            return;
+        }
+        merged.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        let into = self.final_id(&resolution.project_id);
+        let row = self.project_row(resolution);
+        for mut dir in merged {
+            if into == dir.project_id {
+                log::warn("refused a Project migration that would close an alias cycle");
+                continue;
+            }
+            self.write(WriteOp::Migration(MigrationRow {
+                alias_id: dir.project_id.clone(),
+                into: row.clone(),
+                migrated_at_ms: now_ms(),
+            }));
+            self.projects.remove(&dir.project_id);
+            self.aliases.insert(dir.project_id.clone(), into.clone());
+            dir.merged_into = Some(into.clone());
+            for hook in &mut self.hooks {
+                hook(&dir);
+            }
+        }
     }
 
     /// Registers the Project Root `path` resolves to (`/v1/project`).
@@ -232,11 +345,16 @@ impl Router {
         if self.exclusions.is_excluded(&folder) {
             return Err(RegisterError::Excluded);
         }
-        let resolution = self
+        let mut resolution = self
             .resolve(&folder)
-            .unwrap_or_else(|| self.dir_resolution(folder));
-        self.register(&resolution);
-        Ok(resolution.project_id)
+            .unwrap_or_else(|| self.dir_resolution(folder.clone()));
+        if let Some(root) = self.repo_appeared(Some(&resolution)) {
+            self.invalidate(&root);
+            resolution = self
+                .resolve(&folder)
+                .unwrap_or_else(|| self.dir_resolution(folder));
+        }
+        Ok(self.settle(&resolution))
     }
 
     /// Resolves a canonical folder through the Git root and nearest-marker
@@ -305,9 +423,17 @@ impl Router {
         }
         match self.git.root_commit(candidate).ok()? {
             Some(commit) => {
-                let origin = self.git.origin_url(candidate).ok().flatten();
+                // ID pinning: the first ID stored for this common dir wins,
+                // even after `origin` changes.
+                let project_id = match self.pinned.get(&pin_key(&common_dir)) {
+                    Some(pinned) => pinned.clone(),
+                    None => {
+                        let origin = self.git.origin_url(candidate).ok().flatten();
+                        git_project_id(&commit, origin.as_deref())
+                    }
+                };
                 Some(Resolution {
-                    project_id: git_project_id(&commit, origin.as_deref()),
+                    project_id,
                     kind: ProjectKind::Git,
                     root,
                     git_common_dir: Some(common_dir),
@@ -396,12 +522,31 @@ impl Router {
         if self.projects.contains_key(&resolution.project_id) {
             return;
         }
+        let row = self.project_row(resolution);
+        if let Some(dir) = &resolution.git_common_dir {
+            self.pinned
+                .insert(pin_key(dir), resolution.project_id.clone());
+        }
+        self.write(WriteOp::Project(row));
+        let project = RegisteredProject {
+            project_id: resolution.project_id.clone(),
+            kind: resolution.kind,
+            root: resolution.root.clone(),
+            merged_into: None,
+        };
+        for hook in &mut self.hooks {
+            hook(&project);
+        }
+        self.projects.insert(project.project_id.clone(), project);
+    }
+
+    fn project_row(&self, resolution: &Resolution) -> ProjectRow {
         let root_path = resolution.root.to_str().unwrap_or_default().to_owned();
         let name = resolution
             .root
             .file_name()
             .map_or_else(|| root_path.clone(), |n| n.to_string_lossy().into_owned());
-        let row = ProjectRow {
+        ProjectRow {
             project_id: resolution.project_id.clone(),
             kind: resolution.kind,
             home_relative_path: self.home_relative(&resolution.root),
@@ -412,17 +557,7 @@ impl Router {
                 .git_common_dir
                 .as_ref()
                 .map(|dir| dir.to_str().unwrap_or_default().to_owned()),
-        };
-        self.write(WriteOp::Project(row));
-        let project = RegisteredProject {
-            project_id: resolution.project_id.clone(),
-            kind: resolution.kind,
-            root: resolution.root.clone(),
-        };
-        for hook in &mut self.hooks {
-            hook(&project);
         }
-        self.projects.insert(project.project_id.clone(), project);
     }
 
     /// `~/a/b` for a root inside `$HOME` (always `/`-separated).
@@ -454,6 +589,16 @@ impl Router {
             // The bus ran `EventRow::check` before accepting it.
             Err(_) => log::warn("dropped a routed event that does not fit the events table"),
         }
+    }
+}
+
+/// The pinning key of a canonical common dir (case-folded on Windows).
+fn pin_key(common_dir: &Path) -> String {
+    let text = common_dir.to_string_lossy();
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text.into_owned()
     }
 }
 
