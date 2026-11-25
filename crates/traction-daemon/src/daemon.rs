@@ -3,8 +3,10 @@
 //! the writer and returns once everything accepted is committed.
 //!
 //! Threads: one runs a single-threaded tokio runtime serving the bus, one is
-//! the SQLite writer. Startup order matters: data folder, (single-instance
-//! lock, ticket 07), token, database, listener, writer, server.
+//! the SQLite writer. Startup order matters: data folder, single-instance
+//! lock, token, database, listener, writer, server. Nothing in the data
+//! folder (token, database, later the socket) is touched before the lock is
+//! held, and the lock is released only after every thread has stopped.
 
 use std::fmt;
 use std::io;
@@ -17,6 +19,7 @@ use tokio::sync::oneshot;
 
 use crate::bus::Bus;
 use crate::config::DaemonConfig;
+use crate::lock::{InstanceLock, LockError};
 use crate::token::BusToken;
 use crate::writer::{self, WriterSettings, WriterThread};
 use crate::{http, log, storage};
@@ -27,20 +30,33 @@ pub struct DaemonHandle {
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
     writer: Option<WriterThread>,
+    /// Dropped last (after `stop` joined every thread), so a new daemon can
+    /// only start once this one has flushed.
+    _lock: InstanceLock,
 }
 
 /// Starts the daemon described by `config`.
 pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     create_data_dir(&config.data_dir).map_err(StartError::DataDir)?;
+    let lock = InstanceLock::acquire(&config.data_dir).map_err(|error| match error {
+        LockError::AlreadyRunning => StartError::AlreadyRunning,
+        LockError::Io(error) => StartError::Lock(error),
+    })?;
     let token = BusToken::load_or_create(&config.data_dir).map_err(StartError::Token)?;
     let conn = storage::open(&config.data_dir).map_err(StartError::Database)?;
 
     // Loopback IPv4 only: never `0.0.0.0` or `::`. No fallback port.
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, config.http_port)).map_err(|source| {
-            StartError::Bind {
-                port: config.http_port,
-                source,
+            if source.kind() == io::ErrorKind::AddrInUse {
+                StartError::PortInUse {
+                    port: config.http_port,
+                }
+            } else {
+                StartError::Bind {
+                    port: config.http_port,
+                    source,
+                }
             }
         })?;
     listener
@@ -93,6 +109,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         shutdown: Some(shutdown_tx),
         server: Some(server),
         writer: Some(writer_thread),
+        _lock: lock,
     })
 }
 
@@ -144,9 +161,21 @@ fn create_data_dir(path: &Path) -> io::Result<()> {
 #[derive(Debug)]
 pub enum StartError {
     DataDir(io::Error),
+    /// Another daemon already holds the single-instance lock on this data
+    /// folder. Distinct so the binary can exit with a one-line message.
+    AlreadyRunning,
+    /// The single-instance lock could not be created or checked.
+    Lock(io::Error),
     Token(io::Error),
     Database(rusqlite::Error),
-    Bind { port: u16, source: io::Error },
+    /// The configured port is taken. The daemon never falls back to another.
+    PortInUse {
+        port: u16,
+    },
+    Bind {
+        port: u16,
+        source: io::Error,
+    },
     Runtime(io::Error),
 }
 
@@ -154,8 +183,17 @@ impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DataDir(e) => write!(f, "cannot create the data folder: {e}"),
+            Self::AlreadyRunning => {
+                f.write_str("another Traction daemon is already running for this data folder")
+            }
+            Self::Lock(e) => write!(f, "cannot take the single-instance lock: {e}"),
             Self::Token(e) => write!(f, "cannot read or create daemon.token: {e}"),
             Self::Database(e) => write!(f, "cannot open the database: {e}"),
+            Self::PortInUse { port } => write!(
+                f,
+                "port {port} on 127.0.0.1 is already in use by another program; \
+                 free it or configure another port (no automatic fallback)"
+            ),
             Self::Bind { port, source } => {
                 write!(f, "cannot listen on 127.0.0.1:{port}: {source}")
             }
@@ -167,7 +205,8 @@ impl fmt::Display for StartError {
 impl std::error::Error for StartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::DataDir(e) | Self::Token(e) | Self::Runtime(e) => Some(e),
+            Self::DataDir(e) | Self::Lock(e) | Self::Token(e) | Self::Runtime(e) => Some(e),
+            Self::AlreadyRunning | Self::PortInUse { .. } => None,
             Self::Bind { source, .. } => Some(source),
             Self::Database(e) => Some(e),
         }

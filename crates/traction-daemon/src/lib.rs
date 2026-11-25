@@ -8,6 +8,7 @@ mod bus;
 mod config;
 mod daemon;
 mod http;
+mod lock;
 mod log;
 mod storage;
 mod token;
@@ -19,5 +20,6 @@ pub use config::{
     DEFAULT_WRITER_QUEUE_CAPACITY, DaemonConfig,
 };
 pub use daemon::{DaemonHandle, ShutdownError, StartError, start};
+pub use lock::LOCK_FILE;
 pub use storage::DB_FILE;
 pub use token::TOKEN_FILE;

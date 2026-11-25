@@ -108,7 +108,18 @@ impl Drop for TestDaemon {
     }
 }
 
-fn test_config(data_dir: &Path) -> DaemonConfig {
+/// Starts another daemon on `data_dir` with the default test config and
+/// returns the raw result (single-instance and port-conflict tests).
+pub fn try_start_on(
+    data_dir: &Path,
+    adjust: impl FnOnce(&mut DaemonConfig),
+) -> Result<DaemonHandle, traction_daemon::StartError> {
+    let mut config = test_config(data_dir);
+    adjust(&mut config);
+    traction_daemon::start(config)
+}
+
+pub fn test_config(data_dir: &Path) -> DaemonConfig {
     let mut config = DaemonConfig::new(data_dir.to_path_buf());
     config.http_port = 0;
     config.commit_interval = Duration::from_secs(60);
