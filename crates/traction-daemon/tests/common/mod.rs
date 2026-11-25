@@ -558,7 +558,7 @@ pub fn stored_event_count(db: &Connection) -> i64 {
 /// only `AlreadyRunning` is retried, and only for a bounded time; a lock that
 /// is never released still fails the test.
 pub fn start_after_shutdown(config: DaemonConfig) -> DaemonHandle {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         match traction_daemon::start(config.clone()) {
             Err(traction_daemon::StartError::AlreadyRunning) if Instant::now() < deadline => {
