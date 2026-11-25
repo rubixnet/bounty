@@ -52,6 +52,16 @@ impl HarnessId {
         HarnessId::CodexCli,
         HarnessId::CodexDesktop,
     ];
+
+    /// The exact wire spelling (the same string serde writes).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HarnessId::ClaudeCode => "claude-code",
+            HarnessId::OpenCode => "opencode",
+            HarnessId::CodexCli => "codex-cli",
+            HarnessId::CodexDesktop => "codex-desktop",
+        }
+    }
 }
 
 /// What happened in the Harness.
@@ -90,6 +100,25 @@ impl EventType {
         EventType::SessionEnd,
         EventType::FileMutation,
     ];
+
+    /// The exact wire spelling (the same string serde writes).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EventType::SessionStart => "SESSION_START",
+            EventType::PromptSubmit => "PROMPT_SUBMIT",
+            EventType::PermissionRequest => "PERMISSION_REQUEST",
+            EventType::ToolPre => "TOOL_PRE",
+            EventType::ToolPost => "TOOL_POST",
+            EventType::ToolFail => "TOOL_FAIL",
+            EventType::SubagentStart => "SUBAGENT_START",
+            EventType::SubagentStop => "SUBAGENT_STOP",
+            EventType::CwdChange => "CWD_CHANGE",
+            EventType::TurnEnd => "TURN_END",
+            EventType::StopFailure => "STOP_FAILURE",
+            EventType::SessionEnd => "SESSION_END",
+            EventType::FileMutation => "FILE_MUTATION",
+        }
+    }
 }
 
 /// How a `TURN_END` finished.
@@ -100,6 +129,19 @@ pub enum EndReason {
     Aborted,
 }
 
+impl EndReason {
+    /// Every end reason, in protocol order.
+    pub const ALL: [EndReason; 2] = [EndReason::Completed, EndReason::Aborted];
+
+    /// The exact wire spelling (the same string serde writes).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EndReason::Completed => "completed",
+            EndReason::Aborted => "aborted",
+        }
+    }
+}
+
 /// Where the model behind the Harness runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +149,24 @@ pub enum NetworkClass {
     CloudApi,
     LocalModel,
     Manual,
+}
+
+impl NetworkClass {
+    /// Every network class, in protocol order.
+    pub const ALL: [NetworkClass; 3] = [
+        NetworkClass::CloudApi,
+        NetworkClass::LocalModel,
+        NetworkClass::Manual,
+    ];
+
+    /// The exact wire spelling (the same string serde writes).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            NetworkClass::CloudApi => "cloud_api",
+            NetworkClass::LocalModel => "local_model",
+            NetworkClass::Manual => "manual",
+        }
+    }
 }
 
 /// Metrics an Adapter computed in memory from raw content it then discarded.

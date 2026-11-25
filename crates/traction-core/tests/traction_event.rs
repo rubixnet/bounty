@@ -90,6 +90,7 @@ fn every_harness_id_round_trips_with_its_protocol_spelling() {
         let wire = with("harness_id", json!(spelling));
         let event = parse(&wire).expect("every protocol Harness is accepted");
         assert_eq!(event.harness_id, harness);
+        assert_eq!(harness.as_str(), spelling);
         assert_eq!(reserialize(&event), wire);
     }
 }
@@ -120,6 +121,7 @@ fn every_event_type_round_trips_with_its_protocol_spelling() {
         };
         let event = parse(&wire).expect("every protocol event type is accepted");
         assert_eq!(event.event_type, event_type);
+        assert_eq!(event_type.as_str(), spelling);
         assert_eq!(reserialize(&event), wire);
     }
 }
@@ -134,6 +136,7 @@ fn every_network_class_and_end_reason_round_trips_with_its_protocol_spelling() {
         let wire = with("network_class", json!(spelling));
         let event = parse(&wire).expect("every protocol network class is accepted");
         assert_eq!(event.network_class, class);
+        assert_eq!(class.as_str(), spelling);
         assert_eq!(reserialize(&event), wire);
     }
     for (reason, spelling) in [
@@ -143,7 +146,31 @@ fn every_network_class_and_end_reason_round_trips_with_its_protocol_spelling() {
         let wire = with("end_reason", json!(spelling));
         let event = parse(&wire).expect("every protocol end reason is accepted");
         assert_eq!(event.end_reason, Some(reason));
+        assert_eq!(reason.as_str(), spelling);
         assert_eq!(reserialize(&event), wire);
+    }
+}
+
+/// `as_str` is the spelling serde writes, for every variant of every enum.
+#[test]
+fn as_str_matches_the_serde_spelling_of_every_enum_value() {
+    fn serde_spelling(value: impl serde::Serialize) -> String {
+        match serde_json::to_value(value) {
+            Ok(Value::String(spelling)) => spelling,
+            other => panic!("enums serialize as strings, got {other:?}"),
+        }
+    }
+    for harness in HarnessId::ALL {
+        assert_eq!(harness.as_str(), serde_spelling(harness));
+    }
+    for event_type in EventType::ALL {
+        assert_eq!(event_type.as_str(), serde_spelling(event_type));
+    }
+    for reason in EndReason::ALL {
+        assert_eq!(reason.as_str(), serde_spelling(reason));
+    }
+    for class in NetworkClass::ALL {
+        assert_eq!(class.as_str(), serde_spelling(class));
     }
 }
 

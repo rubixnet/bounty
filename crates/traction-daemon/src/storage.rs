@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use rusqlite::{Connection, params};
-use traction_core::TractionEvent;
+use traction_core::{EndReason, TractionEvent};
 
 pub const DB_FILE: &str = "traction.db";
 
@@ -65,15 +65,15 @@ pub struct EventRow {
     event_id: String,
     schema_version: i64,
     timestamp_ms: i64,
-    harness_id: String,
+    harness_id: &'static str,
     session_id: String,
     parent_orchestrator_id: Option<String>,
-    event_type: String,
-    end_reason: Option<String>,
+    event_type: &'static str,
+    end_reason: Option<&'static str>,
     cwd: String,
     project_id: String,
     model_id: Option<String>,
-    network_class: String,
+    network_class: &'static str,
     prompt_char_len: Option<i64>,
     repo_symbol_hits: Option<i64>,
     has_stacktrace: Option<bool>,
@@ -99,10 +99,10 @@ impl TryFrom<TractionEvent> for EventRow {
         Ok(Self {
             schema_version: i64::from(event.schema_version),
             timestamp_ms: int(event.timestamp_ms)?,
-            harness_id: wire(serde_json::to_value(event.harness_id)),
-            event_type: wire(serde_json::to_value(event.event_type)),
-            end_reason: event.end_reason.map(|r| wire(serde_json::to_value(r))),
-            network_class: wire(serde_json::to_value(event.network_class)),
+            harness_id: event.harness_id.as_str(),
+            event_type: event.event_type.as_str(),
+            end_reason: event.end_reason.map(EndReason::as_str),
+            network_class: event.network_class.as_str(),
             event_id: event.event_id,
             session_id: event.session_id,
             parent_orchestrator_id: event.parent_orchestrator_id,
@@ -116,15 +116,6 @@ impl TryFrom<TractionEvent> for EventRow {
             exit_code: metrics.exit_code,
             diff_lines_delta: metrics.diff_lines_delta,
         })
-    }
-}
-
-/// The protocol spelling of a `traction-core` enum, via its serde form so the
-/// daemon never keeps a second copy of the wire strings.
-fn wire(value: serde_json::Result<serde_json::Value>) -> String {
-    match value {
-        Ok(serde_json::Value::String(spelling)) => spelling,
-        _ => unreachable!("traction-core enums serialize as strings"),
     }
 }
 
