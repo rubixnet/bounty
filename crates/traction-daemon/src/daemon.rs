@@ -110,7 +110,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let git = Git::with_program(&config.git_program, exclusions.home());
     let (watches, notifications) = Watches::new(exclusions.clone());
     let mut router = Router::new(git, exclusions, device_secret, writer_sender, registry);
-    router.set_attribution_timing(config.watcher.trailing_window, config.watcher.hold);
+    router.set_attribution_timing(&config.watcher);
     // Re-attach every stored (non-merged) Project before anything can edit
     // unobserved; later registrations attach on the Router thread before
     // they are answered.
