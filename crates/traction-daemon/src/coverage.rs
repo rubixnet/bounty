@@ -150,7 +150,10 @@ mod tests {
         assert!(covers(10_000 - skew), "a skew before the first hook");
         assert!(!covers(10_000 - skew - 1), "before the skewed start");
         assert!(covers(20_000), "the last commit itself");
-        assert!(!covers(20_000 + 1), "just after the last commit: daemon down");
+        assert!(
+            !covers(20_000 + 1),
+            "just after the last commit: daemon down"
+        );
         assert!(!coverage.covers(CLAUDE, "other", 15_000));
         assert!(!coverage.covers(HarnessId::OpenCode, "s", 15_000));
     }

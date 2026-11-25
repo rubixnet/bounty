@@ -500,7 +500,10 @@ fn a_symlinked_settings_file_stays_a_link_and_its_target_gets_the_merge() {
     setup.install_ok();
 
     let link = fs::symlink_metadata(setup.settings()).unwrap();
-    assert!(link.file_type().is_symlink(), "settings.json is still a link");
+    assert!(
+        link.file_type().is_symlink(),
+        "settings.json is still a link"
+    );
     assert_eq!(fs::read_link(setup.settings()).unwrap(), target);
     let merged: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
     assert_eq!(traction_entries(&merged, "SessionStart").len(), 1);
