@@ -71,7 +71,7 @@ impl TestDaemon {
         let mut config = test_config(self.data_dir.path());
         config.home_dir = Some(self.home());
         adjust(&mut config);
-        let handle = traction_daemon::start(config).expect("daemon restarts");
+        let handle = start_after_shutdown(config);
         self.addr = handle.local_addr();
         self.handle = Some(handle);
         self
@@ -546,6 +546,27 @@ pub fn event_id(n: u32) -> String {
 pub fn stored_event_count(db: &Connection) -> i64 {
     db.query_row("SELECT COUNT(*) FROM traction_event", [], |row| row.get(0))
         .expect("count events")
+}
+
+/// Starts a daemon on a data folder whose previous daemon was just shut down.
+///
+/// The test binary hosts many daemons at once. If another test thread forks
+/// a child (a fixture `git`, say) at the instant the previous daemon still
+/// held its lock file open, the child briefly holds a copy of that
+/// descriptor until it execs, and the `flock` outlives the shutdown by a few
+/// milliseconds. A real restart is a new process and never sees this, so
+/// only `AlreadyRunning` is retried, and only for a bounded time; a lock that
+/// is never released still fails the test.
+pub fn start_after_shutdown(config: DaemonConfig) -> DaemonHandle {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match traction_daemon::start(config.clone()) {
+            Err(traction_daemon::StartError::AlreadyRunning) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            result => return result.expect("daemon restarts"),
+        }
+    }
 }
 
 /// Calls `probe` until it returns `Some`, or panics after `timeout`.
