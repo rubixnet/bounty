@@ -28,7 +28,7 @@ use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
 use traction_core::TractionEvent;
 
-use crate::storage::{EventRow, IntegerOutOfRange};
+use crate::storage::EventRow;
 use crate::token::BusToken;
 use crate::writer::WriterSender;
 
@@ -158,8 +158,8 @@ impl Bus {
         let body = read_capped_body(body, read).await?;
         let event = TractionEvent::from_json(&body)
             .map_err(|error| Rejection::bad_request(error.code()))?;
-        let row = EventRow::try_from(event)
-            .map_err(|IntegerOutOfRange| Rejection::bad_request(IntegerOutOfRange::CODE))?;
+        let row =
+            EventRow::try_from(event).map_err(|error| Rejection::bad_request(error.code()))?;
         self.writer.try_enqueue(row).map_err(|_| Rejection::BUSY)
     }
 

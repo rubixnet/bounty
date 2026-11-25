@@ -9,7 +9,8 @@ mod validate;
 
 pub use canonical::{CanonicalJsonError, canonical_json};
 pub use event::{
-    EndReason, EventType, HarnessId, MetricsOnly, NetworkClass, SCHEMA_VERSION, TractionEvent,
+    AttributionSource, EndReason, EventType, HarnessId, MetricsOnly, MutationKind, NetworkClass,
+    SCHEMA_VERSION, TractionEvent,
 };
 pub use validate::{
     EventError, MAX_CWD_LEN, MAX_IDENTIFIER_LEN, MAX_SESSION_ID_LEN, ValidationError,
