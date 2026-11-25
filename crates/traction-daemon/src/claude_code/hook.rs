@@ -131,11 +131,26 @@ struct Prompt {
     command: Option<Command>,
 }
 
+/// What one raw hook body yields: the action, and the transcript path the
+/// payload reported (from any hook), for the tailer to validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mapped {
+    pub action: HookAction,
+    pub transcript_path: Option<PathBuf>,
+}
+
+/// Longest `transcript_path` taken from a payload, in bytes.
+const MAX_TRANSCRIPT_PATH_BYTES: usize = 4096;
+
 /// The only payload fields the daemon reads. Everything else is skipped.
 #[derive(Deserialize)]
 struct Payload {
     session_id: String,
     hook_event_name: String,
+    /// Claude's own transcript of the session. A hint only: the tailer
+    /// opens it only when it is under the Claude `projects/` folder.
+    #[serde(default)]
+    transcript_path: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
     /// Reduced to metrics (and the pause-command match) while parsing; the
@@ -165,10 +180,25 @@ fn measured<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Prompt>
 
 /// Maps one raw hook body, received at `received_ms`, to what the daemon
 /// does with it. Never fails: anything unusable is [`HookAction::Nothing`].
-pub fn map_hook(body: &[u8], received_ms: u64) -> HookAction {
-    let Ok(payload) = serde_json::from_slice::<Payload>(body) else {
-        return HookAction::Nothing;
+pub fn map_hook(body: &[u8], received_ms: u64) -> Mapped {
+    let Ok(mut payload) = serde_json::from_slice::<Payload>(body) else {
+        return Mapped {
+            action: HookAction::Nothing,
+            transcript_path: None,
+        };
     };
+    let transcript_path = payload
+        .transcript_path
+        .take()
+        .filter(|path| !path.is_empty() && path.len() <= MAX_TRANSCRIPT_PATH_BYTES)
+        .map(PathBuf::from);
+    Mapped {
+        action: map_payload(payload, received_ms),
+        transcript_path,
+    }
+}
+
+fn map_payload(payload: Payload, received_ms: u64) -> HookAction {
     let Some(hook) = Hook::from_name(&payload.hook_event_name) else {
         return HookAction::Nothing;
     };

@@ -49,9 +49,9 @@ use traction_core::{
 use crate::attribution::Attribution;
 use crate::claude_code::pause::PauseAction;
 use crate::config::WatcherSettings;
-use crate::coverage::HookCoverage;
 #[cfg(doc)]
 use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW, STALE_TURN_TIMEOUT};
+use crate::coverage::HookCoverage;
 use crate::exclusions::{Exclusions, has_project_marker};
 use crate::git::Git;
 use crate::log;

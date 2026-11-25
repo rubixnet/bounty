@@ -154,7 +154,10 @@ mod tests {
     #[test]
     fn the_current_run_is_open_ended_from_its_first_hook() {
         let mut coverage = earlier_run();
-        assert!(!coverage.covers(CLAUDE, "s", 50_000), "no hook yet in run 2");
+        assert!(
+            !coverage.covers(CLAUDE, "s", 50_000),
+            "no hook yet in run 2"
+        );
         let first = coverage.note_hook(CLAUDE, "s", 40_000).expect("first");
         assert_eq!((first.run_id, first.first_hook_ms), (2, 40_000));
         assert_eq!(coverage.note_hook(CLAUDE, "s", 41_000), None, "only once");

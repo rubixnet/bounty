@@ -613,8 +613,8 @@ pub fn load_runs(conn: &Connection) -> rusqlite::Result<Vec<StoredRun>> {
 
 /// Every stored `session_hook_run` row.
 pub fn load_hook_runs(conn: &Connection) -> rusqlite::Result<Vec<HookRunRow>> {
-    let mut stmt = conn
-        .prepare("SELECT harness_id, session_id, run_id, first_hook_ms FROM session_hook_run")?;
+    let mut stmt =
+        conn.prepare("SELECT harness_id, session_id, run_id, first_hook_ms FROM session_hook_run")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,

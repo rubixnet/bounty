@@ -143,12 +143,10 @@ fn stored(db: &Connection, session: &str) -> Vec<(String, String, i64)> {
              ORDER BY timestamp_ms, event_type <> 'SESSION_START', event_id",
         )
         .expect("prepare");
-    stmt.query_map([session], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    })
-    .expect("query")
-    .map(|row| row.expect("row"))
-    .collect()
+    stmt.query_map([session], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query")
+        .map(|row| row.expect("row"))
+        .collect()
 }
 
 fn row(event_type: &str, source: &str, ts: i64) -> (String, String, i64) {
