@@ -2,8 +2,8 @@
 //! prompt from a Claude Code hook or transcript record). It returns numbers
 //! and flags and keeps nothing, so the caller can drop the text at once.
 //!
-//! Shared by every Adapter that sees raw text (Claude Code hooks now, the
-//! Claude transcript tailer next).
+//! Shared by every Adapter that sees raw text: the Claude Code hooks and the
+//! Claude transcript tailer.
 
 /// What a piece of raw text is reduced to before it is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
