@@ -4,11 +4,11 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Unit tests assert the exact argv and env for each query (incl. `safe.bareRepository=explicit` and per-OS hooks path).
-- [ ] A real child hanging past the timeout is killed and reaped (test may use a test-only timeout override; production value is one public constant = 5 s).
-- [ ] Wrapper-level red-team test: a real repo with hostile `core.fsmonitor`, `core.hooksPath` and `.git/hooks/*` (sh on Unix, `.bat`/`.cmd` on Windows) — running every query never creates a sentinel, and no `dev/null` path appears.
-- [ ] A bare repo with hostile config, reached by `-C` inside it, is refused (treated as not-a-repo).
-- [ ] `$HOME`-rooted repo refused; missing `git` binary returns unavailable without panicking.
-- [ ] AGENTS.md invariant wording updated.
+- [x] Unit tests assert the exact argv and env for each query (incl. `safe.bareRepository=explicit` and per-OS hooks path).
+- [x] A real child hanging past the timeout is killed and reaped (test may use a test-only timeout override; production value is one public constant = 5 s).
+- [x] Wrapper-level red-team test: a real repo with hostile `core.fsmonitor`, `core.hooksPath` and `.git/hooks/*` (sh on Unix, `.bat`/`.cmd` on Windows) — running every query never creates a sentinel, and no `dev/null` path appears.
+- [x] A bare repo with hostile config, reached by `-C` inside it, is refused (treated as not-a-repo).
+- [x] `$HOME`-rooted repo refused; missing `git` binary returns unavailable without panicking.
+- [x] AGENTS.md invariant wording updated.
