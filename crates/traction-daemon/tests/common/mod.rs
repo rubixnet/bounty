@@ -141,7 +141,7 @@ pub fn open_db_read_only(data_dir: &Path) -> Connection {
 pub fn test_config(data_dir: &Path) -> DaemonConfig {
     let mut config = DaemonConfig::new(data_dir.to_path_buf());
     config.http_port = 0;
-    config.commit_interval = Duration::from_secs(60);
+    config.writer.commit_interval = Duration::from_secs(60);
     // Hermetic: never the real `$XDG_RUNTIME_DIR`. A temp data folder keeps
     // the path well under the macOS 104-byte `sun_path` limit.
     #[cfg(unix)]

@@ -22,16 +22,9 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
+use crate::config::WriterSettings;
 use crate::log;
 use crate::storage::{self, EventRow};
-
-/// Writer tuning, taken from `DaemonConfig`.
-#[derive(Debug, Clone, Copy)]
-pub struct WriterSettings {
-    pub commit_interval: Duration,
-    pub max_batch: usize,
-    pub queue_capacity: usize,
-}
 
 /// The bus side of the channel. Cheap to clone; never blocks.
 #[derive(Clone)]

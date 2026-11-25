@@ -28,7 +28,7 @@ use crate::lock::{InstanceLock, LockError};
 #[cfg(unix)]
 use crate::socket::{self, SocketError, SocketFile};
 use crate::token::BusToken;
-use crate::writer::{self, WriterSettings, WriterThread};
+use crate::writer::{self, WriterThread};
 use crate::{http, log, storage};
 
 /// A running daemon. Dropping it performs the same graceful shutdown.
@@ -78,23 +78,8 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let local_addr = listener.local_addr().map_err(StartError::Runtime)?;
 
     #[cfg(unix)]
-    let (unix_listener, socket_file) =
-        socket::bind(&config.socket_path, &lock).map_err(|error| match error {
-            SocketError::InUse => StartError::SocketInUse {
-                path: config.socket_path.clone(),
-            },
-            SocketError::NotASocket => StartError::Socket {
-                path: config.socket_path.clone(),
-                source: io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "the path exists and is not a socket",
-                ),
-            },
-            SocketError::Io(source) => StartError::Socket {
-                path: config.socket_path.clone(),
-                source,
-            },
-        })?;
+    let (unix_listener, socket_file) = socket::bind(&config.socket_path, &lock)
+        .map_err(|error| socket_start_error(error, &config.socket_path))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -102,15 +87,8 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         .build()
         .map_err(StartError::Runtime)?;
 
-    let (writer_sender, writer_thread) = writer::spawn(
-        conn,
-        WriterSettings {
-            commit_interval: config.commit_interval,
-            max_batch: config.max_batch,
-            queue_capacity: config.writer_queue_capacity,
-        },
-    )
-    .map_err(StartError::Runtime)?;
+    let (writer_sender, writer_thread) =
+        writer::spawn(conn, config.writer).map_err(StartError::Runtime)?;
 
     let bus = Arc::new(Bus::new(token, writer_sender, local_addr.port()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -151,6 +129,23 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         _socket: socket_file,
         _lock: lock,
     })
+}
+
+/// The [`StartError`] for a failed bind of the bus socket at `path`.
+#[cfg(unix)]
+fn socket_start_error(error: SocketError, path: &Path) -> StartError {
+    let path = path.to_path_buf();
+    match error {
+        SocketError::InUse => StartError::SocketInUse { path },
+        SocketError::NotASocket => StartError::Socket {
+            path,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the path exists and is not a socket",
+            ),
+        },
+        SocketError::Io(source) => StartError::Socket { path, source },
+    }
 }
 
 /// Hands the bound std listeners to the tokio runtime (inside it).

@@ -32,12 +32,8 @@ pub struct DaemonConfig {
     pub data_dir: PathBuf,
     /// Loopback HTTP port. `0` picks an ephemeral port (tests only).
     pub http_port: u16,
-    /// Writer timer: a non-empty batch is committed at least this often.
-    pub commit_interval: Duration,
-    /// Writer size threshold: a batch this large is committed immediately.
-    pub max_batch: usize,
-    /// Bounded writer channel capacity.
-    pub writer_queue_capacity: usize,
+    /// SQLite writer tuning.
+    pub writer: WriterSettings,
     /// The Local Ingestion Bus Unix socket (macOS/Linux only). Default from
     /// [`default_socket_path`].
     #[cfg(unix)]
@@ -55,9 +51,7 @@ impl DaemonConfig {
             ),
             data_dir,
             http_port: DEFAULT_HTTP_PORT,
-            commit_interval: DEFAULT_COMMIT_INTERVAL,
-            max_batch: DEFAULT_MAX_BATCH,
-            writer_queue_capacity: DEFAULT_WRITER_QUEUE_CAPACITY,
+            writer: WriterSettings::default(),
         }
     }
 
@@ -67,6 +61,28 @@ impl DaemonConfig {
             .filter(|home| home.is_absolute())
             .ok_or(ConfigError::NoHomeDir)?;
         Ok(Self::new(home.join(".traction")))
+    }
+}
+
+/// SQLite writer tuning. Fields are public so tests can adjust them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WriterSettings {
+    /// A non-empty batch is committed at least this often.
+    pub commit_interval: Duration,
+    /// A batch this large is committed immediately.
+    pub max_batch: usize,
+    /// Bounded writer channel capacity.
+    pub queue_capacity: usize,
+}
+
+impl Default for WriterSettings {
+    fn default() -> Self {
+        Self {
+            commit_interval: DEFAULT_COMMIT_INTERVAL,
+            max_batch: DEFAULT_MAX_BATCH,
+            queue_capacity: DEFAULT_WRITER_QUEUE_CAPACITY,
+        }
     }
 }
 

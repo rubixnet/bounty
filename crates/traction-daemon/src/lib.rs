@@ -19,7 +19,7 @@ mod writer;
 pub use bus::{EVENT_PATH, MAX_BODY_BYTES};
 pub use config::{
     ConfigError, DEFAULT_COMMIT_INTERVAL, DEFAULT_HTTP_PORT, DEFAULT_MAX_BATCH,
-    DEFAULT_WRITER_QUEUE_CAPACITY, DaemonConfig,
+    DEFAULT_WRITER_QUEUE_CAPACITY, DaemonConfig, WriterSettings,
 };
 #[cfg(unix)]
 pub use config::{DATA_DIR_SOCKET_FILE, RUNTIME_SOCKET_FILE, default_socket_path};

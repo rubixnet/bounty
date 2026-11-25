@@ -81,7 +81,7 @@ fn the_same_event_sent_twice_is_accepted_twice_and_stored_once() {
 fn a_retry_after_the_first_copy_was_committed_is_accepted_and_ignored() {
     // `max_batch = 1` commits every event on its own, so the second copy
     // meets an already stored row rather than a duplicate in the same batch.
-    let mut daemon = TestDaemon::start_with(|config| config.max_batch = 1);
+    let mut daemon = TestDaemon::start_with(|config| config.writer.max_batch = 1);
     let caller = daemon.caller();
 
     assert_eq!(caller.post_event(&valid_event(1)).status, 202);
@@ -120,7 +120,7 @@ fn a_duplicate_does_not_overwrite_the_stored_event() {
 fn a_full_batch_is_committed_without_waiting_for_the_timer() {
     // The test config's timer is 60 s, so a commit inside the deadline can
     // only come from the size threshold.
-    let daemon = TestDaemon::start_with(|config| config.max_batch = 3);
+    let daemon = TestDaemon::start_with(|config| config.writer.max_batch = 3);
     let caller = daemon.caller();
 
     for n in 0..3 {
@@ -133,8 +133,8 @@ fn a_full_batch_is_committed_without_waiting_for_the_timer() {
 #[test]
 fn a_partial_batch_is_committed_by_the_timer() {
     let daemon = TestDaemon::start_with(|config| {
-        config.commit_interval = Duration::from_millis(100);
-        config.max_batch = 1000;
+        config.writer.commit_interval = Duration::from_millis(100);
+        config.writer.max_batch = 1000;
     });
     let caller = daemon.caller();
 
@@ -146,8 +146,8 @@ fn a_partial_batch_is_committed_by_the_timer() {
 #[test]
 fn a_full_writer_queue_answers_503_at_once_and_loses_nothing_accepted() {
     let mut daemon = TestDaemon::start_with(|config| {
-        config.max_batch = 1;
-        config.writer_queue_capacity = 1;
+        config.writer.max_batch = 1;
+        config.writer.queue_capacity = 1;
     });
     let caller = daemon.caller();
     let lock = hold_write_lock(&daemon);
@@ -184,8 +184,8 @@ fn a_full_writer_queue_answers_503_at_once_and_loses_nothing_accepted() {
 #[test]
 fn a_batch_whose_commit_fails_is_retried_not_dropped() {
     let mut daemon = TestDaemon::start_with(|config| {
-        config.commit_interval = Duration::from_millis(100);
-        config.max_batch = 1;
+        config.writer.commit_interval = Duration::from_millis(100);
+        config.writer.max_batch = 1;
     });
     let caller = daemon.caller();
     let lock = hold_write_lock(&daemon);
@@ -217,7 +217,7 @@ fn events_accepted_just_before_shutdown_are_stored() {
 fn raw_text_sent_through_unknown_fields_never_reaches_disk() {
     // One full batch of valid events, so they are committed to the WAL while
     // the daemon is still running and the WAL file can be scanned too.
-    let mut daemon = TestDaemon::start_with(|config| config.max_batch = 20);
+    let mut daemon = TestDaemon::start_with(|config| config.writer.max_batch = 20);
     let caller = daemon.caller();
 
     let mut smuggled = Vec::new();
