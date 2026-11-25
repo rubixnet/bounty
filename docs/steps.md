@@ -60,7 +60,8 @@
    - **Passive manual-coding coverage:** Watch the files of known Projects (recursive OS file notifications, honoring `.gitignore` / `.tractionignore`) and emit metadata-only `FILE_MUTATION` events, so hand-coding with no AI session open is still tracked.
 4. **Wire the 3 Initial Harnesses:**
    - **Claude Code:**
-     - Installer merges non-blocking HTTP hooks into `~/.claude/settings.json` with `"onFailure": "continue"` and `"timeout": 1` (seconds; token via `allowedEnvVars` header interpolation) for `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`, `SubagentStart`, `SubagentStop`, `CwdChanged`, `DirectoryAdded`, `Stop`, `StopFailure`, and `SessionEnd`.
+     - Installer merges non-blocking HTTP hooks into `~/.claude/settings.json` with `"onFailure": "continue"` and `"timeout": 1` (seconds; token via `allowedEnvVars` header interpolation) for `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SubagentStart`, `SubagentStop`, `CwdChanged`, `DirectoryAdded`, `Stop`, `StopFailure`, and `SessionEnd`.
+     - `PreToolUse` → `TOOL_PRE` and `PostToolUse`/`PostToolUseFailure` → `TOOL_POST`/`TOOL_FAIL` give every tool call an exact hook window for `FILE_MUTATION` attribution.
      - **DO NOT hook `WorktreeCreate`** (replaces native worktree creation).
      - `UserPromptSubmit` handler matches **only** exact `/stop-track` and `/resume-track` user commands, flips local session pause state, and returns `{ "decision": "block", "reason": "Traction tracking paused for this session." }` without blocking automated turns.
      - Fallback passive inode + byte-offset JSONL tailer on `~/.claude/projects/` (prefer the hook's `transcript_path`) handling partial lines, rotation, async write lag, and daemon restarts.
@@ -69,6 +70,7 @@
      - Safe read-only SQLite fallback poller on `~/.local/share/opencode/opencode.db` (`mode=ro`, `PRAGMA query_only = ON`, cursor `WHERE time_updated > ?` on `session`/`message`/`part`) active only while an `opencode` process is running.
    - **Codex CLI & Codex Desktop:**
      - Primary passive Rust inode + byte-offset tailer on `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (handles Windows `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`). Map `event_msg` `task_started` → `PROMPT_SUBMIT`, `task_complete` → `TURN_END{completed}`, `turn_aborted` → `TURN_END{aborted}`, `function_call`/`custom_tool_call` (+ `_output`) → `TOOL_PRE`/`TOOL_POST`; tolerate `compacted`, `world_state`, `token_usage_record`; distinguish Desktop via `session_meta.originator`. Verify the error record type against the codex-rs protocol source before mapping `STOP_FAILURE`.
+     - Stale-turn timeout (shared with every log-tailed Harness, built in Step 1c): an open log-tailed turn window that sees no new events for one documented inactivity constant auto-closes, so a crashed or unterminated turn stops claiming manual edits instead of holding until daemon restart.
      - No `notify` wrapper in v1 (raw prompt text in payload; slot may be owned by another tool).
      - **HARD RULE:** Never open, read, or lock `~/.codex/state_5.sqlite` (or any `~/.codex/*.sqlite`).
 5. **Instant Privacy Controls & OS Auto-Start:**
