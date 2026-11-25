@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use common::{TestDaemon, event_id, stored_event_count, valid_event, valid_event_value};
 use rusqlite::{Connection, OpenFlags};
+use traction_daemon::DB_FILE;
 
 /// Far longer than any commit should take, even on a loaded CI runner.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -23,7 +24,7 @@ const DEADLINE: Duration = Duration::from_secs(20);
 const SENTINEL: &str = "TRACTION-SENTINEL-c0ffee-raw-prompt-text";
 
 fn db_path(daemon: &TestDaemon) -> std::path::PathBuf {
-    daemon.data_dir().join("traction.db")
+    daemon.data_dir().join(DB_FILE)
 }
 
 /// A read-only connection to a running daemon's database (WAL readers do not
@@ -253,7 +254,7 @@ fn raw_text_sent_through_unknown_fields_never_reaches_disk() {
     assert_eq!(sentinel_hits_in_tables(&db), 0);
     drop(db);
     let scanned = assert_no_file_contains_sentinel(daemon.data_dir(), SkipShm::No);
-    assert!(scanned.iter().any(|name| name == "traction.db"));
+    assert!(scanned.iter().any(|name| name == DB_FILE));
 }
 
 #[derive(PartialEq)]

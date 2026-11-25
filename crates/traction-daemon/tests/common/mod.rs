@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
-use traction_daemon::{DaemonConfig, DaemonHandle};
+#[cfg(unix)]
+use traction_daemon::DATA_DIR_SOCKET_FILE;
+use traction_daemon::{DB_FILE, DaemonConfig, DaemonHandle, TOKEN_FILE};
 
 /// A daemon running on its own temp data folder. Shut down on drop.
 pub struct TestDaemon {
@@ -65,7 +67,7 @@ impl TestDaemon {
     }
 
     pub fn token_path(&self) -> PathBuf {
-        self.data_dir().join("daemon.token")
+        self.data_dir().join(TOKEN_FILE)
     }
 
     /// The bearer token the daemon wrote to `<data dir>/daemon.token`.
@@ -104,12 +106,7 @@ impl TestDaemon {
     /// Shuts the daemon down and opens its database read-only (`mode=ro`).
     pub fn shutdown_and_open_db(&mut self) -> Connection {
         self.shutdown();
-        let path = self.data_dir().join("traction.db");
-        Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .expect("read-only database")
+        open_db_read_only(self.data_dir())
     }
 }
 
@@ -135,7 +132,7 @@ pub fn try_start_on(
 /// Opens `<data dir>/traction.db` read-only (`mode=ro`).
 pub fn open_db_read_only(data_dir: &Path) -> Connection {
     Connection::open_with_flags(
-        data_dir.join("traction.db"),
+        data_dir.join(DB_FILE),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .expect("read-only database")
@@ -149,7 +146,7 @@ pub fn test_config(data_dir: &Path) -> DaemonConfig {
     // the path well under the macOS 104-byte `sun_path` limit.
     #[cfg(unix)]
     {
-        config.socket_path = data_dir.join("daemon.sock");
+        config.socket_path = data_dir.join(DATA_DIR_SOCKET_FILE);
     }
     config
 }

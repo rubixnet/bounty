@@ -10,10 +10,10 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use common::{BusCaller, TestDaemon, event_id, stored_event_count, try_start_on, valid_event};
-use traction_daemon::{MAX_BODY_BYTES, StartError};
+use traction_daemon::{DATA_DIR_SOCKET_FILE, MAX_BODY_BYTES, StartError, TOKEN_FILE};
 
 fn read_token(data_dir: &Path) -> String {
-    std::fs::read_to_string(data_dir.join("daemon.token")).expect("token file")
+    std::fs::read_to_string(data_dir.join(TOKEN_FILE)).expect("token file")
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn the_socket_skips_only_the_host_check() {
 #[test]
 fn a_stale_socket_left_by_a_dead_daemon_is_replaced() {
     let data_dir = tempfile::tempdir().expect("temp data folder");
-    let path = data_dir.path().join("daemon.sock");
+    let path = data_dir.path().join(DATA_DIR_SOCKET_FILE);
     // A bound-then-dropped listener leaves a socket file nobody serves.
     drop(UnixListener::bind(&path).expect("stale socket"));
 
@@ -154,7 +154,7 @@ fn a_live_socket_is_never_replaced() {
 #[test]
 fn a_file_that_is_not_a_socket_is_left_untouched() {
     let data_dir = tempfile::tempdir().expect("temp data folder");
-    let path = data_dir.path().join("daemon.sock");
+    let path = data_dir.path().join(DATA_DIR_SOCKET_FILE);
     std::fs::write(&path, b"not a socket").expect("regular file");
 
     let result = try_start_on(data_dir.path(), |_| {});

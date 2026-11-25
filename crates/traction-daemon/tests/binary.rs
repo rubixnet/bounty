@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 use common::BusCaller;
 #[cfg(unix)]
 use common::{open_db_read_only, stored_event_count, valid_event};
+use traction_daemon::TOKEN_FILE;
+#[cfg(unix)]
+use traction_daemon::{DATA_DIR_SOCKET_FILE, RUNTIME_SOCKET_FILE};
 
 const BIN: &str = env!("CARGO_BIN_EXE_traction-daemon");
 
@@ -27,7 +30,7 @@ fn command(data_dir: &Path, port: u16) -> Command {
     #[cfg(unix)]
     command
         .arg("--socket-path")
-        .arg(data_dir.join("daemon.sock"));
+        .arg(data_dir.join(DATA_DIR_SOCKET_FILE));
     command
 }
 
@@ -79,7 +82,7 @@ impl RunningDaemon {
 
     #[cfg_attr(not(unix), allow(dead_code))]
     fn caller(&self, data_dir: &Path) -> BusCaller {
-        let token = std::fs::read_to_string(data_dir.join("daemon.token")).expect("token file");
+        let token = std::fs::read_to_string(data_dir.join(TOKEN_FILE)).expect("token file");
         BusCaller::new(self.addr, token)
     }
 
@@ -207,9 +210,9 @@ fn the_socket_defaults_to_traction_sock_in_xdg_runtime_dir() {
     assert_socket_accepts_events(
         &daemon,
         data_dir.path(),
-        &runtime_dir.path().join("traction.sock"),
+        &runtime_dir.path().join(RUNTIME_SOCKET_FILE),
     );
-    assert!(!data_dir.path().join("daemon.sock").exists());
+    assert!(!data_dir.path().join(DATA_DIR_SOCKET_FILE).exists());
 }
 
 #[cfg(unix)]
@@ -224,7 +227,7 @@ fn without_xdg_runtime_dir_the_socket_is_daemon_sock_in_the_data_folder() {
     assert_socket_accepts_events(
         &daemon,
         data_dir.path(),
-        &data_dir.path().join("daemon.sock"),
+        &data_dir.path().join(DATA_DIR_SOCKET_FILE),
     );
 }
 
