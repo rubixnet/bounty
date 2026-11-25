@@ -6,8 +6,8 @@ Source: `docs/roadmap.md` (Step 1a), `docs/steps.md` (Step 1, Build items 1 and 
 
 Gate items this sub-step owns (from the Step 1 Exit Gate):
 
-- [ ] The Local Ingestion Bus rejects missing or wrong bearer tokens, foreign `Host` headers and foreign `Origin` headers.
-- [ ] Zero raw prompt text is persisted in SQLite. 1a owns the structural guarantee; the fixture-based check over real Harness payloads lands in 1c and 1d.
+- [x] The Local Ingestion Bus rejects missing or wrong bearer tokens, foreign `Host` headers and foreign `Origin` headers.
+- [x] Zero raw prompt text is persisted in SQLite. 1a owns the structural guarantee; the fixture-based check over real Harness payloads lands in 1c and 1d.
 
 ## Problem Statement
 
