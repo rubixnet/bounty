@@ -217,16 +217,28 @@ fn after_migration_hand_edits_land_under_the_git_project() {
     assert_eq!(daemon.caller().post_event(&event).status, 202);
     assert_eq!(register(&daemon, &notes), git_id);
     let db = daemon.live_db();
-    // The fixture's own commit (`src/main.txt`) is a hand edit too.
-    common::poll_until(common::WATCH_DEADLINE, "the fixture's edits", || {
-        let rows = stored_mutations(&db);
-        rows.iter()
-            .any(|row| row.mutation_kind.as_deref() == Some("created"))
-            .then_some(())
+    // The fixture's own `git init`/commit writes race the watcher hand-over
+    // (FSEvents may deliver them after the `dir:` watch is gone), so this
+    // test asserts only on a file created after the migration. Let those
+    // fixture writes settle (several holds) before taking the baseline.
+    std::thread::sleep(Duration::from_secs(3));
+    let created_under_git = |db: &rusqlite::Connection| {
+        stored_mutations(db)
+            .iter()
+            .filter(|row| {
+                row.project_id.as_deref() == Some(git_id.as_str())
+                    && row.mutation_kind.as_deref() == Some("created")
+            })
+            .count()
+    };
+    let baseline = created_under_git(&db);
+    fs::write(notes.join("after.txt"), "post-migration").unwrap();
+    common::poll_until(common::WATCH_DEADLINE, "the post-migration create", || {
+        (created_under_git(&db) > baseline).then_some(())
     });
 
     // The only removal: decided after the migration.
-    fs::remove_file(notes.join("src/main.txt")).unwrap();
+    fs::remove_file(notes.join("after.txt")).unwrap();
     let removed = common::poll_until(common::WATCH_DEADLINE, "the post-migration edit", || {
         stored_mutations(&db)
             .into_iter()
