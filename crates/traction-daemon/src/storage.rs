@@ -37,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
         diff_lines_delta       INTEGER
     ) STRICT, WITHOUT ROWID;",
     MIGRATION_2,
+    MIGRATION_3,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -135,6 +136,48 @@ const MIGRATION_2: &str = "
         SELECT RAISE(ABORT, 'traction_event is append-only');
     END;
 ";
+
+/// Step 1b: the alias-aware events view, the only way to read "a Project's
+/// events".
+///
+/// `project_event` has every `traction_event` column, but its `project_id`
+/// is the stored ID resolved through `project_alias` to the final ID (alias
+/// chains followed up to [`MAX_ALIAS_DEPTH`] links). `stored_project_id`
+/// keeps the ID the event was written with (the hash-chain input). Read a
+/// Project's events as `SELECT ... FROM project_event WHERE project_id = ?`;
+/// never filter `traction_event.project_id` directly.
+const MIGRATION_3: &str = "
+    CREATE VIEW project_event AS
+    WITH RECURSIVE chain (alias_id, project_id, depth) AS (
+        SELECT alias_id, project_id, 1 FROM project_alias
+        UNION ALL
+        SELECT chain.alias_id, next.project_id, chain.depth + 1
+        FROM chain JOIN project_alias AS next ON next.alias_id = chain.project_id
+        WHERE chain.depth < 32
+    ),
+    resolved (alias_id, project_id) AS (
+        SELECT alias_id, project_id FROM chain
+        WHERE NOT EXISTS (
+            SELECT 1 FROM project_alias AS a WHERE a.alias_id = chain.project_id
+        )
+    )
+    SELECT
+        e.event_id, e.schema_version, e.timestamp_ms, e.harness_id, e.session_id,
+        e.parent_orchestrator_id, e.event_type, e.end_reason, e.cwd,
+        COALESCE(resolved.project_id, e.project_id) AS project_id,
+        e.model_id, e.network_class, e.attribution_source, e.prompt_char_len,
+        e.repo_symbol_hits, e.has_stacktrace, e.tool_name, e.exit_code,
+        e.diff_lines_delta, e.mutation_kind,
+        e.project_id AS stored_project_id
+    FROM traction_event AS e
+    LEFT JOIN resolved ON resolved.alias_id = e.project_id;
+";
+
+/// The alias-aware events view (see [`MIGRATION_3`]).
+pub const PROJECT_EVENT_VIEW: &str = "project_event";
+
+/// Longest alias chain followed (the view's recursion limit is the same).
+pub const MAX_ALIAS_DEPTH: usize = 32;
 
 /// Opens (creating if needed) the database read-write and migrates it.
 pub fn open(data_dir: &Path) -> rusqlite::Result<Connection> {
@@ -298,6 +341,40 @@ pub enum WriteOp {
     Project(ProjectRow),
     /// Upserts a session's start folder and last `cwd`.
     Session(SessionRow),
+    /// Alias-only `dir:` -> `git:` migration, in the batch's transaction.
+    Migration(MigrationRow),
+}
+
+/// Migrates the `dir:` Project `alias_id` into `into`: registers `into`
+/// (if new), records `project_alias` (`alias_id` -> `into`'s final ID) and
+/// marks the `dir:` row merged. Stored events are never touched. Replaying
+/// it is a no-op; one that would close an alias cycle is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationRow {
+    pub alias_id: String,
+    pub into: ProjectRow,
+    pub migrated_at_ms: i64,
+}
+
+/// Follows `alias_of` from `id` to its final ID. `None` when the chain
+/// loops or is longer than [`MAX_ALIAS_DEPTH`].
+pub fn final_alias(mut alias_of: impl FnMut(&str) -> Option<String>, id: &str) -> Option<String> {
+    let mut current = id.to_owned();
+    for _ in 0..=MAX_ALIAS_DEPTH {
+        match alias_of(&current) {
+            Some(next) if next == id => return None,
+            Some(next) => current = next,
+            None => return Some(current),
+        }
+    }
+    None
+}
+
+/// Every stored alias (`alias_id`, `project_id`), for the Router.
+pub fn load_aliases(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT alias_id, project_id FROM project_alias")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
 }
 
 /// Registered, non-merged Projects, for the Router's in-memory registry.
@@ -367,6 +444,7 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
             WriteOp::Event(row) => insert_event(&tx, row)?,
             WriteOp::Project(project) => insert_project(&tx, project)?,
             WriteOp::Session(session) => upsert_session(&tx, session)?,
+            WriteOp::Migration(migration) => migrate_project(&tx, migration)?,
         }
     }
     tx.commit()
@@ -388,6 +466,45 @@ fn insert_project(conn: &Connection, row: &ProjectRow) -> rusqlite::Result<()> {
         row.first_seen_ms,
         row.git_common_dir,
     ])?;
+    Ok(())
+}
+
+fn migrate_project(conn: &Connection, row: &MigrationRow) -> rusqlite::Result<()> {
+    let mut lookup =
+        conn.prepare_cached("SELECT project_id FROM project_alias WHERE alias_id = ?1")?;
+    let mut lookup_error = None;
+    let mut alias_of = |id: &str| match lookup.query_row([id], |r| r.get(0)) {
+        Ok(next) => Some(next),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => {
+            lookup_error = Some(error);
+            None
+        }
+    };
+    let already = alias_of(&row.alias_id).is_some();
+    let target = final_alias(&mut alias_of, &row.into.project_id);
+    drop(lookup);
+    if let Some(error) = lookup_error {
+        return Err(error);
+    }
+    if already {
+        // Already migrated: a replay is a no-op.
+        return Ok(());
+    }
+    let Some(target) = target.filter(|target| *target != row.alias_id) else {
+        crate::log::warn("refused a Project migration that would close an alias cycle");
+        return Ok(());
+    };
+    insert_project(conn, &row.into)?;
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO project_alias (alias_id, project_id, migrated_at_ms)
+         VALUES (?1, ?2, ?3)",
+    )?
+    .execute(params![row.alias_id, target, row.migrated_at_ms])?;
+    conn.prepare_cached(
+        "UPDATE project SET merged_into = ?2 WHERE project_id = ?1 AND merged_into IS NULL",
+    )?
+    .execute(params![row.alias_id, target])?;
     Ok(())
 }
 
@@ -442,4 +559,185 @@ fn insert_event(conn: &Connection, row: &EventRow) -> rusqlite::Result<()> {
         row.mutation_kind,
     ])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The writer's migration handler against a real SQLite file: replay,
+    //! alias chains and cycles (states the Router never produces in v1, so
+    //! Seam 2 cannot reach them).
+
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn project(id: &str, kind: ProjectKind) -> ProjectRow {
+        ProjectRow {
+            project_id: id.to_owned(),
+            kind,
+            root_path: format!("/code/{id}"),
+            home_relative_path: None,
+            name: id.to_owned(),
+            first_seen_ms: 1,
+            git_common_dir: None,
+        }
+    }
+
+    fn migration(alias: &str, into: &str) -> WriteOp {
+        WriteOp::Migration(MigrationRow {
+            alias_id: alias.to_owned(),
+            into: project(into, ProjectKind::Git),
+            migrated_at_ms: 7,
+        })
+    }
+
+    fn event(n: u8, project_id: &str) -> WriteOp {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "event_id": format!("019a7c2e-8b4d-7000-8000-0000000000{n:02x}"),
+            "timestamp_ms": 1u64,
+            "harness_id": "claude-code",
+            "session_id": "s",
+            "parent_orchestrator_id": null,
+            "event_type": "PROMPT_SUBMIT",
+            "end_reason": null,
+            "cwd": null,
+            "project_id": project_id,
+            "model_id": null,
+            "network_class": "cloud_api",
+            "attribution_source": "harness_hook",
+            "metrics_only": {}
+        });
+        let event: TractionEvent = serde_json::from_value(value).expect("event");
+        WriteOp::Event(Box::new(EventRow::try_from(event).expect("row")))
+    }
+
+    fn rows(conn: &Connection, sql: &str) -> Vec<(String, Option<String>)> {
+        let mut stmt = conn.prepare(sql).expect("prepare");
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .map(|row| row.expect("row"))
+            .collect()
+    }
+
+    fn aliases(conn: &Connection) -> Vec<(String, Option<String>)> {
+        rows(
+            conn,
+            "SELECT alias_id, project_id FROM project_alias ORDER BY alias_id",
+        )
+    }
+
+    fn view(conn: &Connection) -> Vec<(String, Option<String>)> {
+        rows(
+            conn,
+            "SELECT stored_project_id, project_id FROM project_event ORDER BY event_id",
+        )
+    }
+
+    fn open_temp() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open(dir.path()).expect("open");
+        (dir, conn)
+    }
+
+    fn pair(a: &str, b: &str) -> (String, Option<String>) {
+        (a.to_owned(), Some(b.to_owned()))
+    }
+
+    #[test]
+    fn a_replayed_migration_is_a_no_op() {
+        let (_dir, mut conn) = open_temp();
+        apply_batch(
+            &mut conn,
+            &[
+                WriteOp::Project(project("dir:a", ProjectKind::Dir)),
+                event(1, "dir:a"),
+                migration("dir:a", "git:x"),
+            ],
+        )
+        .unwrap();
+        apply_batch(&mut conn, &[migration("dir:a", "git:x")]).unwrap();
+        apply_batch(&mut conn, &[migration("dir:a", "git:other")]).unwrap();
+
+        assert_eq!(aliases(&conn), vec![pair("dir:a", "git:x")]);
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT project_id, merged_into FROM project ORDER BY project_id"
+            ),
+            vec![pair("dir:a", "git:x"), ("git:x".to_owned(), None)]
+        );
+        assert_eq!(view(&conn), vec![pair("dir:a", "git:x")]);
+    }
+
+    #[test]
+    fn alias_chains_resolve_to_the_final_id() {
+        let (_dir, mut conn) = open_temp();
+        apply_batch(
+            &mut conn,
+            &[
+                WriteOp::Project(project("dir:a", ProjectKind::Dir)),
+                event(1, "dir:a"),
+                migration("dir:a", "git:b"),
+                event(2, "git:b"),
+                // `git:b` is later aliased again.
+                migration("git:b", "git:c"),
+                event(3, "git:c"),
+                // A migration into an aliased ID lands on its final ID.
+                WriteOp::Project(project("dir:d", ProjectKind::Dir)),
+                migration("dir:d", "git:b"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            view(&conn),
+            vec![
+                pair("dir:a", "git:c"),
+                pair("git:b", "git:c"),
+                pair("git:c", "git:c"),
+            ]
+        );
+        assert_eq!(
+            aliases(&conn),
+            vec![
+                pair("dir:a", "git:b"),
+                pair("dir:d", "git:c"),
+                pair("git:b", "git:c"),
+            ]
+        );
+        let map: HashMap<_, _> = load_aliases(&conn).unwrap().into_iter().collect();
+        let resolve = |id: &str| final_alias(|current| map.get(current).cloned(), id);
+        assert_eq!(resolve("dir:a").as_deref(), Some("git:c"));
+        assert_eq!(resolve("git:c").as_deref(), Some("git:c"));
+    }
+
+    #[test]
+    fn a_migration_that_would_close_a_cycle_is_refused() {
+        let (_dir, mut conn) = open_temp();
+        apply_batch(
+            &mut conn,
+            &[
+                migration("dir:a", "git:b"),
+                migration("git:b", "git:c"),
+                // c -> a would close a -> b -> c -> a.
+                migration("git:c", "dir:a"),
+                // A self-alias.
+                migration("git:z", "git:z"),
+                event(1, "dir:a"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            aliases(&conn),
+            vec![pair("dir:a", "git:b"), pair("git:b", "git:c")]
+        );
+        assert_eq!(view(&conn), vec![pair("dir:a", "git:c")]);
+        let looped: HashMap<String, String> = [("a", "b"), ("b", "a")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        assert_eq!(final_alias(|id| looped.get(id).cloned(), "a"), None);
+    }
 }
