@@ -3,7 +3,8 @@
 
 mod common;
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::time::Duration;
 
 use common::{TestDaemon, event_id, stored_event_count, valid_event};
 
@@ -170,4 +171,35 @@ fn listener_is_bound_to_ipv4_loopback_only() {
 
     assert_eq!(daemon.addr().ip(), Ipv4Addr::LOCALHOST);
     assert_ne!(daemon.addr().port(), 0);
+}
+
+/// This host's outbound IPv4 address, if it has one that is not loopback.
+/// `connect` on a UDP socket only picks a route and a source address; no
+/// packet is sent. The target is TEST-NET-1 (RFC 5737), never a real host.
+fn non_loopback_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+#[test]
+fn listener_is_not_reachable_on_a_non_loopback_address() {
+    let Some(ip) = non_loopback_ipv4() else {
+        eprintln!("skipped: this host has no non-loopback IPv4 address");
+        return;
+    };
+    let daemon = TestDaemon::start();
+    let target = SocketAddr::from((ip, daemon.addr().port()));
+
+    // Nothing listens on this address, so the host itself refuses at once.
+    // The timeout only stops a misconfigured firewall from hanging the test.
+    let connected = TcpStream::connect_timeout(&target, Duration::from_secs(2));
+
+    assert!(
+        connected.is_err(),
+        "the bus answered on non-loopback {target}"
+    );
 }
