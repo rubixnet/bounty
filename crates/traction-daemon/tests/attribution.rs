@@ -324,3 +324,97 @@ fn windows_are_live_only_and_do_not_survive_a_restart() {
     assert_manual(&rows[0], &project);
     assert_eq!(rows[0].mutation_kind.as_deref(), Some("created"));
 }
+
+/// Watcher timing for the stale-turn tests: production is a 10 min timeout;
+/// here 3 s, and the tests backdate event timestamps instead of waiting.
+fn stale_after_3s(config: &mut traction_daemon::DaemonConfig) {
+    fast_watcher(config);
+    config.watcher.stale_turn_timeout = Duration::from_secs(3);
+}
+
+#[test]
+fn the_stale_turn_timeout_defaults_to_ten_minutes() {
+    assert_eq!(
+        traction_daemon::STALE_TURN_TIMEOUT,
+        Duration::from_secs(10 * 60)
+    );
+    let config = traction_daemon::DaemonConfig::new("unused".into());
+    assert_eq!(
+        config.watcher.stale_turn_timeout,
+        traction_daemon::STALE_TURN_TIMEOUT
+    );
+}
+
+#[test]
+fn a_quiet_log_tailed_turn_stops_claiming_edits_until_its_session_is_active_again() {
+    let daemon = TestDaemon::start_with(stale_after_3s);
+    let root = fixtures::folder(&daemon.home().join("quiet-log"), &[]);
+    let project = register(&daemon, &root);
+
+    // A turn opened 5 s ago and never ended (a crashed Codex Desktop).
+    send(&daemon, 1, LOG, "PROMPT_SUBMIT", &root, now_ms() - 5000);
+    fs::write(root.join("a.txt"), "by hand").unwrap();
+    let rows = daemon.wait_for_mutations(1);
+    assert_manual(&rows[0], &project);
+
+    // Any event of the session keeps the still-open turn alive.
+    send(&daemon, 2, LOG, "TOOL_POST", &root, now_ms());
+    fs::write(root.join("b.txt"), "by the agent").unwrap();
+    let rows = daemon.wait_for_mutations(2);
+    assert_attributed(&rows[1], LOG, &project);
+}
+
+#[test]
+fn a_quiet_open_hook_window_stops_claiming_edits_until_its_session_is_active_again() {
+    let daemon = TestDaemon::start_with(stale_after_3s);
+    let root = fixtures::folder(&daemon.home().join("quiet-hook"), &[]);
+    let project = register(&daemon, &root);
+
+    // TOOL_PRE with no TOOL_POST, 5 s ago (a kill -9ed Claude Code).
+    let t0 = now_ms() - 5000;
+    send(&daemon, 1, HOOK, "PROMPT_SUBMIT", &root, t0);
+    send(&daemon, 2, HOOK, "TOOL_PRE", &root, t0);
+    fs::write(root.join("a.txt"), "by hand").unwrap();
+    let rows = daemon.wait_for_mutations(1);
+    assert_manual(&rows[0], &project);
+
+    // A permission prompt inside the same tool call keeps it alive.
+    send(&daemon, 3, HOOK, "PERMISSION_REQUEST", &root, now_ms());
+    fs::write(root.join("b.txt"), "by the agent").unwrap();
+    let rows = daemon.wait_for_mutations(2);
+    assert_attributed(&rows[1], HOOK, &project);
+}
+
+#[test]
+fn the_stale_turn_verdict_does_not_depend_on_arrival_order_within_the_hold() {
+    let daemon = TestDaemon::start_with(|config| {
+        stale_after_3s(config);
+        config.watcher.hold = Duration::from_secs(3);
+    });
+    let late = fixtures::folder(&daemon.home().join("late-alive"), &[]);
+    let early = fixtures::folder(&daemon.home().join("early-alive"), &[]);
+    let late_id = register(&daemon, &late);
+    let early_id = register(&daemon, &early);
+
+    // Stale when the edit is observed, but an event that happened just
+    // before the edit arrives 1 s later, inside the hold.
+    send(&daemon, 1, LOG, "PROMPT_SUBMIT", &late, now_ms() - 5000);
+    let before = now_ms();
+    fs::write(late.join("a.txt"), "by the agent").unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    send(&daemon, 2, LOG, "TOOL_POST", &late, before - 500);
+    let rows = daemon.wait_for_mutations(1);
+    assert_attributed(&rows[0], LOG, &late_id);
+
+    // The same timeline with the keep-alive delivered before the edit.
+    let other = Session {
+        session: "other-log-session",
+        ..LOG
+    };
+    let before = now_ms();
+    send(&daemon, 3, other, "PROMPT_SUBMIT", &early, before - 5000);
+    send(&daemon, 4, other, "TOOL_POST", &early, before - 500);
+    fs::write(early.join("b.txt"), "by the agent").unwrap();
+    let rows = daemon.wait_for_mutations(2);
+    assert_attributed(&rows[1], other, &early_id);
+}

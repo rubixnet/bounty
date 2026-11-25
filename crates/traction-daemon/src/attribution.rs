@@ -23,7 +23,15 @@
 //! to [`WINDOW_CLOSE_GRACE`] after its close: a mutation is stamped when its
 //! file-system notification arrives, which can trail the closing event.
 //!
+//! An open hook or log-tailed turn window goes stale: it covers a mutation
+//! stamped at `t` only while its session's latest event timestamp is at
+//! least `t` minus [`STALE_TURN_TIMEOUT`] (any event counts, and a later
+//! event revives it). Checked lazily in [`Attribution::claim`], against
+//! event timestamps, so the verdict never depends on arrival order within
+//! the hold. A crashed or `kill -9`ed Harness then stops claiming edits.
+//!
 //! [`LOG_TAIL_TRAILING_WINDOW`]: crate::config::LOG_TAIL_TRAILING_WINDOW
+//! [`STALE_TURN_TIMEOUT`]: crate::config::STALE_TURN_TIMEOUT
 //! [`WINDOW_CLOSE_GRACE`]: crate::config::WINDOW_CLOSE_GRACE
 
 use std::collections::{HashMap, VecDeque};
@@ -31,7 +39,7 @@ use std::time::Duration;
 
 use traction_core::{AttributionSource, EventType, HarnessId, NetworkClass, TractionEvent};
 
-use crate::config::WINDOW_CLOSE_GRACE;
+use crate::config::{WINDOW_CLOSE_GRACE, WatcherSettings};
 
 /// How long after it closed (or after a session's last event) window state
 /// is kept beyond the hold, for mutations decided late (a busy Router).
@@ -99,18 +107,20 @@ type Rank = (Kind, u64);
 pub struct Attribution {
     sessions: HashMap<SessionKey, SessionWindows>,
     trailing_ms: u64,
+    stale_ms: u64,
     retention_ms: u64,
     since_sweep: u32,
 }
 
 impl Attribution {
-    /// No open windows (a daemon start). `hold` bounds how late a mutation
-    /// can be decided, so how long closed windows must be kept.
-    pub fn new(trailing_window: Duration, hold: Duration) -> Self {
+    /// No open windows (a daemon start). The hold bounds how late a
+    /// mutation can be decided, so how long closed windows must be kept.
+    pub fn new(settings: &WatcherSettings) -> Self {
         Self {
             sessions: HashMap::new(),
-            trailing_ms: millis(trailing_window),
-            retention_ms: millis(hold + RETENTION_MARGIN),
+            trailing_ms: millis(settings.trailing_window),
+            stale_ms: millis(settings.stale_turn_timeout),
+            retention_ms: millis(settings.hold + RETENTION_MARGIN),
             since_sweep: 0,
         }
     }
@@ -196,10 +206,15 @@ impl Attribution {
         let on = |project: &Option<String>| project.as_deref().is_some_and(&on_project);
         let mut best: Option<(Rank, &SessionKey, &SessionWindows)> = None;
         for (key, state) in &self.sessions {
+            let active = state.last_ms.saturating_add(self.stale_ms) >= ts;
             let windows = state
                 .windows
                 .iter()
-                .filter(|w| on(&w.project) && w.covers(ts, millis(WINDOW_CLOSE_GRACE)))
+                .filter(|w| {
+                    on(&w.project)
+                        && w.covers(ts, millis(WINDOW_CLOSE_GRACE))
+                        && (active || w.closed_ms.is_some())
+                })
                 .map(|w| (w.kind, w.opened_ms));
             let trailing = state
                 .marks
