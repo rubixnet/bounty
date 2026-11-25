@@ -279,6 +279,11 @@ impl Worker {
     /// Watches `projects/` recursively once it exists, else its nearest
     /// existing ancestor (not recursively) for the next folder down to
     /// appear.
+    ///
+    /// Moving the watch down a level re-checks at once: a deeper folder
+    /// created before the new watch was in place (`mkdir -p
+    /// .claude/projects` in one go) sends no event to it, so without the
+    /// re-check the tailer would wait on `.claude/` forever.
     fn watch(&mut self) {
         if self.projects_watched {
             return;
@@ -286,30 +291,38 @@ impl Worker {
         let Some(backend) = self.backend.as_mut() else {
             return;
         };
-        if self.projects.is_dir() {
-            if let Some(ancestor) = self.ancestor_watched.take() {
-                let _ = backend.unwatch(&ancestor);
+        loop {
+            if self.projects.is_dir() {
+                if let Some(ancestor) = self.ancestor_watched.take() {
+                    let _ = backend.unwatch(&ancestor);
+                }
+                if backend
+                    .watch(&self.projects, RecursiveMode::Recursive)
+                    .is_ok()
+                {
+                    self.projects_watched = true;
+                } else {
+                    log::warn(
+                        "cannot watch the Claude projects folder; transcripts are not tailed",
+                    );
+                }
+                return;
+            }
+            let Some(ancestor) = self.claude_dir.ancestors().find(|dir| dir.is_dir()) else {
+                return;
+            };
+            if self.ancestor_watched.as_deref() == Some(ancestor) {
+                return;
+            }
+            if let Some(previous) = self.ancestor_watched.take() {
+                let _ = backend.unwatch(&previous);
             }
             if backend
-                .watch(&self.projects, RecursiveMode::Recursive)
-                .is_ok()
+                .watch(ancestor, RecursiveMode::NonRecursive)
+                .is_err()
             {
-                self.projects_watched = true;
-            } else {
-                log::warn("cannot watch the Claude projects folder; transcripts are not tailed");
+                return;
             }
-            return;
-        }
-        let Some(ancestor) = self.claude_dir.ancestors().find(|dir| dir.is_dir()) else {
-            return;
-        };
-        if self.ancestor_watched.as_deref() == Some(ancestor) {
-            return;
-        }
-        if let Some(previous) = self.ancestor_watched.take() {
-            let _ = backend.unwatch(&previous);
-        }
-        if backend.watch(ancestor, RecursiveMode::NonRecursive).is_ok() {
             self.ancestor_watched = Some(ancestor.to_path_buf());
         }
     }

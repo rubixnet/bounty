@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 /// then renamed over the target, so the file is never observed half-written
 /// or with wider permissions.
 pub fn write_atomically(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
