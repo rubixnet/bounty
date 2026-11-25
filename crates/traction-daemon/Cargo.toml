@@ -20,6 +20,7 @@ getrandom.workspace = true
 subtle.workspace = true
 notify.workspace = true
 ignore.workspace = true
+sha2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true

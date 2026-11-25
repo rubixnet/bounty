@@ -44,6 +44,13 @@ impl BusToken {
         presented.len() == TOKEN_HEX_LEN && bool::from(self.0.ct_eq(presented))
     }
 
+    /// The token's text, for the one place it must be copied: the Windows
+    /// per-user `TRACTION_TOKEN` variable the installer sets.
+    #[cfg(windows)]
+    pub(crate) fn reveal(&self) -> &[u8] {
+        &self.0
+    }
+
     fn parse(bytes: &[u8]) -> Option<Self> {
         let bytes = bytes.trim_ascii();
         let token: [u8; TOKEN_HEX_LEN] = bytes.try_into().ok()?;

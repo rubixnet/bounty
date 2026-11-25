@@ -1,6 +1,6 @@
 //! SQLite persistence: bundled SQLite in WAL mode with `synchronous=NORMAL`,
 //! a versioned (`user_version`) migration list, the append-only events
-//! table and the Project registry tables.
+//! table, the Project registry tables and the Session Pause spans.
 //!
 //! Only validated, typed Traction Event fields are written. No column ever
 //! holds a request body. The single writer thread (`writer.rs`) owns the only
@@ -38,6 +38,9 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT, WITHOUT ROWID;",
     MIGRATION_2,
     MIGRATION_3,
+    MIGRATION_4,
+    MIGRATION_5,
+    MIGRATION_6,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -171,6 +174,74 @@ const MIGRATION_3: &str = "
         e.project_id AS stored_project_id
     FROM traction_event AS e
     LEFT JOIN resolved ON resolved.alias_id = e.project_id;
+";
+
+/// Step 1c: Session Pause spans (`/stop-track` .. `/resume-track`).
+///
+/// One row per span; `to_ms` is `NULL` while the span is open, and a
+/// session has at most one open span. Only the daemon's single writer
+/// inserts a span and closes it; the Router loads them at startup.
+const MIGRATION_4: &str = "
+    CREATE TABLE session_pause (
+        harness_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        from_ms    INTEGER NOT NULL,
+        to_ms      INTEGER,
+        PRIMARY KEY (harness_id, session_id, from_ms),
+        CHECK (to_ms IS NULL OR to_ms >= from_ms)
+    ) STRICT, WITHOUT ROWID;
+    CREATE UNIQUE INDEX session_pause_open
+        ON session_pause (harness_id, session_id) WHERE to_ms IS NULL;
+";
+
+/// Step 1c: the Claude transcript tailer's resume state.
+///
+/// - `transcript_offset`: per transcript file, its identity (inode + device
+///   on Unix, volume serial + file index on Windows) and the byte offset
+///   just past the last line whose events are stored. Written in the same
+///   transaction as those events.
+/// - `transcript_tailer_start`: one row, the tailer's first-ever start. A
+///   file with no offset row was created after it, so it is read from 0.
+/// - A partial index finding a session's stored `SESSION_START` (the Router
+///   loads it at startup, so a tailed session is announced only once).
+const MIGRATION_5: &str = "
+    CREATE TABLE transcript_offset (
+        path          TEXT PRIMARY KEY NOT NULL,
+        file_identity TEXT NOT NULL,
+        \"offset\"      INTEGER NOT NULL CHECK (\"offset\" >= 0),
+        updated_ms    INTEGER NOT NULL
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE transcript_tailer_start (
+        id         INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+        started_ms INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE INDEX traction_event_session_start
+        ON traction_event (harness_id, session_id) WHERE event_type = 'SESSION_START';
+";
+
+/// Step 1c: hook coverage (`docs/protocol.md`, "Hook coverage").
+///
+/// - `daemon_run`: one row per daemon start. `last_alive_ms` is bumped by
+///   the writer in every commit, so a run's span ends when its last write
+///   did.
+/// - `session_hook_run`: the timestamp of a session's first accepted hook
+///   event in a run.
+const MIGRATION_6: &str = "
+    CREATE TABLE daemon_run (
+        run_id        INTEGER PRIMARY KEY NOT NULL,
+        started_ms    INTEGER NOT NULL,
+        last_alive_ms INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE session_hook_run (
+        harness_id    TEXT NOT NULL,
+        session_id    TEXT NOT NULL,
+        run_id        INTEGER NOT NULL,
+        first_hook_ms INTEGER NOT NULL,
+        PRIMARY KEY (harness_id, session_id, run_id)
+    ) STRICT, WITHOUT ROWID;
 ";
 
 /// The alias-aware events view (see [`MIGRATION_3`]).
@@ -331,6 +402,16 @@ pub struct SessionRow {
     pub last_cwd: Option<String>,
 }
 
+/// A Session Pause span (`session_pause` table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PauseSpanRow {
+    pub harness_id: HarnessId,
+    pub session_id: String,
+    pub from_ms: i64,
+    /// `None` while the session is still paused.
+    pub to_ms: Option<i64>,
+}
+
 /// One write the single writer applies, in channel order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOp {
@@ -343,6 +424,123 @@ pub enum WriteOp {
     Session(SessionRow),
     /// Alias-only `dir:` -> `git:` migration, in the batch's transaction.
     Migration(MigrationRow),
+    /// Opens a pause span (`to_ms` unset). Ignored when the session
+    /// already has an open span.
+    PauseStart(PauseSpanRow),
+    /// Closes the session's open span starting at `from_ms` at `to_ms`.
+    PauseEnd(PauseSpanRow),
+    /// Events read from one transcript and the offset just past them,
+    /// stored together in one transaction.
+    Tailed(TailedBatch),
+    /// The tailer's first-ever start and the offsets (each file's end) of
+    /// the transcripts that existed before it. A replay keeps the first.
+    TailerStart(TailerStartRow),
+    /// Starts a daemon run (`last_alive_ms` starts at `started_ms`).
+    RunStart(RunRow),
+    /// A session's first accepted hook event in a run. A repeat is ignored.
+    HookRun(HookRunRow),
+}
+
+impl WriteOp {
+    /// How many Traction Events this write stores (the writer's batch size
+    /// counts these).
+    pub fn event_count(&self) -> usize {
+        match self {
+            Self::Event(_) => 1,
+            Self::Tailed(batch) => batch.events.len(),
+            Self::Project(_)
+            | Self::Session(_)
+            | Self::Migration(_)
+            | Self::PauseStart(_)
+            | Self::PauseEnd(_)
+            | Self::TailerStart(_)
+            | Self::RunStart(_)
+            | Self::HookRun(_) => 0,
+        }
+    }
+}
+
+/// One `daemon_run` row, as started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunRow {
+    pub run_id: i64,
+    pub started_ms: i64,
+}
+
+/// A stored run's end: when its last write committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredRun {
+    pub run_id: i64,
+    pub last_alive_ms: i64,
+}
+
+/// One `session_hook_run` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRunRow {
+    pub harness_id: HarnessId,
+    pub session_id: String,
+    pub run_id: i64,
+    pub first_hook_ms: i64,
+}
+
+/// One `transcript_offset` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptOffset {
+    pub path: String,
+    pub file_identity: String,
+    pub offset: i64,
+    pub updated_ms: i64,
+}
+
+/// See [`WriteOp::Tailed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailedBatch {
+    pub events: Vec<EventRow>,
+    pub offset: TranscriptOffset,
+}
+
+/// See [`WriteOp::TailerStart`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailerStartRow {
+    pub started_ms: i64,
+    pub offsets: Vec<TranscriptOffset>,
+}
+
+/// The tailer's stored resume state.
+#[derive(Debug, Default)]
+pub struct TailerState {
+    /// `None` until the tailer's first-ever start is committed.
+    pub started_ms: Option<i64>,
+    pub offsets: Vec<TranscriptOffset>,
+}
+
+/// Loads the [`TailerState`].
+pub fn load_tailer_state(conn: &Connection) -> rusqlite::Result<TailerState> {
+    let started_ms = match conn.query_row(
+        "SELECT started_ms FROM transcript_tailer_start WHERE id = 1",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(ms) => Some(ms),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error),
+    };
+    let mut stmt =
+        conn.prepare("SELECT path, file_identity, \"offset\", updated_ms FROM transcript_offset")?;
+    let offsets = stmt
+        .query_map([], |row| {
+            Ok(TranscriptOffset {
+                path: row.get(0)?,
+                file_identity: row.get(1)?,
+                offset: row.get(2)?,
+                updated_ms: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(TailerState {
+        started_ms,
+        offsets,
+    })
 }
 
 /// Migrates the `dir:` Project `alias_id` into `into`: registers `into`
@@ -378,6 +576,14 @@ pub struct StoredRegistry {
     /// `project_alias` rows: (`alias_id`, `project_id`).
     pub aliases: Vec<(String, String)>,
     pub sessions: Vec<SessionRow>,
+    /// Every Session Pause span, open and closed.
+    pub pauses: Vec<PauseSpanRow>,
+    /// Sessions with a stored `SESSION_START`.
+    pub started_sessions: Vec<(HarnessId, String)>,
+    /// Every earlier daemon run.
+    pub runs: Vec<StoredRun>,
+    /// Every session's first hook in each earlier run.
+    pub hook_runs: Vec<HookRunRow>,
 }
 
 /// Loads the [`StoredRegistry`].
@@ -386,7 +592,72 @@ pub fn load_registry(conn: &Connection) -> rusqlite::Result<StoredRegistry> {
         projects: load_projects(conn)?,
         aliases: load_aliases(conn)?,
         sessions: load_sessions(conn)?,
+        pauses: load_pauses(conn)?,
+        started_sessions: load_started_sessions(conn)?,
+        runs: load_runs(conn)?,
+        hook_runs: load_hook_runs(conn)?,
     })
+}
+
+/// Every stored daemon run, oldest first.
+pub fn load_runs(conn: &Connection) -> rusqlite::Result<Vec<StoredRun>> {
+    let mut stmt = conn.prepare("SELECT run_id, last_alive_ms FROM daemon_run ORDER BY run_id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(StoredRun {
+            run_id: row.get(0)?,
+            last_alive_ms: row.get(1)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Every stored `session_hook_run` row.
+pub fn load_hook_runs(conn: &Connection) -> rusqlite::Result<Vec<HookRunRow>> {
+    let mut stmt =
+        conn.prepare("SELECT harness_id, session_id, run_id, first_hook_ms FROM session_hook_run")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get(2)?,
+            row.get(3)?,
+        ))
+    })?;
+    let mut runs = Vec::new();
+    for row in rows {
+        let (harness, session_id, run_id, first_hook_ms) = row?;
+        let Some(harness_id) = harness_by_name(&harness) else {
+            continue;
+        };
+        runs.push(HookRunRow {
+            harness_id,
+            session_id,
+            run_id,
+            first_hook_ms,
+        });
+    }
+    Ok(runs)
+}
+
+/// Every `(harness_id, session_id)` with a stored `SESSION_START` (through
+/// the partial index, so the events table is not scanned).
+pub fn load_started_sessions(conn: &Connection) -> rusqlite::Result<Vec<(HarnessId, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT harness_id, session_id FROM traction_event
+         WHERE event_type = 'SESSION_START' AND harness_id IS NOT NULL
+           AND session_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut started = Vec::new();
+    for row in rows {
+        let (harness, session_id) = row?;
+        if let Some(harness_id) = harness_by_name(&harness) {
+            started.push((harness_id, session_id));
+        }
+    }
+    Ok(started)
 }
 
 /// Every stored alias (`alias_id`, `project_id`), for the Router.
@@ -438,7 +709,7 @@ pub fn load_sessions(conn: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
     for row in rows {
         let (harness, session_id, start_folder, last_cwd) = row?;
         // Only daemon-written spellings are stored; skip anything else.
-        let Some(harness_id) = HarnessId::ALL.into_iter().find(|h| h.as_str() == harness) else {
+        let Some(harness_id) = harness_by_name(&harness) else {
             continue;
         };
         sessions.push(SessionRow {
@@ -451,6 +722,40 @@ pub fn load_sessions(conn: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
     Ok(sessions)
 }
 
+/// Every stored Session Pause span, oldest first.
+pub fn load_pauses(conn: &Connection) -> rusqlite::Result<Vec<PauseSpanRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT harness_id, session_id, from_ms, to_ms FROM session_pause ORDER BY from_ms",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get(2)?,
+            row.get(3)?,
+        ))
+    })?;
+    let mut pauses = Vec::new();
+    for row in rows {
+        let (harness, session_id, from_ms, to_ms) = row?;
+        let Some(harness_id) = harness_by_name(&harness) else {
+            continue;
+        };
+        pauses.push(PauseSpanRow {
+            harness_id,
+            session_id,
+            from_ms,
+            to_ms,
+        });
+    }
+    Ok(pauses)
+}
+
+/// The Harness stored as `name` (only daemon-written spellings exist).
+fn harness_by_name(name: &str) -> Option<HarnessId> {
+    HarnessId::ALL.into_iter().find(|h| h.as_str() == name)
+}
+
 /// Applies a batch of writes in order, in one transaction.
 pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
@@ -460,9 +765,82 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
             WriteOp::Project(project) => insert_project(&tx, project)?,
             WriteOp::Session(session) => upsert_session(&tx, session)?,
             WriteOp::Migration(migration) => migrate_project(&tx, migration)?,
+            WriteOp::PauseStart(span) => start_pause(&tx, span)?,
+            WriteOp::PauseEnd(span) => end_pause(&tx, span)?,
+            WriteOp::Tailed(batch) => {
+                for row in &batch.events {
+                    insert_event(&tx, row)?;
+                }
+                upsert_offset(&tx, &batch.offset)?;
+            }
+            WriteOp::TailerStart(start) => {
+                let inserted = tx
+                    .prepare_cached(
+                        "INSERT OR IGNORE INTO transcript_tailer_start (id, started_ms)
+                         VALUES (1, ?1)",
+                    )?
+                    .execute([start.started_ms])?;
+                // A replay (the first start already stored) keeps the
+                // offsets stored since.
+                if inserted == 1 {
+                    for offset in &start.offsets {
+                        upsert_offset(&tx, offset)?;
+                    }
+                }
+            }
+            WriteOp::RunStart(run) => {
+                tx.prepare_cached(
+                    "INSERT OR IGNORE INTO daemon_run (run_id, started_ms, last_alive_ms)
+                     VALUES (?1, ?2, ?2)",
+                )?
+                .execute(params![run.run_id, run.started_ms])?;
+            }
+            WriteOp::HookRun(hook) => {
+                tx.prepare_cached(
+                    "INSERT OR IGNORE INTO session_hook_run
+                         (harness_id, session_id, run_id, first_hook_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![
+                    hook.harness_id.as_str(),
+                    hook.session_id,
+                    hook.run_id,
+                    hook.first_hook_ms
+                ])?;
+            }
         }
     }
+    // The newest run is the live one: every commit proves it was alive.
+    tx.prepare_cached(
+        "UPDATE daemon_run SET last_alive_ms = max(last_alive_ms, ?1)
+         WHERE run_id = (SELECT max(run_id) FROM daemon_run)",
+    )?
+    .execute([now_ms()])?;
     tx.commit()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn upsert_offset(conn: &Connection, row: &TranscriptOffset) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO transcript_offset (path, file_identity, \"offset\", updated_ms)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (path) DO UPDATE SET
+            file_identity = excluded.file_identity,
+            \"offset\" = excluded.\"offset\",
+            updated_ms = excluded.updated_ms",
+    )?
+    .execute(params![
+        row.path,
+        row.file_identity,
+        row.offset,
+        row.updated_ms
+    ])?;
+    Ok(())
 }
 
 fn insert_project(conn: &Connection, row: &ProjectRow) -> rusqlite::Result<()> {
@@ -520,6 +898,33 @@ fn migrate_project(conn: &Connection, row: &MigrationRow) -> rusqlite::Result<()
         "UPDATE project SET merged_into = ?2 WHERE project_id = ?1 AND merged_into IS NULL",
     )?
     .execute(params![row.alias_id, target])?;
+    Ok(())
+}
+
+fn start_pause(conn: &Connection, row: &PauseSpanRow) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO session_pause (harness_id, session_id, from_ms, to_ms)
+         VALUES (?1, ?2, ?3, NULL)",
+    )?
+    .execute(params![
+        row.harness_id.as_str(),
+        row.session_id,
+        row.from_ms
+    ])?;
+    Ok(())
+}
+
+fn end_pause(conn: &Connection, row: &PauseSpanRow) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "UPDATE session_pause SET to_ms = ?4
+         WHERE harness_id = ?1 AND session_id = ?2 AND from_ms = ?3 AND to_ms IS NULL",
+    )?
+    .execute(params![
+        row.harness_id.as_str(),
+        row.session_id,
+        row.from_ms,
+        row.to_ms,
+    ])?;
     Ok(())
 }
 

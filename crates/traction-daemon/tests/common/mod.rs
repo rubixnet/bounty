@@ -49,6 +49,7 @@ impl TestDaemon {
         let home = tempfile::tempdir().expect("temp fake home");
         let mut config = test_config(data_dir.path());
         config.home_dir = Some(canonical(home.path()));
+        config.claude_config_dir = Some(canonical(home.path()).join(".claude"));
         adjust(&mut config);
         let handle = traction_daemon::start(config).expect("daemon starts");
         let addr = handle.local_addr();
@@ -70,6 +71,7 @@ impl TestDaemon {
         self.shutdown();
         let mut config = test_config(self.data_dir.path());
         config.home_dir = Some(self.home());
+        config.claude_config_dir = Some(self.home().join(".claude"));
         adjust(&mut config);
         let handle = start_after_shutdown(config);
         self.addr = handle.local_addr();
@@ -257,6 +259,8 @@ pub fn test_config(data_dir: &Path) -> DaemonConfig {
     let mut config = DaemonConfig::new(data_dir.to_path_buf());
     // Hermetic: never the developer's real home folder.
     config.home_dir = Some(data_dir.join("fake-home"));
+    // Hermetic: never the developer's real Claude transcripts.
+    config.claude_config_dir = Some(data_dir.join("fake-home").join(".claude"));
     config.http_port = 0;
     config.writer.commit_interval = Duration::from_secs(60);
     // Hermetic: never the real `$XDG_RUNTIME_DIR`. A temp data folder keeps
@@ -737,3 +741,8 @@ pub fn assert_no_file_contains(data_dir: &Path, needle: &str) -> Vec<String> {
     }
     scanned
 }
+
+/// The daemon's current SQLite `user_version` (the number of migrations in
+/// `storage::MIGRATIONS`). Bump it here, once, when a migration is appended.
+#[allow(dead_code)]
+pub const LATEST_SCHEMA_VERSION: i64 = 6;

@@ -10,12 +10,24 @@
 //! Options (mainly so tests stay hermetic): `--data-dir <path>`,
 //! `--port <n>` (`0` = ephemeral) and, on macOS/Linux, `--socket-path <path>`
 //! (default `$XDG_RUNTIME_DIR/traction.sock`, else `<data dir>/daemon.sock`).
+//!
+//! Subcommands:
+//! - `install claude-code [--settings <path>] [--claude-program <path>]
+//!   [--port <n>] [--profile <path>]...` merges Traction's hooks into Claude
+//!   Code's `settings.json` (default `$CLAUDE_CONFIG_DIR/settings.json`, else
+//!   `~/.claude/settings.json`), writes the `/stop-track` and `/resume-track`
+//!   command files next to it, adds the `TRACTION_TOKEN` block to each shell
+//!   profile (default: the existing zsh, bash, fish and PowerShell ones; any
+//!   `--profile` replaces that list), prints a summary to stdout and exits.
+//!   On Windows it also sets `TRACTION_TOKEN` under `HKCU\Environment`
+//!   (the test-only `--windows-env-key <subkey>` redirects that to a scratch
+//!   key; it is deliberately left out of the usage text).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use traction_daemon::DaemonConfig;
+use traction_daemon::{ClaudeCodeInstall, DaemonConfig};
 
 fn main() -> ExitCode {
     match run() {
@@ -28,7 +40,12 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let config = config_from_args(std::env::args_os().skip(1))?;
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().and_then(|arg| arg.to_str()) == Some("install") {
+        args.next();
+        return install(args);
+    }
+    let config = config_from_args(args)?;
 
     // Signals are registered before `start` so a signal that arrives during
     // startup is not lost (and does not kill the process mid-start).
@@ -87,6 +104,62 @@ fn config_from_args(mut args: impl Iterator<Item = OsString>) -> Result<DaemonCo
     }
     Ok(config)
 }
+
+/// `install <harness> [options]`.
+fn install(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
+    match args.next().as_ref().and_then(|arg| arg.to_str()) {
+        Some("claude-code") => {}
+        _ => return Err(INSTALL_USAGE.to_owned()),
+    }
+    let mut install = ClaudeCodeInstall::for_user().map_err(|e| e.to_string())?;
+    let mut profiles: Vec<PathBuf> = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--settings") => {
+                install.settings = PathBuf::from(args.next().ok_or("--settings needs a path")?);
+            }
+            Some("--claude-program") => {
+                install.claude_program =
+                    PathBuf::from(args.next().ok_or("--claude-program needs a path")?);
+            }
+            Some("--port") => {
+                install.port = args
+                    .next()
+                    .as_ref()
+                    .and_then(|v| v.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&port| port != 0)
+                    .ok_or("--port needs a number from 1 to 65535")?;
+            }
+            Some("--profile") => {
+                profiles.push(PathBuf::from(args.next().ok_or("--profile needs a path")?));
+            }
+            // Test-only (the Seam B tests' scratch `HKCU` key): left out of
+            // INSTALL_USAGE so users never see or rely on it.
+            #[cfg(windows)]
+            Some("--windows-env-key") => {
+                install.windows_env_key = args
+                    .next()
+                    .and_then(|v| v.into_string().ok())
+                    .filter(|v| !v.is_empty())
+                    .ok_or("--windows-env-key needs an HKCU subkey")?;
+            }
+            _ => return Err(INSTALL_USAGE.to_owned()),
+        }
+    }
+    if !profiles.is_empty() {
+        install.profiles = profiles;
+    }
+    let report = install.run().map_err(|e| e.to_string())?;
+    for warning in &report.warnings {
+        eprintln!("traction-daemon: warning: {warning}");
+    }
+    print!("{report}");
+    Ok(())
+}
+
+const INSTALL_USAGE: &str = "usage: traction-daemon install claude-code \
+    [--settings <path>] [--claude-program <path>] [--port <n>] [--profile <path>]...";
 
 #[cfg(unix)]
 const USAGE: &str = "unknown argument (use --data-dir <path>, --port <n>, --socket-path <path>)";

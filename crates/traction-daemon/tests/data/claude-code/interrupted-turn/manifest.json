@@ -1,0 +1,33 @@
+{
+  "scenario": "interrupted-turn",
+  "claude_code_version": "2.1.332",
+  "captured_at": "2026-11-25",
+  "os": "macos",
+  "os_release": "25.5.0",
+  "simulated": false,
+  "note": "The capture sends SIGINT (CTRL_BREAK on Windows) to claude once the Bash PreToolUse hook arrives.",
+  "prompts": [
+    "Run the Bash command `sleep 60 && echo TRACTION-CANARY-interrupted-turn` and wait for it to finish."
+  ],
+  "model": "haiku",
+  "session_ids": [
+    "4810953a-eaf6-444b-a0c8-8f75c6ebc865"
+  ],
+  "hooks_received": [
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd"
+  ],
+  "runs": [
+    {
+      "exit_code": 0,
+      "is_error": false,
+      "terminal_reason": "completed",
+      "api_calls_ms": 3647,
+      "num_turns": 3
+    }
+  ],
+  "transcript_found": true
+}

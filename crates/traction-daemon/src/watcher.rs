@@ -50,6 +50,7 @@ use traction_core::{
 };
 
 use crate::config::WatcherSettings;
+use crate::event_id::fresh_event_id;
 use crate::exclusions::{DEPENDENCY_FOLDERS, Exclusions};
 use crate::log;
 use crate::paths::{self, is_within, name_matches};
@@ -784,7 +785,7 @@ impl Worker {
         };
         let mutation = TractionEvent {
             schema_version: SCHEMA_VERSION,
-            event_id: event_id(decided.first_ms),
+            event_id: fresh_event_id(decided.first_ms),
             timestamp_ms: decided.first_ms,
             harness_id: None,
             session_id: None,
@@ -941,18 +942,6 @@ fn new_folder(table: &mut WatchTable, index: usize, path: &Path, found: Option<&
     }
 }
 
-/// A fresh event ID for `ms`: [`traction_core::uuid_v7`] with OS randomness.
-fn event_id(ms: u64) -> String {
-    let mut random = [0u8; 10];
-    if getrandom::fill(&mut random).is_err() {
-        // No OS randomness: still unique enough within one daemon.
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
-        random[2..].copy_from_slice(&n.to_be_bytes());
-    }
-    traction_core::uuid_v7(ms, random)
-}
-
 /// macOS: FSEvents refuses (or, past the edge, corrupts descriptors) beyond
 /// about a twelfth of the soft open-file limit in watched roots, and the
 /// default soft limit is often 256. Raise it towards the hard limit, as
@@ -980,11 +969,6 @@ fn raise_open_file_limit() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn event_ids_at_the_same_millisecond_differ() {
-        assert_ne!(event_id(1), event_id(1));
-    }
 
     fn project(id: &str, root: &Path) -> RegisteredProject {
         RegisteredProject {

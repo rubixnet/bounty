@@ -11,6 +11,14 @@ pub fn warn(message: &'static str) {
     eprintln!("traction-daemon: warning: {message}");
 }
 
+/// Logs `message` with a running count of how often it happened, on the
+/// 1st, 2nd, 4th, 8th, ... occurrence so a flood cannot flood stderr.
+pub fn warn_counted(message: &'static str, count: u64) {
+    if count.is_power_of_two() {
+        eprintln!("traction-daemon: warning: {message} (total so far: {count})");
+    }
+}
+
 /// `error` must come from the OS or SQLite, never from request input.
 pub fn error(context: &'static str, error: &dyn Display) {
     eprintln!("traction-daemon: error: {context}: {error}");

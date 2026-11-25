@@ -47,12 +47,16 @@ The folder that identifies a Project: its Git repo root if it has one, otherwise
 _Avoid_: cwd, working directory
 
 **Attribution Window**:
-A span of event timestamps in which one Harness session claims the `FILE_MUTATION`s in its current Project: a hook window (tool call inside an open turn), a log-tailed turn window, or the trailing fallback window after a log-tailed session's events. A closed hook or turn window reaches `WINDOW_CLOSE_GRACE` past its closing event (notification latency). The watcher's `LOG_TAIL_HOLD` is not an Attribution Window: it is a delivery-lag buffer that only delays the decision so late events can still be counted.
+A span of event timestamps in which one Harness session claims the `FILE_MUTATION`s in its current Project: a hook window (tool call inside an open turn), a log-tailed turn window, or the trailing fallback window after a log-tailed session's events. A closed hook or turn window reaches `WINDOW_CLOSE_GRACE` past its closing event (notification latency). An open hook or turn window goes stale once its session has produced no event for `STALE_TURN_TIMEOUT` (10 min) before the mutation, so a crashed Harness stops claiming edits. The watcher's `LOG_TAIL_HOLD` is not an Attribution Window: it is a delivery-lag buffer that only delays the decision so late events can still be counted.
 _Avoid_: Fallback window (that is only one kind), grace period, hold (the hold is `LOG_TAIL_HOLD`, a delay, not a window)
 
 **Manual Work**:
 A `FILE_MUTATION` in a Project that falls outside every Attribution Window, so it carries no Harness, no session and `network_class: manual`.
 _Avoid_: Unattributed edit, human edit, hand-written code
+
+**Session Pause**:
+A span during which one Harness session is not tracked, opened by the user typing exactly `/stop-track` in that session and closed by `/resume-track`. Its events are not stored but still feed the Attribution Windows, so a `FILE_MUTATION` it claims is dropped instead of counted as Manual Work. Per session, kept across daemon restarts.
+_Avoid_: Stop tracking (ambiguous with stopping the daemon), mute, tray Pause (that one is device-wide, Step 1e)
 
 **Linked Repo**:
 The hosted GitHub repository a user has attached to a Project from the website.

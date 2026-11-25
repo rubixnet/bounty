@@ -18,7 +18,10 @@
 //!    event for a migrated `dir:` Project lands under the `git:` ID;
 //! 7. registers a Project seen for the first time (a [`WriteOp::Project`],
 //!    then every [`ProjectHook`] is told); and
-//! 8. replaces any Adapter-supplied `project_id` and queues the event.
+//! 8. replaces any Adapter-supplied `project_id` and queues the event,
+//!    unless its session was paused at the event's timestamp (Session
+//!    Pause): a paused event still feeds the attribution windows, but is
+//!    not stored.
 //!
 //! `git:` IDs are pinned per canonical common dir: the first ID stored for
 //! a repo is reused even after `origin` changes. A `.git` entry appearing
@@ -30,7 +33,7 @@
 //! copy of the registry and sessions, loaded from SQLite at startup and
 //! updated as it queues writes, and never reads SQLite afterwards.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -38,18 +41,26 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
-use traction_core::{HarnessId, NetworkClass, TractionEvent, dir_project_id, git_project_id};
+use traction_core::{
+    AttributionSource, EventType, HarnessId, NetworkClass, TractionEvent, dir_project_id,
+    git_project_id,
+};
 
 use crate::attribution::Attribution;
-use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW};
+use crate::claude_code::pause::PauseAction;
+use crate::config::WatcherSettings;
+#[cfg(doc)]
+use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW, STALE_TURN_TIMEOUT};
+use crate::coverage::HookCoverage;
 use crate::exclusions::{Exclusions, has_project_marker};
 use crate::git::Git;
 use crate::log;
 use crate::paths::{self, is_within, same};
+use crate::pause::Pauses;
 use crate::secret::DeviceSecret;
 use crate::storage::{
-    EventRow, MigrationRow, ProjectKind, ProjectRow, SessionRow, StoredRegistry, WriteOp,
-    final_alias,
+    EventRow, MigrationRow, ProjectKind, ProjectRow, RunRow, SessionRow, StoredRegistry,
+    TailedBatch, TailerStartRow, TranscriptOffset, WriteOp, final_alias,
 };
 use crate::writer::WriterSender;
 
@@ -152,6 +163,12 @@ pub struct Router {
     /// The `.git` entry last seen at each `dir:` Root.
     git_entries: HashMap<PathBuf, GitEntry>,
     sessions: HashMap<(HarnessId, String), SessionState>,
+    /// Sessions with a stored (or queued) `SESSION_START`.
+    started: HashSet<(HarnessId, String)>,
+    /// Session Pause spans, loaded at startup.
+    pauses: Pauses,
+    /// Which spans of each session its hooks covered (this run and earlier).
+    coverage: HookCoverage,
     hooks: Vec<ProjectHook>,
     /// In-memory attribution windows (never persisted).
     windows: Attribution,
@@ -171,6 +188,10 @@ impl Router {
             projects,
             aliases,
             sessions,
+            started_sessions,
+            pauses,
+            runs,
+            hook_runs,
         } = stored;
         let pinned = projects
             .iter()
@@ -201,7 +222,8 @@ impl Router {
                 ((row.harness_id, row.session_id), state)
             })
             .collect();
-        Self {
+        let coverage = HookCoverage::new(&runs, hook_runs);
+        let mut router = Self {
             git,
             exclusions,
             secret,
@@ -213,17 +235,27 @@ impl Router {
             pinned,
             git_entries: HashMap::new(),
             sessions,
+            started: started_sessions.into_iter().collect(),
+            pauses: Pauses::new(pauses),
+            coverage,
             hooks: Vec::new(),
-            windows: Attribution::new(LOG_TAIL_TRAILING_WINDOW, LOG_TAIL_HOLD),
+            windows: Attribution::new(&WatcherSettings::default()),
             writer_gone_logged: false,
-        }
+        };
+        // This start is a run; the writer keeps its `last_alive_ms` current.
+        let run = RunRow {
+            run_id: router.coverage.current_run(),
+            started_ms: now_ms(),
+        };
+        router.write(WriteOp::RunStart(run));
+        router
     }
 
     /// Replaces the attribution windows' timing (test overrides of
-    /// [`LOG_TAIL_TRAILING_WINDOW`] and [`LOG_TAIL_HOLD`]). Call before any
-    /// event is routed.
-    pub fn set_attribution_timing(&mut self, trailing_window: Duration, hold: Duration) {
-        self.windows = Attribution::new(trailing_window, hold);
+    /// [`LOG_TAIL_TRAILING_WINDOW`], [`LOG_TAIL_HOLD`] and
+    /// [`STALE_TURN_TIMEOUT`]). Call before any event is routed.
+    pub fn set_attribution_timing(&mut self, settings: &WatcherSettings) {
+        self.windows = Attribution::new(settings);
     }
 
     /// Adds a hook told about every Project registered from now on.
@@ -614,21 +646,32 @@ impl Router {
     /// bus accepted before the hold ended, so the window covering the
     /// mutation's timestamp on its own Project (if any) claims it by
     /// copying the winning session's `harness_id`, `session_id` and
-    /// `network_class`.
-    fn attribute(&self, mutation: &mut TractionEvent) {
+    /// `network_class`. Returns `false` when the claiming session was
+    /// paused at the mutation's timestamp: the mutation must be dropped.
+    fn attribute(&self, mutation: &mut TractionEvent) -> bool {
         debug_assert!(mutation.harness_id.is_none() && mutation.session_id.is_none());
         mutation.network_class = NetworkClass::Manual;
         let Some(project) = mutation.project_id.as_deref() else {
-            return;
+            return true;
         };
         let claim = self
             .windows
             .claim(mutation.timestamp_ms, |id| self.final_id(id) == project);
         if let Some(claim) = claim {
+            // Session Pause: the paused session's edit is dropped, never
+            // recorded as Manual Work.
+            let ts = i64::try_from(mutation.timestamp_ms).unwrap_or(i64::MAX);
+            if self
+                .pauses
+                .is_paused_at(claim.harness_id, &claim.session_id, ts)
+            {
+                return false;
+            }
             mutation.harness_id = Some(claim.harness_id);
             mutation.session_id = Some(claim.session_id);
             mutation.network_class = claim.network_class;
         }
+        true
     }
 
     /// Attributes a watcher `FILE_MUTATION`, re-checks it against the
@@ -638,7 +681,9 @@ impl Router {
     fn handle_mutation(&mut self, mut mutation: TractionEvent) {
         // Held across a migration: store it under the final (`git:`) ID.
         mutation.project_id = mutation.project_id.map(|id| self.final_id(&id));
-        self.attribute(&mut mutation);
+        if !self.attribute(&mut mutation) {
+            return;
+        }
         if mutation.validate().is_err() {
             log::warn("dropped a file watcher mutation that is not a valid Traction Event");
             return;
@@ -653,17 +698,126 @@ impl Router {
 
     /// Routes `event` and queues it for the writer.
     fn handle_event(&mut self, event: TractionEvent) {
-        let Some(event) = self.route(event) else {
-            return;
-        };
-        self.windows
-            .observe(&event, u64::try_from(now_ms()).unwrap_or_default());
-        match EventRow::try_from(event) {
-            Ok(row) => self.write(WriteOp::Event(Box::new(row))),
-            // The bus ran `EventRow::check` before accepting it.
-            Err(_) => log::warn("dropped a routed event that does not fit the events table"),
+        self.note_hook(&event);
+        if let Some(row) = self.routed_row(event) {
+            self.write(WriteOp::Event(Box::new(row)));
         }
     }
+
+    /// Routes `event`, feeds it to the attribution windows and converts it
+    /// to a row. `None` when it is dropped.
+    fn routed_row(&mut self, event: TractionEvent) -> Option<EventRow> {
+        if event.event_type == EventType::SessionStart
+            && let (Some(harness), Some(session)) = (event.harness_id, &event.session_id)
+        {
+            self.started.insert((harness, session.clone()));
+        }
+        let event = self.route(event)?;
+        self.windows
+            .observe(&event, u64::try_from(now_ms()).unwrap_or_default());
+        if self.is_paused(&event) {
+            return None;
+        }
+        match EventRow::try_from(event) {
+            Ok(row) => Some(row),
+            // The bus ran `EventRow::check` before accepting it, and the
+            // daemon's own Adapters build only rows that fit.
+            Err(_) => {
+                log::warn("dropped a routed event that does not fit the events table");
+                None
+            }
+        }
+    }
+
+    /// Records the first accepted hook event of a session in this run (its
+    /// `first_hook_ms`), the start of the span the transcript tailer must
+    /// not duplicate.
+    fn note_hook(&mut self, event: &TractionEvent) {
+        if event.attribution_source != AttributionSource::HarnessHook {
+            return;
+        }
+        let (Some(harness), Some(session)) = (event.harness_id, &event.session_id) else {
+            return;
+        };
+        let at_ms = i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX);
+        if let Some(row) = self.coverage.note_hook(harness, session, at_ms) {
+            self.write(WriteOp::HookRun(row));
+        }
+    }
+
+    /// Whether a tailed (`harness_log`) event is stored. Dropped: a
+    /// synthesized `SESSION_START` once one is stored for its session, and
+    /// a record inside a span the session's hooks covered (see
+    /// [`HookCoverage`]).
+    ///
+    /// A tailed record inside a paused span is dropped later, by
+    /// [`Self::routed_row`] (pause spans compare the record's own
+    /// timestamp).
+    fn keeps_tailed(&self, event: &TractionEvent) -> bool {
+        debug_assert_eq!(event.attribution_source, AttributionSource::HarnessLog);
+        let (Some(harness), Some(session)) = (event.harness_id, &event.session_id) else {
+            return true;
+        };
+        if event.event_type == EventType::SessionStart
+            && self.started.contains(&(harness, session.clone()))
+        {
+            return false;
+        }
+        let ts = i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX);
+        !self.coverage.covers(harness, session, ts)
+    }
+
+    /// Routes the events the transcript tailer read from one file and
+    /// queues them with the file's new offset as one write, so the offset
+    /// commits in the same transaction as its events. Dropped events still
+    /// advance the offset.
+    fn handle_tailed(&mut self, events: Vec<TractionEvent>, offset: TranscriptOffset) {
+        let mut rows = Vec::with_capacity(events.len());
+        for event in events {
+            if self.keeps_tailed(&event)
+                && let Some(row) = self.routed_row(event)
+            {
+                rows.push(row);
+            }
+        }
+        self.write(WriteOp::Tailed(TailedBatch {
+            events: rows,
+            offset,
+        }));
+    }
+}
+
+impl Router {
+    /// Whether `event`'s session was paused at its timestamp.
+    fn is_paused(&self, event: &TractionEvent) -> bool {
+        let (Some(harness), Some(session_id)) = (event.harness_id, &event.session_id) else {
+            return false;
+        };
+        let ts = i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX);
+        self.pauses.is_paused_at(harness, session_id, ts)
+    }
+
+    /// `/stop-track` / `/resume-track`: pauses or resumes the session,
+    /// queueing the span write when its state changed (a repeat is a
+    /// no-op).
+    fn handle_pause(&mut self, pause: Pause) {
+        let at_ms = i64::try_from(pause.at_ms).unwrap_or(i64::MAX);
+        if let Some(op) = self
+            .pauses
+            .apply(pause.action, pause.harness, &pause.session_id, at_ms)
+        {
+            self.write(op);
+        }
+    }
+}
+
+/// A Session Pause command for one session, received at `at_ms`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pause {
+    pub action: PauseAction,
+    pub harness: HarnessId,
+    pub session_id: String,
+    pub at_ms: u64,
 }
 
 /// The pinning key of a canonical common dir (case-folded on Windows).
@@ -689,10 +843,19 @@ enum RouterMessage {
     Event(Box<TractionEvent>),
     /// A held watcher `FILE_MUTATION` whose hold just ended.
     Mutation(Box<TractionEvent>),
+    Pause(Pause),
     Register {
         path: PathBuf,
         reply: oneshot::Sender<RegisterReply>,
     },
+    /// Events the transcript tailer read from one file, with the offset
+    /// just past them.
+    Tailed {
+        events: Vec<TractionEvent>,
+        offset: TranscriptOffset,
+    },
+    /// The transcript tailer's first-ever start.
+    TailerStart(TailerStartRow),
 }
 
 /// The bus side of the Router's queue. Cheap to clone; never blocks.
@@ -707,6 +870,11 @@ impl RouterSender {
     /// Queues an accepted event for routing and storage.
     pub fn try_route(&self, event: TractionEvent) -> Result<(), RouterBusy> {
         self.try_send(RouterMessage::Event(Box::new(event)))
+    }
+
+    /// Queues a Session Pause command, in order with the session's events.
+    pub fn try_pause(&self, pause: Pause) -> Result<(), RouterBusy> {
+        self.try_send(RouterMessage::Pause(pause))
     }
 
     /// Queues a registration; the receiver yields the Router's answer.
@@ -724,6 +892,26 @@ impl RouterSender {
     pub fn send_mutation(&self, mutation: TractionEvent) -> Result<(), RouterBusy> {
         self.0
             .send(RouterMessage::Mutation(Box::new(mutation)))
+            .map_err(|_| RouterBusy)
+    }
+
+    /// Queues events read from one transcript with the offset just past
+    /// them, waiting while the queue is full (only the tailer thread calls
+    /// it).
+    pub fn send_tailed(
+        &self,
+        events: Vec<TractionEvent>,
+        offset: TranscriptOffset,
+    ) -> Result<(), RouterBusy> {
+        self.0
+            .send(RouterMessage::Tailed { events, offset })
+            .map_err(|_| RouterBusy)
+    }
+
+    /// Queues the tailer's first-ever start record (waits while full).
+    pub fn send_tailer_start(&self, start: TailerStartRow) -> Result<(), RouterBusy> {
+        self.0
+            .send(RouterMessage::TailerStart(start))
             .map_err(|_| RouterBusy)
     }
 
@@ -758,10 +946,13 @@ fn run(mut router: Router, receiver: &Receiver<RouterMessage>) {
         match message {
             RouterMessage::Event(event) => router.handle_event(*event),
             RouterMessage::Mutation(mutation) => router.handle_mutation(*mutation),
+            RouterMessage::Pause(pause) => router.handle_pause(pause),
             RouterMessage::Register { path, reply } => {
                 // The caller may have given up waiting; nothing to do then.
                 let _ = reply.send(router.register_path(&path));
             }
+            RouterMessage::Tailed { events, offset } => router.handle_tailed(events, offset),
+            RouterMessage::TailerStart(start) => router.write(WriteOp::TailerStart(start)),
         }
     }
 }

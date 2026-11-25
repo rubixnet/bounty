@@ -1,0 +1,39 @@
+{
+  "scenario": "subagent",
+  "claude_code_version": "2.1.332",
+  "captured_at": "2026-11-25",
+  "os": "macos",
+  "os_release": "25.5.0",
+  "simulated": false,
+  "note": "",
+  "prompts": [
+    "Use the Task tool to start one general-purpose subagent with this exact task: 'Read the file README.md and reply with the phrase TRACTION-CANARY-subagent.' Then tell me in one sentence what the subagent replied."
+  ],
+  "model": "haiku",
+  "session_ids": [
+    "856eb859-27d5-44f9-a36d-54ce5f277c79"
+  ],
+  "hooks_received": [
+    "UserPromptSubmit",
+    "PreToolUse",
+    "SubagentStart",
+    "PostToolUse",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "SubagentStop",
+    "UserPromptSubmit",
+    "Stop",
+    "SessionEnd"
+  ],
+  "runs": [
+    {
+      "exit_code": 0,
+      "is_error": false,
+      "terminal_reason": "completed",
+      "api_calls_ms": 6123,
+      "num_turns": 1
+    }
+  ],
+  "transcript_found": true
+}
