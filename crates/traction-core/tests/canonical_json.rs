@@ -5,7 +5,10 @@
 //! on exact bytes.
 
 use serde_json::{Value, json};
-use traction_core::{CanonicalJsonError, EndReason, EventType, HarnessId, TractionEvent};
+use traction_core::{
+    AttributionSource, CanonicalJsonError, EndReason, EventType, HarnessId, MutationKind,
+    TractionEvent,
+};
 
 /// The `docs/protocol.md` section 2 example Traction Event, with each enum
 /// slot filled by one concrete protocol value.
@@ -23,13 +26,15 @@ fn protocol_example() -> Value {
         "project_id": "git:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "model_id": "optional-model-string",
         "network_class": "cloud_api",
+        "attribution_source": "harness_hook",
         "metrics_only": {
             "prompt_char_len": 142,
             "repo_symbol_hits": 3,
             "has_stacktrace": true,
             "tool_name": "Bash",
             "exit_code": 1,
-            "diff_lines_delta": 24
+            "diff_lines_delta": 24,
+            "mutation_kind": null
         }
     })
 }
@@ -40,13 +45,14 @@ fn parse(value: &Value) -> TractionEvent {
 
 /// The exact, checked-in canonical bytes of the protocol example.
 const PROTOCOL_EXAMPLE_CANONICAL: &str = concat!(
-    r#"{"cwd":"/abs/path/to/working/dir","#,
+    r#"{"attribution_source":"harness_hook","#,
+    r#""cwd":"/abs/path/to/working/dir","#,
     r#""end_reason":"completed","#,
     r#""event_id":"019a7c2e-8b4d-7000-8000-000000000001","#,
     r#""event_type":"TURN_END","#,
     r#""harness_id":"claude-code","#,
     r#""metrics_only":{"diff_lines_delta":24,"exit_code":1,"has_stacktrace":true,"#,
-    r#""prompt_char_len":142,"repo_symbol_hits":3,"tool_name":"Bash"},"#,
+    r#""mutation_kind":null,"prompt_char_len":142,"repo_symbol_hits":3,"tool_name":"Bash"},"#,
     r#""model_id":"optional-model-string","#,
     r#""network_class":"cloud_api","#,
     r#""parent_orchestrator_id":null,"#,
@@ -76,11 +82,12 @@ fn absent_optional_fields_are_explicit_null_with_sorted_nested_keys_and_no_white
     assert_eq!(
         String::from_utf8(bytes).unwrap(),
         concat!(
-            r#"{"cwd":"/abs/path/to/working/dir","end_reason":null,"#,
+            r#"{"attribution_source":"harness_hook","#,
+            r#""cwd":"/abs/path/to/working/dir","end_reason":null,"#,
             r#""event_id":"019a7c2e-8b4d-7000-8000-000000000001","#,
             r#""event_type":"SESSION_START","harness_id":"claude-code","#,
             r#""metrics_only":{"diff_lines_delta":null,"exit_code":null,"has_stacktrace":null,"#,
-            r#""prompt_char_len":null,"repo_symbol_hits":null,"tool_name":null},"#,
+            r#""mutation_kind":null,"prompt_char_len":null,"repo_symbol_hits":null,"tool_name":null},"#,
             r#""model_id":null,"network_class":"cloud_api","parent_orchestrator_id":null,"#,
             r#""project_id":"git:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","#,
             r#""schema_version":1,"session_id":"string","timestamp_ms":1795432800000}"#,
@@ -109,6 +116,7 @@ fn equal_events_built_in_different_field_orders_give_identical_bytes() {
     let reversed = concat!(
         r#"{"metrics_only":{"diff_lines_delta":24,"exit_code":1,"tool_name":"Bash","#,
         r#""has_stacktrace":true,"repo_symbol_hits":3,"prompt_char_len":142},"#,
+        r#""attribution_source":"harness_hook","#,
         r#""network_class":"cloud_api","model_id":"optional-model-string","#,
         r#""project_id":"git:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","#,
         r#""cwd":"/abs/path/to/working/dir","end_reason":"completed","event_type":"TURN_END","#,
@@ -131,8 +139,12 @@ fn every_event_type_and_harness_round_trips_through_canonical_json() {
         for harness_id in HarnessId::ALL {
             let mut event = parse(&protocol_example());
             event.event_type = event_type;
-            event.harness_id = harness_id;
+            event.harness_id = Some(harness_id);
             event.end_reason = (event_type == EventType::TurnEnd).then_some(EndReason::Aborted);
+            if event_type == EventType::FileMutation {
+                event.attribution_source = AttributionSource::FileWatcher;
+                event.metrics_only.mutation_kind = Some(MutationKind::Renamed);
+            }
             event.validate().expect("still a valid Traction Event");
             let bytes = event.to_canonical_json();
             let back = TractionEvent::from_json(&bytes).expect("canonical bytes parse back");

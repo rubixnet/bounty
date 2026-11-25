@@ -5,8 +5,8 @@
 
 use serde_json::{Value, json};
 use traction_core::{
-    EndReason, EventError, EventType, HarnessId, MetricsOnly, NetworkClass, TractionEvent,
-    ValidationError,
+    AttributionSource, EndReason, EventError, EventType, HarnessId, MetricsOnly, MutationKind,
+    NetworkClass, TractionEvent, ValidationError,
 };
 
 /// The `docs/protocol.md` section 2 example Traction Event, with each enum
@@ -25,13 +25,15 @@ fn protocol_example() -> Value {
         "project_id": "git:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "model_id": "optional-model-string",
         "network_class": "cloud_api",
+        "attribution_source": "harness_hook",
         "metrics_only": {
             "prompt_char_len": 142,
             "repo_symbol_hits": 3,
             "has_stacktrace": true,
             "tool_name": "Bash",
             "exit_code": 1,
-            "diff_lines_delta": 24
+            "diff_lines_delta": 24,
+            "mutation_kind": null
         }
     })
 }
@@ -73,6 +75,28 @@ fn non_turn_end(event_type: &str) -> Value {
     wire
 }
 
+/// A manual `FILE_MUTATION`: seen by the file watcher outside every Harness
+/// window, so it carries no Harness, no session and `network_class: manual`.
+fn manual_file_mutation() -> Value {
+    let mut wire = non_turn_end("FILE_MUTATION");
+    wire["harness_id"] = Value::Null;
+    wire["session_id"] = Value::Null;
+    wire["model_id"] = Value::Null;
+    wire["network_class"] = json!("manual");
+    wire["attribution_source"] = json!("file_watcher");
+    wire["cwd"] = json!("/home/teen/code/my-game");
+    wire["metrics_only"] = json!({
+        "prompt_char_len": null,
+        "repo_symbol_hits": null,
+        "has_stacktrace": null,
+        "tool_name": null,
+        "exit_code": null,
+        "diff_lines_delta": null,
+        "mutation_kind": "modified"
+    });
+    wire
+}
+
 fn assert_malformed(wire: &Value) {
     assert_eq!(parse(wire), Err(EventError::Malformed));
 }
@@ -89,7 +113,7 @@ fn every_harness_id_round_trips_with_its_protocol_spelling() {
     for (harness, spelling) in spellings {
         let wire = with("harness_id", json!(spelling));
         let event = parse(&wire).expect("every protocol Harness is accepted");
-        assert_eq!(event.harness_id, harness);
+        assert_eq!(event.harness_id, Some(harness));
         assert_eq!(harness.as_str(), spelling);
         assert_eq!(reserialize(&event), wire);
     }
@@ -116,6 +140,8 @@ fn every_event_type_round_trips_with_its_protocol_spelling() {
     for (event_type, spelling) in spellings {
         let wire = if event_type == EventType::TurnEnd {
             protocol_example()
+        } else if event_type == EventType::FileMutation {
+            manual_file_mutation()
         } else {
             non_turn_end(spelling)
         };
@@ -151,6 +177,47 @@ fn every_network_class_and_end_reason_round_trips_with_its_protocol_spelling() {
     }
 }
 
+#[test]
+fn every_attribution_source_round_trips_with_its_protocol_spelling() {
+    let spellings = [
+        (AttributionSource::HarnessHook, "harness_hook"),
+        (AttributionSource::HarnessPlugin, "harness_plugin"),
+        (AttributionSource::HarnessLog, "harness_log"),
+        (AttributionSource::HarnessDbPoll, "harness_db_poll"),
+        (AttributionSource::FileWatcher, "file_watcher"),
+        (AttributionSource::BrowserExtension, "browser_extension"),
+        (AttributionSource::EditorExtension, "editor_extension"),
+        (AttributionSource::ManualPick, "manual_pick"),
+    ];
+    assert_eq!(spellings.len(), AttributionSource::ALL.len());
+    for (source, spelling) in spellings {
+        // `file_watcher` is only valid on a `FILE_MUTATION`.
+        let mut wire = if source == AttributionSource::FileWatcher {
+            manual_file_mutation()
+        } else {
+            protocol_example()
+        };
+        wire["attribution_source"] = json!(spelling);
+        let event = parse(&wire).expect("every protocol attribution source is accepted");
+        assert_eq!(event.attribution_source, source);
+        assert_eq!(source.as_str(), spelling);
+        assert_eq!(reserialize(&event), wire);
+    }
+}
+
+#[test]
+fn rejects_missing_or_unknown_attribution_source() {
+    let mut missing = protocol_example();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("attribution_source");
+    assert_malformed(&missing);
+    for bad in ["Harness_Hook", "harness-hook", "hook", "", "wakatime"] {
+        assert_malformed(&with("attribution_source", json!(bad)));
+    }
+}
+
 /// `as_str` is the spelling serde writes, for every variant of every enum.
 #[test]
 fn as_str_matches_the_serde_spelling_of_every_enum_value() {
@@ -172,6 +239,12 @@ fn as_str_matches_the_serde_spelling_of_every_enum_value() {
     for class in NetworkClass::ALL {
         assert_eq!(class.as_str(), serde_spelling(class));
     }
+    for source in AttributionSource::ALL {
+        assert_eq!(source.as_str(), serde_spelling(source));
+    }
+    for kind in MutationKind::ALL {
+        assert_eq!(kind.as_str(), serde_spelling(kind));
+    }
 }
 
 #[test]
@@ -185,7 +258,8 @@ fn optional_fields_and_metrics_may_all_be_null() {
         "has_stacktrace": null,
         "tool_name": null,
         "exit_code": null,
-        "diff_lines_delta": null
+        "diff_lines_delta": null,
+        "mutation_kind": null
     });
     let event = parse(&wire).expect("a Traction Event with no metrics is valid");
     assert_eq!(event.metrics_only, MetricsOnly::default());
@@ -488,5 +562,188 @@ fn rejects_whitespace_laden_or_unsafe_model_ids() {
             &with("model_id", json!(bad)),
             ValidationError::InvalidModelId,
         );
+    }
+}
+
+#[test]
+fn an_event_with_no_cwd_or_project_id_validates() {
+    // Absent and explicit `null` are the same on the wire.
+    let mut absent = protocol_example();
+    let object = absent.as_object_mut().unwrap();
+    object.remove("cwd");
+    object.remove("project_id");
+    let event = parse(&absent).expect("a Traction Event with no cwd is valid");
+    assert_eq!(event.cwd, None);
+    assert_eq!(event.project_id, None);
+
+    let mut null = protocol_example();
+    null["cwd"] = Value::Null;
+    null["project_id"] = Value::Null;
+    assert_eq!(reserialize(&parse(&null).unwrap()), null);
+}
+
+#[test]
+fn a_manual_file_mutation_validates() {
+    let wire = manual_file_mutation();
+    let event = parse(&wire).expect("a manual FILE_MUTATION is valid");
+    assert_eq!(event.harness_id, None);
+    assert_eq!(event.session_id, None);
+    assert_eq!(event.network_class, NetworkClass::Manual);
+    assert_eq!(event.attribution_source, AttributionSource::FileWatcher);
+    assert_eq!(
+        event.metrics_only.mutation_kind,
+        Some(MutationKind::Modified)
+    );
+    assert_eq!(reserialize(&event), wire);
+}
+
+#[test]
+fn a_harness_attributed_file_mutation_validates() {
+    let mut wire = manual_file_mutation();
+    wire["harness_id"] = json!("codex-cli");
+    wire["session_id"] = json!("rollout-2026-11-25T10-00-00");
+    wire["network_class"] = json!("cloud_api");
+    let event = parse(&wire).expect("an attributed FILE_MUTATION is valid");
+    assert_eq!(event.harness_id, Some(HarnessId::CodexCli));
+    assert_eq!(reserialize(&event), wire);
+}
+
+#[test]
+fn every_mutation_kind_round_trips_with_its_protocol_spelling() {
+    for (kind, spelling) in [
+        (MutationKind::Created, "created"),
+        (MutationKind::Modified, "modified"),
+        (MutationKind::Removed, "removed"),
+        (MutationKind::Renamed, "renamed"),
+    ] {
+        let mut wire = manual_file_mutation();
+        wire["metrics_only"]["mutation_kind"] = json!(spelling);
+        let event = parse(&wire).expect("every protocol mutation kind is accepted");
+        assert_eq!(event.metrics_only.mutation_kind, Some(kind));
+        assert_eq!(kind.as_str(), spelling);
+        assert_eq!(reserialize(&event), wire);
+    }
+    let mut wire = manual_file_mutation();
+    wire["metrics_only"]["mutation_kind"] = json!("deleted");
+    assert_malformed(&wire);
+}
+
+/// A valid event of every type except `FILE_MUTATION`, each passed to `f`.
+fn for_each_non_file_mutation(mut f: impl FnMut(Value)) {
+    for event_type in EventType::ALL {
+        if event_type == EventType::FileMutation {
+            continue;
+        }
+        let mut wire = non_turn_end(event_type.as_str());
+        if event_type == EventType::TurnEnd {
+            wire["end_reason"] = json!("completed");
+        }
+        f(wire);
+    }
+}
+
+#[test]
+fn rejects_a_non_file_mutation_with_no_harness() {
+    for_each_non_file_mutation(|mut wire| {
+        wire["harness_id"] = Value::Null;
+        assert_invalid(&wire, ValidationError::MissingHarness);
+    });
+}
+
+#[test]
+fn rejects_a_non_file_mutation_with_no_session() {
+    for_each_non_file_mutation(|mut wire| {
+        wire["session_id"] = Value::Null;
+        assert_invalid(&wire, ValidationError::MissingSession);
+    });
+}
+
+#[test]
+fn rejects_a_file_mutation_with_a_harness_but_no_session() {
+    let mut wire = manual_file_mutation();
+    wire["harness_id"] = json!("claude-code");
+    wire["network_class"] = json!("cloud_api");
+    assert_invalid(&wire, ValidationError::MissingSession);
+}
+
+#[test]
+fn rejects_a_file_mutation_with_a_session_but_no_harness() {
+    let mut wire = manual_file_mutation();
+    wire["session_id"] = json!("session-1");
+    wire["network_class"] = json!("cloud_api");
+    assert_invalid(&wire, ValidationError::MissingHarness);
+}
+
+#[test]
+fn rejects_a_manual_file_mutation_that_is_not_network_class_manual() {
+    for class in ["cloud_api", "local_model"] {
+        let mut wire = manual_file_mutation();
+        wire["network_class"] = json!(class);
+        assert_invalid(&wire, ValidationError::ManualMutationNotManual);
+    }
+}
+
+#[test]
+fn rejects_file_watcher_on_every_non_file_mutation() {
+    for_each_non_file_mutation(|mut wire| {
+        wire["attribution_source"] = json!("file_watcher");
+        assert_invalid(&wire, ValidationError::UnexpectedFileWatcher);
+    });
+}
+
+#[test]
+fn rejects_a_file_mutation_not_from_the_file_watcher() {
+    for source in AttributionSource::ALL {
+        if source == AttributionSource::FileWatcher {
+            continue;
+        }
+        let mut wire = manual_file_mutation();
+        wire["attribution_source"] = json!(source.as_str());
+        assert_invalid(&wire, ValidationError::InvalidAttributionSource);
+    }
+}
+
+#[test]
+fn rejects_a_file_mutation_without_mutation_kind() {
+    let mut wire = manual_file_mutation();
+    wire["metrics_only"]["mutation_kind"] = Value::Null;
+    assert_invalid(&wire, ValidationError::MissingMutationKind);
+}
+
+#[test]
+fn rejects_mutation_kind_on_every_non_file_mutation() {
+    for_each_non_file_mutation(|mut wire| {
+        wire["metrics_only"]["mutation_kind"] = json!("modified");
+        assert_invalid(&wire, ValidationError::UnexpectedMutationKind);
+    });
+}
+
+#[test]
+fn schema_room_reason_codes_are_stable() {
+    for (error, code) in [
+        (ValidationError::MissingHarness, "missing_harness"),
+        (ValidationError::MissingSession, "missing_session"),
+        (
+            ValidationError::ManualMutationNotManual,
+            "manual_mutation_not_manual",
+        ),
+        (
+            ValidationError::UnexpectedFileWatcher,
+            "unexpected_file_watcher",
+        ),
+        (
+            ValidationError::InvalidAttributionSource,
+            "invalid_attribution_source",
+        ),
+        (
+            ValidationError::MissingMutationKind,
+            "missing_mutation_kind",
+        ),
+        (
+            ValidationError::UnexpectedMutationKind,
+            "unexpected_mutation_kind",
+        ),
+    ] {
+        assert_eq!(error.code(), code);
     }
 }

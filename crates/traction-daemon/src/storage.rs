@@ -82,32 +82,53 @@ pub struct EventRow {
     diff_lines_delta: Option<i64>,
 }
 
-/// An unsigned field exceeds SQLite's signed 64-bit integer range.
+/// Why a validated Traction Event cannot be stored as a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IntegerOutOfRange;
+pub enum RowError {
+    /// An unsigned field exceeds SQLite's signed 64-bit integer range.
+    IntegerOutOfRange,
+    /// The event lacks a Harness, session, `cwd` or `project_id`, which the
+    /// migration-1 events table still requires. Core accepts such events
+    /// since Step 1b; the table catches up in a later migration.
+    NotStorable,
+}
 
-impl IntegerOutOfRange {
-    pub const CODE: &'static str = "integer_out_of_range";
+impl RowError {
+    /// A short, stable, machine-readable reason code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            RowError::IntegerOutOfRange => "integer_out_of_range",
+            RowError::NotStorable => "event_not_storable",
+        }
+    }
 }
 
 impl TryFrom<TractionEvent> for EventRow {
-    type Error = IntegerOutOfRange;
+    type Error = RowError;
 
     fn try_from(event: TractionEvent) -> Result<Self, Self::Error> {
-        let int = |value: u64| i64::try_from(value).map_err(|_| IntegerOutOfRange);
+        let int = |value: u64| i64::try_from(value).map_err(|_| RowError::IntegerOutOfRange);
+        let (Some(harness_id), Some(session_id), Some(cwd), Some(project_id)) = (
+            event.harness_id,
+            event.session_id,
+            event.cwd,
+            event.project_id,
+        ) else {
+            return Err(RowError::NotStorable);
+        };
         let metrics = event.metrics_only;
         Ok(Self {
             schema_version: i64::from(event.schema_version),
             timestamp_ms: int(event.timestamp_ms)?,
-            harness_id: event.harness_id.as_str(),
+            harness_id: harness_id.as_str(),
             event_type: event.event_type.as_str(),
             end_reason: event.end_reason.map(EndReason::as_str),
             network_class: event.network_class.as_str(),
             event_id: event.event_id,
-            session_id: event.session_id,
+            session_id,
             parent_orchestrator_id: event.parent_orchestrator_id,
-            cwd: event.cwd,
-            project_id: event.project_id,
+            cwd,
+            project_id,
             model_id: event.model_id,
             prompt_char_len: metrics.prompt_char_len.map(int).transpose()?,
             repo_symbol_hits: metrics.repo_symbol_hits.map(int).transpose()?,
