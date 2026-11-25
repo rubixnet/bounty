@@ -1,0 +1,33 @@
+{
+  "scenario": "permission-request",
+  "claude_code_version": "2.1.332",
+  "captured_at": "2026-11-25",
+  "os": "macos",
+  "os_release": "25.5.0",
+  "simulated": false,
+  "note": "Bash is not pre-allowed, so Claude Code must ask for permission; headless -p mode may deny instead of asking.",
+  "prompts": [
+    "Run the Bash command `echo TRACTION-CANARY-permission-request > perm.txt`. If you are not allowed, say so in one sentence and stop."
+  ],
+  "model": "haiku",
+  "session_ids": [
+    "14e7e170-a90b-435a-81bb-abd742c681d6"
+  ],
+  "hooks_received": [
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "Stop",
+    "SessionEnd"
+  ],
+  "runs": [
+    {
+      "exit_code": 0,
+      "is_error": false,
+      "terminal_reason": "completed",
+      "api_calls_ms": 2228,
+      "num_turns": 2
+    }
+  ],
+  "transcript_found": true
+}

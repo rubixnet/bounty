@@ -14,7 +14,11 @@ CLAUDE_CODE_OAUTH_TOKEN=<token> python3 scripts/claude_fixtures.py
 #   --timeout SECS    hard wall-clock limit per claude call (default 240)
 #   --model ALIAS     default: haiku
 
-# Check the committed fixtures (no claude needed; safe in CI)
+# Re-apply the scrub rules to fixtures already on disk (no `claude` call), then check:
+
+    python3 scripts/claude_fixtures.py --rescrub
+
+Check the committed fixtures (no claude needed; safe in CI)
 python3 scripts/claude_fixtures.py --check
 
 # Tests for the script itself
@@ -53,9 +57,9 @@ home/temp path, email, account identifier or token, and on a missing canary.
 
 ## Findings (Claude Code 2.1.332, macOS)
 
-Observed from real `claude -p` runs on 2026-11-25. These runs were **not logged in** (the
-agent's environment has no token for a temp config dir), so every model call ended in an
-authentication error; the authenticated capture is still pending (see ticket 01).
+Observed from real `claude -p` runs on 2026-11-25: first unauthenticated agent runs, then the
+committed **authenticated** capture (all 8 scenarios, `haiku`), which confirmed every finding
+below.
 
 - **`/stop-track` text:** with the command files installed, `UserPromptSubmit` receives the
   **literal** command, `"prompt": "/stop-track"` (and `"/resume-track"`), not the expanded body.
@@ -70,10 +74,19 @@ authentication error; the authenticated capture is still pending (see ticket 01)
   `isApiErrorMessage: true`, an `error` code (here `"authentication_failed"`) and
   `message.model: "<synthetic>"`, and the `StopFailure` hook fires with the same `error` and
   a `last_assistant_message`. So an explicit API-error record exists (`STOP_FAILURE` mapping).
-- **Turn-end record:** not yet known. In the failing runs the only records after the turn are
-  `last-prompt`, `atis-latch` and `cost-state` (session bookkeeping, not a per-turn end
-  marker). Confirm against the authenticated capture before mapping `TURN_END`.
-- **`SessionStart`:** not delivered in these `-p` runs (first hook was `UserPromptSubmit`).
-  Re-check in the authenticated capture.
+- **Turn-end record: none usable.** The only per-turn record is `system` /
+  `subtype: "stop_hook_summary"`, and Claude Code writes it only because a `Stop` hook is
+  configured (it summarises that hook's run). A session whose hooks are absent has no such
+  record, and the other trailing records (`last-prompt`, `atis-latch`, `cost-state`) are
+  session bookkeeping. So the tailer does **not** map `TURN_END`: a tailed turn ends at the
+  next prompt or by `STALE_TURN_TIMEOUT`.
+- **`SessionStart`:** never delivered in any `-p` scenario (the first hook is always
+  `UserPromptSubmit`). The hook mapping still handles it (interactive sessions), and the
+  tailer's synthesized first `SESSION_START` covers `-p` sessions.
+- **Interrupted turn:** the interrupt lands after the tool ran; hooks show `PostToolUse` then
+  `Stop`, with no separate abort hook.
+- **Scratch paths:** Claude Code writes background-task output under
+  `/private/tmp/claude-<uid>/...` (macOS) or `/tmp/claude-<uid>/...` (Linux) and quotes those
+  paths in tool results; the scrubber rewrites the prefix to `<CLAUDE_TMP>`.
 - Transcripts also carry large `api-request-shape` / `api-request-blob` / `attachment` records
   (system prompt, environment snapshot). The tailer must ignore them.

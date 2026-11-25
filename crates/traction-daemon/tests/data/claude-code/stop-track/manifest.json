@@ -1,0 +1,40 @@
+{
+  "scenario": "stop-track",
+  "claude_code_version": "2.1.332",
+  "captured_at": "2026-11-25",
+  "os": "macos",
+  "os_release": "25.5.0",
+  "simulated": false,
+  "note": "The listener answers UserPromptSubmit with the spec's block decision when the prompt is the literal command or the command file body. Each prompt is a separate `claude -p` call.",
+  "prompts": [
+    "/stop-track",
+    "/resume-track"
+  ],
+  "model": "haiku",
+  "session_ids": [
+    "0a7867a8-39b8-468d-ae7c-ade156cbeb6d"
+  ],
+  "hooks_received": [
+    "UserPromptSubmit",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "SessionEnd"
+  ],
+  "runs": [
+    {
+      "exit_code": 0,
+      "is_error": false,
+      "terminal_reason": null,
+      "api_calls_ms": 0,
+      "num_turns": 0
+    },
+    {
+      "exit_code": 0,
+      "is_error": false,
+      "terminal_reason": null,
+      "api_calls_ms": 0,
+      "num_turns": 0
+    }
+  ],
+  "transcript_found": true
+}

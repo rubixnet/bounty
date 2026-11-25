@@ -194,6 +194,11 @@ ACCOUNT_KEYS_RE = re.compile(
     r"\"(accountUuid|account_uuid|organizationUuid|organization_uuid|emailAddress|oauthAccount|userID|user_id"
     r"|apiKey|api_key|accessToken|access_token|refreshToken|refresh_token)\"\s*:\s*\"(?!<)[^\"]+\""
 )
+# Claude Code's own per-user scratch folder for background-task output:
+# `/private/tmp/claude-<uid>/...` on macOS, `/tmp/claude-<uid>/...` on Linux.
+# The uid is machine-specific; the rest of the path (project slug, session ID,
+# task ID) is already scrubbed or deliberately kept.
+CLAUDE_SCRATCH_RE = re.compile(r"(?:/private)?/tmp/claude-\d+(?=[/\\])")
 SECRET_VALUE_RE = re.compile(r"(sk-ant-[A-Za-z0-9_-]{8,}|Bearer\s+(?!<|\$)[A-Za-z0-9._-]{16,})")
 
 
@@ -605,6 +610,7 @@ def scrub_pairs(values):
 def scrub(text: str, pairs) -> str:
     for old, new in pairs:
         text = text.replace(old, new)
+    text = CLAUDE_SCRATCH_RE.sub("<CLAUDE_TMP>", text)
     text = EMAIL_RE.sub("fixture@example.invalid", text)
     text = ACCOUNT_KEYS_RE.sub(lambda m: f'"{m.group(1)}": "<REDACTED>"', text)
     text = SECRET_VALUE_RE.sub("<REDACTED>", text)
@@ -773,9 +779,33 @@ def capture(args) -> int:
     return check(args.out)
 
 
+def rescrub(out: Path) -> int:
+    """Re-apply the machine-independent scrub rules to fixtures already on disk.
+
+    Never calls `claude`. Capture-time replacements (temp dirs, home, host) are
+    gone with the capture run, so this applies only the pattern-based rules,
+    then runs `--check`. Idempotent.
+    """
+    user = getpass.getuser()
+    for f in sorted(out.rglob("*")):
+        if not f.is_file() or f.suffix not in (".json", ".jsonl"):
+            continue
+        before = f.read_text(encoding="utf-8")
+        after = scrub(before, [])
+        if len(user) >= 3:
+            after = re.sub(rf"(?<=[/\\-]){re.escape(user)}(?=[/\\\"-]|$)", "<USER>", after)
+        if after != before:
+            f.write_text(after, encoding="utf-8")
+            print(f"rescrubbed {f.relative_to(out)}")
+    return check(out)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true", help="validate committed fixtures; never calls claude")
+    ap.add_argument(
+        "--rescrub", action="store_true", help="re-apply scrub rules to fixtures on disk, then --check; never calls claude"
+    )
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help="fixture folder")
     ap.add_argument("--claude", default="claude", help="claude program (default: claude on PATH)")
     ap.add_argument("--scenario", action="append", choices=SCENARIO_NAMES, help="capture only these")
@@ -785,6 +815,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.check:
         return check(args.out)
+    if args.rescrub:
+        return rescrub(args.out)
     return capture(args)
 
 

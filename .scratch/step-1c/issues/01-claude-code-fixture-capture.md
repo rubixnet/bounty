@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-human
+**Status:** resolved
 
 ### Capture script
 - [x] One script, with a short usage note in the fixture folder's README, captures every scenario: normal multi-tool session, tool failure, permission request, subagent, `cwd` change, interrupted turn, and API-error stop (simulated if it can't be triggered, and clearly marked as simulated).
@@ -15,12 +15,12 @@
 - [x] A `--check` mode validates the committed fixtures without calling `claude`, so CI and later agents can run it: every scenario is present, every hook payload parses, transcripts are valid JSONL, and the cleanliness rules below hold.
 
 ### Clean, version-tagged fixtures
-- [ ] Each scenario folder holds a manifest with the Claude Code version, capture date, OS, scenario name, and whether it was simulated.
-- [ ] A scrub pass replaces machine-specific values with stable placeholders: home dir, temp paths, username, hostname, and any auth or account identifiers. Session IDs and record UUIDs are kept, because dedup and the deterministic `event_id` depend on them. `--check` fails if any of these values are left in.
-- [ ] Prompts and tool content are synthetic, with known canary strings that later canary tests can look for.
+- [x] Each scenario folder holds a manifest with the Claude Code version, capture date, OS, scenario name, and whether it was simulated.
+- [x] A scrub pass replaces machine-specific values with stable placeholders: home dir, temp paths, username, hostname, and any auth or account identifiers. Session IDs and record UUIDs are kept, because dedup and the deterministic `event_id` depend on them. `--check` fails if any of these values are left in.
+- [x] Prompts and tool content are synthetic, with known canary strings that later canary tests can look for.
 
 ### Findings recorded (in the fixture README and the Comments below)
-- [ ] Whether transcripts contain explicit turn-end and API-error records (this decides the tailer's `TURN_END` and `STOP_FAILURE` mapping in ticket 07).
+- [x] Whether transcripts contain explicit turn-end and API-error records (this decides the tailer's `TURN_END` and `STOP_FAILURE` mapping in ticket 07).
 - [x] What text `UserPromptSubmit` receives for `/stop-track` when the command files are installed (the literal command or the expanded body), and whether a `{"decision":"block"}` answer stops the model call. Ticket 04 copies this finding into `docs/protocol.md`.
 
 ### Not stalling
@@ -45,3 +45,11 @@ Findings from real but unauthenticated `claude -p` 2.1.332 runs (hooks still fir
 - API errors: the transcript has an explicit `assistant` record with `isApiErrorMessage: true` and an `error` code; `StopFailure` carries the same `error`. So `STOP_FAILURE` can be mapped from transcripts in ticket 07.
 - Turn end: still open. No per-turn end record appeared in the failing runs, so this needs the authenticated capture. `SessionStart` was not delivered in these `-p` runs either; re-check then.
 
+
+**2026-11-25 (human + agent):** The human ran the authenticated capture locally: all 8 scenarios captured with Claude Code 2.1.332. `--check` flagged 4 leftover `/private/tmp/claude-501/...` paths (Claude Code's own background-task scratch folder, quoted in tool results) in `subagent/hooks/003-PostToolUse.json`, `subagent/hooks/008-UserPromptSubmit.json`, `subagent/transcript.jsonl` and `interrupted-turn/transcript.jsonl`. Fix: `CLAUDE_SCRATCH_RE` in `scrub()` rewrites `(/private)?/tmp/claude-<uid>` to `<CLAUDE_TMP>`, plus a `--rescrub` mode that re-cleans fixtures on disk without calling `claude` (2 new tests, 19 passing). The fixtures were re-scrubbed in place and `--check` passes.
+
+Final findings (also in the fixture README):
+- `UserPromptSubmit` gets the literal `/stop-track` / `/resume-track`; a block answer stops the model call (confirmed authenticated).
+- `STOP_FAILURE` maps from transcripts: `assistant` records with `isApiErrorMessage: true` (api-error-stop is simulated via a local 400 stub, and marked as such).
+- **`TURN_END` is not mapped from transcripts.** The only per-turn record is `system`/`stop_hook_summary`, which exists only because a `Stop` hook is configured, so tailer-only sessions would not have it. A tailed turn ends at the next prompt or by `STALE_TURN_TIMEOUT`.
+- `SessionStart` is never delivered in `-p` mode; the tailer's synthesized first `SESSION_START` covers it.

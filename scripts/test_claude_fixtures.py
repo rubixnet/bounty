@@ -124,6 +124,37 @@ class CheckMode(unittest.TestCase):
         )
         self.assert_check_fails("temp path")
 
+    def test_leftover_claude_scratch_path_fails(self):
+        (self.root / "subagent" / "hooks" / "000-SessionStart.json").write_text(
+            json.dumps({"output": "/private/tmp/claude-501/-<REPO>/s/tasks/a1.output"})
+        )
+        self.assert_check_fails("temp path")
+
+    def test_rescrub_cleans_claude_scratch_paths_in_place(self):
+        hook = self.root / "subagent" / "hooks" / "003-PostToolUse.json"
+        hook.write_text(
+            json.dumps(
+                {
+                    "tool_response": "see /private/tmp/claude-501/-<REPO>/856e/tasks/a03.output and "
+                    "/tmp/claude-1000/-<REPO>/856e/tasks/b1.output",
+                    "session_id": "11111111-2222-3333-4444-555555555555",
+                }
+            )
+        )
+        with open(self.root / "interrupted-turn" / "transcript.jsonl", "a") as f:
+            f.write(json.dumps({"text": "/private/tmp/claude-501/-<REPO>/4810/tasks/b89.output."}) + "\n")
+        r = run("--rescrub", "--out", str(self.root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        body = hook.read_text()
+        self.assertNotIn("/tmp/claude-", body)
+        self.assertIn("<CLAUDE_TMP>/-<REPO>/856e/tasks/a03.output", body)
+        self.assertIn("11111111-2222-3333-4444-555555555555", body)
+        self.assertNotIn("/tmp/claude-", (self.root / "interrupted-turn" / "transcript.jsonl").read_text())
+        # Idempotent: a second pass changes nothing and still passes --check.
+        before = body
+        self.assertEqual(run("--rescrub", "--out", str(self.root)).returncode, 0)
+        self.assertEqual(hook.read_text(), before)
+
     def test_leftover_windows_home_path_fails(self):
         (self.root / "normal-multi-tool" / "hooks" / "001-Stop.json").write_text(
             json.dumps({"cwd": "C:\\Users\\alice\\repo"})

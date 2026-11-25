@@ -1,0 +1,37 @@
+{
+  "scenario": "normal-multi-tool",
+  "claude_code_version": "2.1.332",
+  "captured_at": "2026-11-25",
+  "os": "macos",
+  "os_release": "25.5.0",
+  "simulated": false,
+  "note": "",
+  "prompts": [
+    "Create a file named notes.txt containing exactly the line 'TRACTION-CANARY-normal-multi-tool'. Then read it back with the Read tool, then run `ls` with Bash. Reply with one short sentence."
+  ],
+  "model": "haiku",
+  "session_ids": [
+    "632c8f94-1180-4c7b-a72a-57da24db93b9"
+  ],
+  "hooks_received": [
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PreToolUse",
+    "PostToolUse",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd"
+  ],
+  "runs": [
+    {
+      "exit_code": 0,
+      "is_error": false,
+      "terminal_reason": "completed",
+      "api_calls_ms": 3120,
+      "num_turns": 4
+    }
+  ],
+  "transcript_found": true
+}

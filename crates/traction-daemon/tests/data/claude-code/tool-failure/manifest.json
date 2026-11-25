@@ -1,0 +1,35 @@
+{
+  "scenario": "tool-failure",
+  "claude_code_version": "2.1.332",
+  "captured_at": "2026-11-25",
+  "os": "macos",
+  "os_release": "25.5.0",
+  "simulated": false,
+  "note": "",
+  "prompts": [
+    "Use the Read tool to read the file missing-TRACTION-CANARY-tool-failure.txt (it does not exist). Then run the Bash command `false`. Report both failures in one sentence and do nothing else."
+  ],
+  "model": "haiku",
+  "session_ids": [
+    "85edfb43-2871-4399-939f-5e6e93bebb09"
+  ],
+  "hooks_received": [
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUseFailure",
+    "PreToolUse",
+    "PostToolUseFailure",
+    "Stop",
+    "SessionEnd"
+  ],
+  "runs": [
+    {
+      "exit_code": 0,
+      "is_error": false,
+      "terminal_reason": "completed",
+      "api_calls_ms": 2114,
+      "num_turns": 3
+    }
+  ],
+  "transcript_found": true
+}
