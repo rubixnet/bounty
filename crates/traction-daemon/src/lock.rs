@@ -11,7 +11,7 @@
 //!
 //! [`InstanceLock`] can only be obtained through [`InstanceLock::acquire`].
 //! Code that must only run while this daemon owns the data folder (e.g.
-//! replacing a stale Unix socket, ticket 08) takes `&InstanceLock` as proof.
+//! replacing a stale Unix socket) takes `&InstanceLock` as proof.
 
 use std::io;
 use std::path::Path;

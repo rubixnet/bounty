@@ -1,10 +1,10 @@
 //! Shared Seam 2 helper: a real in-process daemon on a fresh temp data folder
 //! and an ephemeral loopback port, plus a raw HTTP/1.1 caller.
 //!
-//! Tests interact only through HTTP, the token file the daemon wrote and a
-//! read-only SQLite connection opened after shutdown. The caller writes raw
-//! request bytes so later tickets can send arbitrary (or missing) `Host`,
-//! `Origin` and `Authorization` headers.
+//! Tests interact only through the bus (HTTP or the Unix socket), the token
+//! file the daemon wrote and a read-only SQLite connection opened after
+//! shutdown. The caller writes raw request bytes so tests can send arbitrary
+//! (or missing) `Host`, `Origin` and `Authorization` headers.
 //!
 //! Each test binary uses a different subset of this module.
 #![allow(dead_code)]
