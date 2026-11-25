@@ -7,6 +7,23 @@
 - **Auth:** `Authorization: Bearer <token>` read from `~/.traction/daemon.token` (auto-generated 32-byte random hex, mode `0600`).
 - **Request Hardening:** Reject any request whose `Host` header is not `127.0.0.1:41937` or `localhost:41937`, and any request carrying an `Origin` header other than the daemon's own Review UI origin (blocks DNS rebinding and browser CSRF). The `Host` check applies to loopback HTTP only: Unix-socket requests skip it (no TCP origin; the socket is `0600`) but still pass the `Origin` and token checks (see `docs/adr/0003-uds-skips-host-check.md`).
 - **Source Policy:** after validation the bus refuses, with `400`, any `FILE_MUTATION` (`external_file_mutation`; only the daemon's own watcher produces them), `attribution_source: file_watcher` (`internal_attribution_source`) and the reserved `browser_extension`, `editor_extension` and `manual_pick` (`reserved_attribution_source`).
+- **Claude Code hooks:** `POST /v1/hooks/claude-code` accepts Claude Code's native HTTP hook payloads, with the same `Host`, `Origin`, bearer-token and Unix-socket rules and error codes as `/v1/event` (`403 forbidden_host` / `forbidden_origin`, `401`, `404`, `405`). Its body cap is **8 MiB** (hook payloads embed whole tool outputs); above it the answer is `413 body_too_large`, which Claude Code treats as a non-blocking hook error. The body is parsed into an allowlist (`session_id`, `hook_event_name`, `cwd`, `prompt`, `tool_name`, `model`, `new_cwd`, `directory`); every other field (tool input and output, assistant messages, error text) is skipped and never kept, the prompt is reduced in memory to `prompt_char_len` (Unicode scalar values) and `has_stacktrace`, and the buffer is dropped before anything is queued. Each hook becomes at most one Traction Event (`harness_id: claude-code`, `attribution_source: harness_hook`, `network_class: cloud_api`, a fresh UUIDv7 `event_id`, `timestamp_ms` = the daemon's receive time, `repo_symbol_hits` / `exit_code` / `diff_lines_delta` always `null`):
+
+  | Hook | Traction Event | Kept metadata |
+  |---|---|---|
+  | `SessionStart` | `SESSION_START` | `cwd`, `model_id` (`model`, when it is a safe identifier of at most 64 bytes) |
+  | `UserPromptSubmit` | `PROMPT_SUBMIT` | `prompt_char_len`, `has_stacktrace` |
+  | `PermissionRequest` | `PERMISSION_REQUEST` | `tool_name` |
+  | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `TOOL_PRE` / `TOOL_POST` / `TOOL_FAIL` | `tool_name` |
+  | `SubagentStart` / `SubagentStop` | `SUBAGENT_START` / `SUBAGENT_STOP` | — |
+  | `CwdChanged` | `CWD_CHANGE` | `cwd` = `new_cwd` (later events route to its Project) |
+  | `DirectoryAdded` | none: `directory` is registered as a Project, as `/v1/project` does | — |
+  | `Stop` | `TURN_END` (`end_reason: completed`) | — |
+  | `StopFailure` | `STOP_FAILURE` | — |
+  | `SessionEnd` | `SESSION_END` | — |
+  | anything else (never `WorktreeCreate`) | none | — |
+
+  `tool_name` is cut to 64 bytes and dropped (the event kept) unless it is a safe identifier. Every answer that passes the request checks is `200 {}`, sent once the event is queued to the Project Router and never after a SQLite commit: a body that is not JSON, lacks `session_id` or `hook_event_name`, or fails Traction Event validation, and a hook outside the table, all get `200 {}` with nothing stored. A full Router queue also answers `200 {}`; the event is dropped and counted in the daemon log. A hook is never told to block, except by the `/stop-track` / `/resume-track` handling (Step 1c ticket 04).
 - **Client Failure Policy:** All harness adapters MUST enforce a short timeout (15 ms for in-process plugins; `"timeout": 1` — seconds — for Claude Code HTTP hooks with `"onFailure": "continue"`) and never block the user's coding tool if the daemon is offline.
 
 ## 2. Normalized `TractionEvent` Payload
