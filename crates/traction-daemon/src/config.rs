@@ -37,6 +37,13 @@ pub const LOG_TAIL_TRAILING_WINDOW: Duration = Duration::from_secs(30);
 /// stamps a mutation when its notification arrives, which can be after the
 /// Harness already reported the tool call done.
 pub const WINDOW_CLOSE_GRACE: Duration = Duration::from_secs(1);
+/// Stale-turn timeout (`docs/protocol.md` section 2): an open hook window
+/// or log-tailed turn window claims a `FILE_MUTATION` stamped at `t` only if
+/// its session's latest event timestamp is at least `t` minus this long. A
+/// crashed, `kill -9`ed or unterminated turn or tool call then stops
+/// turning the user's hand edits into Agent Compute. Any event of the
+/// session counts as activity; closed windows are unaffected.
+pub const STALE_TURN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Files the watcher may hold per Project at once; past this, the oldest
 /// held mutation of that Project is decided early (bounded memory).
 pub const DEFAULT_WATCHER_PENDING_CAP: usize = 1024;
@@ -123,8 +130,8 @@ impl Default for WriterSettings {
 }
 
 /// File watcher tuning. Production always uses the defaults; the fields are
-/// public only so tests can shorten the hold or the trailing window, or
-/// shrink the cap.
+/// public only so tests can shorten the hold, the trailing window or the
+/// stale-turn timeout, or shrink the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WatcherSettings {
@@ -132,6 +139,8 @@ pub struct WatcherSettings {
     pub hold: Duration,
     /// Test-only override of [`LOG_TAIL_TRAILING_WINDOW`].
     pub trailing_window: Duration,
+    /// Test-only override of [`STALE_TURN_TIMEOUT`].
+    pub stale_turn_timeout: Duration,
     /// Held files per Project before the oldest is decided early.
     pub pending_cap: usize,
 }
@@ -141,6 +150,7 @@ impl Default for WatcherSettings {
         Self {
             hold: LOG_TAIL_HOLD,
             trailing_window: LOG_TAIL_TRAILING_WINDOW,
+            stale_turn_timeout: STALE_TURN_TIMEOUT,
             pending_cap: DEFAULT_WATCHER_PENDING_CAP,
         }
     }

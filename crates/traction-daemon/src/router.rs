@@ -41,7 +41,9 @@ use tokio::sync::oneshot;
 use traction_core::{HarnessId, NetworkClass, TractionEvent, dir_project_id, git_project_id};
 
 use crate::attribution::Attribution;
-use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW};
+use crate::config::WatcherSettings;
+#[cfg(doc)]
+use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW, STALE_TURN_TIMEOUT};
 use crate::exclusions::{Exclusions, has_project_marker};
 use crate::git::Git;
 use crate::log;
@@ -214,16 +216,16 @@ impl Router {
             git_entries: HashMap::new(),
             sessions,
             hooks: Vec::new(),
-            windows: Attribution::new(LOG_TAIL_TRAILING_WINDOW, LOG_TAIL_HOLD),
+            windows: Attribution::new(&WatcherSettings::default()),
             writer_gone_logged: false,
         }
     }
 
     /// Replaces the attribution windows' timing (test overrides of
-    /// [`LOG_TAIL_TRAILING_WINDOW`] and [`LOG_TAIL_HOLD`]). Call before any
-    /// event is routed.
-    pub fn set_attribution_timing(&mut self, trailing_window: Duration, hold: Duration) {
-        self.windows = Attribution::new(trailing_window, hold);
+    /// [`LOG_TAIL_TRAILING_WINDOW`], [`LOG_TAIL_HOLD`] and
+    /// [`STALE_TURN_TIMEOUT`]). Call before any event is routed.
+    pub fn set_attribution_timing(&mut self, settings: &WatcherSettings) {
+        self.windows = Attribution::new(settings);
     }
 
     /// Adds a hook told about every Project registered from now on.
