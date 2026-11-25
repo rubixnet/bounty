@@ -7,6 +7,7 @@
 mod bus;
 mod config;
 mod daemon;
+mod git;
 mod http;
 mod lock;
 mod log;
