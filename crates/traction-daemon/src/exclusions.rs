@@ -153,7 +153,11 @@ impl Exclusions {
                     .filter(|p| p.is_absolute()),
             );
             if let Some(drive) = std::env::var_os("SystemDrive") {
-                let root = PathBuf::from(drive).join("\\");
+                // `SystemDrive` is a bare drive like `C:`; append the
+                // separator so the root is `C:\`, not drive-relative.
+                let mut root = drive;
+                root.push("\\");
+                let root = PathBuf::from(root);
                 system.push(root.join("$Recycle.Bin"));
                 system.push(root.join("System Volume Information"));
                 system.push(root.join("Recovery"));
