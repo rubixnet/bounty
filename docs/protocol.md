@@ -59,11 +59,12 @@ The daemon's file watcher emits every `FILE_MUTATION` itself (never over HTTP; t
 
 - `LOG_TAIL_HOLD` = **5 s**: each observed mutation is held this long (a delivery-lag buffer, not an attribution window) so late log-tailed events can still claim it.
 - `LOG_TAIL_TRAILING_WINDOW` = **30 s**: the single "short fallback window" for sessions that never report turn boundaries; covers a mutation within 30 s after that session's latest event.
+- `WINDOW_CLOSE_GRACE` = **1 s**: file-system notification latency grace. A mutation is stamped when its notification reaches the watcher, which can trail the edit, so a closed hook window or log-tailed turn window still claims a mutation stamped up to 1 s after its closing event (`TOOL_POST` / `TOOL_FAIL` / next `TOOL_PRE` / turn end). Later than that it is manual work.
 - Hook windows (`harness_hook` / `harness_plugin`) run from a `TOOL_PRE` sent while the session's turn is open (a `PROMPT_SUBMIT` with no later `TURN_END`, `STOP_FAILURE` or `SESSION_END`) to the matching `TOOL_POST` / `TOOL_FAIL`, the session's next `TOOL_PRE`, or the turn's end.
 - Log-tailed sessions (`harness_log` / `harness_db_poll`) that have ever reported a turn boundary (`PROMPT_SUBMIT` or `TURN_END`) get turn windows: from a `PROMPT_SUBMIT` to its `TURN_END` / `STOP_FAILURE` / `SESSION_END` (or still open). Those that never have get the trailing fallback window (`LOG_TAIL_TRAILING_WINDOW`) instead.
 - Windows compare event `timestamp_ms` with the mutation's timestamp (its first observation), never arrival time, so a record delivered late but within `LOG_TAIL_HOLD` still claims the edit. They are scoped to the session's current Project (a session that moves to another Project ends its open windows on the old one), held only in daemon memory and never persisted: a restart starts with none open.
 - Precedence: hook window, then log-tailed turn window, then trailing fallback window; among windows of one kind the most recently opened wins. The winner's `harness_id`, `session_id` and `network_class` are copied onto the mutation (`attribution_source` stays `file_watcher`).
-- Both constants are public in `traction-daemon` (`LOG_TAIL_HOLD`, `LOG_TAIL_TRAILING_WINDOW`); the daemon config allows test-only overrides of each.
+- All three constants are public in `traction-daemon` (`LOG_TAIL_HOLD`, `LOG_TAIL_TRAILING_WINDOW`, `WINDOW_CLOSE_GRACE`); the daemon config allows test-only overrides of the first two.
 
 ## 2a. Project Identity
 

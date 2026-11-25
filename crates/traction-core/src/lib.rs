@@ -15,5 +15,5 @@ pub use event::{
 };
 pub use project_id::{DEVICE_SECRET_LEN, dir_project_id, git_project_id, normalize_origin};
 pub use validate::{
-    EventError, MAX_CWD_LEN, MAX_IDENTIFIER_LEN, MAX_SESSION_ID_LEN, ValidationError,
+    EventError, MAX_CWD_LEN, MAX_IDENTIFIER_LEN, MAX_SESSION_ID_LEN, ValidationError, uuid_v7,
 };

@@ -325,7 +325,7 @@ impl ProjectKind {
 /// `start_folder` is kept once set, `last_cwd` is replaced when given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
-    pub harness_id: &'static str,
+    pub harness_id: HarnessId,
     pub session_id: String,
     pub start_folder: Option<String>,
     pub last_cwd: Option<String>,
@@ -368,6 +368,25 @@ pub fn final_alias(mut alias_of: impl FnMut(&str) -> Option<String>, id: &str) -
         }
     }
     None
+}
+
+/// Everything the Router seeds its in-memory registry from at startup.
+#[derive(Debug, Default)]
+pub struct StoredRegistry {
+    /// Registered, non-merged Projects.
+    pub projects: Vec<ProjectRow>,
+    /// `project_alias` rows: (`alias_id`, `project_id`).
+    pub aliases: Vec<(String, String)>,
+    pub sessions: Vec<SessionRow>,
+}
+
+/// Loads the [`StoredRegistry`].
+pub fn load_registry(conn: &Connection) -> rusqlite::Result<StoredRegistry> {
+    Ok(StoredRegistry {
+        projects: load_projects(conn)?,
+        aliases: load_aliases(conn)?,
+        sessions: load_sessions(conn)?,
+    })
 }
 
 /// Every stored alias (`alias_id`, `project_id`), for the Router.
@@ -419,11 +438,7 @@ pub fn load_sessions(conn: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
     for row in rows {
         let (harness, session_id, start_folder, last_cwd) = row?;
         // Only daemon-written spellings are stored; skip anything else.
-        let Some(harness_id) = HarnessId::ALL
-            .iter()
-            .map(|h| h.as_str())
-            .find(|h| *h == harness)
-        else {
+        let Some(harness_id) = HarnessId::ALL.into_iter().find(|h| h.as_str() == harness) else {
             continue;
         };
         sessions.push(SessionRow {
@@ -517,7 +532,7 @@ fn upsert_session(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
             last_cwd = COALESCE(excluded.last_cwd, session.last_cwd)",
     )?
     .execute(params![
-        row.harness_id,
+        row.harness_id.as_str(),
         row.session_id,
         row.start_folder,
         row.last_cwd,

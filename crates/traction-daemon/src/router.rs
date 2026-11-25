@@ -35,11 +35,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::SystemTime as Stamp;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
-use traction_core::{NetworkClass, TractionEvent, dir_project_id, git_project_id};
+use traction_core::{HarnessId, NetworkClass, TractionEvent, dir_project_id, git_project_id};
 
 use crate::attribution::Attribution;
 use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW};
@@ -49,7 +48,8 @@ use crate::log;
 use crate::paths::{self, is_within, same};
 use crate::secret::DeviceSecret;
 use crate::storage::{
-    EventRow, MigrationRow, ProjectKind, ProjectRow, SessionRow, WriteOp, final_alias,
+    EventRow, MigrationRow, ProjectKind, ProjectRow, SessionRow, StoredRegistry, WriteOp,
+    final_alias,
 };
 use crate::writer::WriterSender;
 
@@ -115,6 +115,23 @@ struct SessionState {
     last_cwd: Option<String>,
 }
 
+/// The `.git` entry last seen at a `dir:` Root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitEntry {
+    Absent,
+    /// Present, with its mtime when the OS reports one.
+    Present(Option<SystemTime>),
+}
+
+impl GitEntry {
+    fn at(root: &Path) -> Self {
+        match std::fs::symlink_metadata(root.join(".git")) {
+            Ok(meta) => Self::Present(meta.modified().ok()),
+            Err(_) => Self::Absent,
+        }
+    }
+}
+
 struct CacheEntry {
     at: Instant,
     resolution: Option<Resolution>,
@@ -132,10 +149,9 @@ pub struct Router {
     aliases: HashMap<String, String>,
     /// Pinned `git:` IDs by canonical common dir ([`pin_key`]).
     pinned: HashMap<String, String>,
-    /// The `.git` entry last seen at each `dir:` Root: `None` when absent,
-    /// else its mtime.
-    git_stamps: HashMap<PathBuf, Option<Option<Stamp>>>,
-    sessions: HashMap<(&'static str, String), SessionState>,
+    /// The `.git` entry last seen at each `dir:` Root.
+    git_entries: HashMap<PathBuf, GitEntry>,
+    sessions: HashMap<(HarnessId, String), SessionState>,
     hooks: Vec<ProjectHook>,
     /// In-memory attribution windows (never persisted).
     windows: Attribution,
@@ -149,10 +165,13 @@ impl Router {
         exclusions: Exclusions,
         secret: DeviceSecret,
         writer: WriterSender,
-        projects: Vec<ProjectRow>,
-        aliases: Vec<(String, String)>,
-        sessions: Vec<SessionRow>,
+        stored: StoredRegistry,
     ) -> Self {
+        let StoredRegistry {
+            projects,
+            aliases,
+            sessions,
+        } = stored;
         let pinned = projects
             .iter()
             .filter_map(|row| {
@@ -192,7 +211,7 @@ impl Router {
             projects,
             aliases: aliases.into_iter().collect(),
             pinned,
-            git_stamps: HashMap::new(),
+            git_entries: HashMap::new(),
             sessions,
             hooks: Vec::new(),
             windows: Attribution::new(LOG_TAIL_TRAILING_WINDOW, LOG_TAIL_HOLD),
@@ -273,12 +292,10 @@ impl Router {
     /// cached resolutions are stale.
     fn repo_appeared(&mut self, resolution: Option<&Resolution>) -> Option<PathBuf> {
         let resolution = resolution.filter(|r| r.kind == ProjectKind::Dir)?;
-        let stamp = std::fs::symlink_metadata(resolution.root.join(".git"))
-            .ok()
-            .map(|meta| meta.modified().ok());
-        let changed = match self.git_stamps.insert(resolution.root.clone(), stamp) {
-            Some(previous) => previous != stamp,
-            None => stamp.is_some(),
+        let entry = GitEntry::at(&resolution.root);
+        let changed = match self.git_entries.insert(resolution.root.clone(), entry) {
+            Some(previous) => previous != entry,
+            None => entry != GitEntry::Absent,
         };
         changed.then(|| resolution.root.clone())
     }
@@ -500,7 +517,7 @@ impl Router {
         let (Some(harness), Some(session_id)) = (event.harness_id, &event.session_id) else {
             return (event.cwd.clone(), None);
         };
-        let key = (harness.as_str(), session_id.clone());
+        let key = (harness, session_id.clone());
         let state = self.sessions.entry(key).or_default();
         let mut changed = false;
         if let Some(cwd) = &event.cwd {
@@ -517,7 +534,7 @@ impl Router {
         let start_folder = state.start_folder.clone();
         if changed {
             let row = SessionRow {
-                harness_id: harness.as_str(),
+                harness_id: harness,
                 session_id: session_id.clone(),
                 start_folder: state.start_folder.clone(),
                 last_cwd: state.last_cwd.clone(),

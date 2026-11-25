@@ -151,10 +151,13 @@ impl Watches {
         self.lock().attach(project);
     }
 
-    /// Stops watching the Project `project_id` (for example, once it is
-    /// merged into another).
-    pub fn detach(&self, project_id: &str) {
-        self.lock().detach(project_id);
+    /// The Project `project_id` was merged into `into` (a migration). Its
+    /// watch is handed over in place, re-keyed to `into` without being
+    /// stopped or restarted, so no in-flight notification is lost; the
+    /// `into` Project's own attach then finds it. When `into` is already
+    /// watched, the old watch is simply stopped.
+    pub fn merge(&self, project_id: &str, into: &str) {
+        self.lock().merge(project_id, into);
     }
 
     fn lock(&self) -> MutexGuard<'_, WatchTable> {
@@ -214,10 +217,14 @@ impl WatchTable {
             watched.project_id.clone_from(&project.project_id);
             return;
         }
-        if self
+        // Already watched under this ID elsewhere: a merged `dir:` root
+        // inside this new Root gives way once the Root is watched.
+        let replaced = self
             .roots
             .iter()
-            .any(|w| w.project_id == project.project_id)
+            .position(|w| w.project_id == project.project_id);
+        if let Some(index) = replaced
+            && !is_within(&self.roots[index].root, &project.root)
         {
             return;
         }
@@ -247,12 +254,23 @@ impl WatchTable {
         };
         self.watch_root(&mut watched);
         self.roots.push(watched);
+        if let Some(index) = replaced {
+            self.detach_at(index);
+        }
     }
 
-    fn detach(&mut self, project_id: &str) {
+    fn merge(&mut self, project_id: &str, into: &str) {
         let Some(index) = self.roots.iter().position(|w| w.project_id == project_id) else {
             return;
         };
+        if self.roots.iter().any(|w| w.project_id == into) {
+            self.detach_at(index);
+        } else {
+            self.roots[index].project_id = into.to_owned();
+        }
+    }
+
+    fn detach_at(&mut self, index: usize) {
         let watched = self.roots.swap_remove(index);
         let Some(backend) = self.backend.as_mut() else {
             return;
@@ -766,7 +784,7 @@ impl Worker {
         };
         let mutation = TractionEvent {
             schema_version: SCHEMA_VERSION,
-            event_id: uuid_v7(decided.first_ms),
+            event_id: event_id(decided.first_ms),
             timestamp_ms: decided.first_ms,
             harness_id: None,
             session_id: None,
@@ -923,28 +941,16 @@ fn new_folder(table: &mut WatchTable, index: usize, path: &Path, found: Option<&
     }
 }
 
-/// A UUIDv7 for `ms` (RFC 9562): 48-bit milliseconds, version 7, the
-/// variant bits, and random bits elsewhere.
-fn uuid_v7(ms: u64) -> String {
-    let mut bytes = [0u8; 16];
-    if getrandom::fill(&mut bytes[6..]).is_err() {
+/// A fresh event ID for `ms`: [`traction_core::uuid_v7`] with OS randomness.
+fn event_id(ms: u64) -> String {
+    let mut random = [0u8; 10];
+    if getrandom::fill(&mut random).is_err() {
         // No OS randomness: still unique enough within one daemon.
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
-        bytes[8..].copy_from_slice(&n.to_be_bytes());
+        random[2..].copy_from_slice(&n.to_be_bytes());
     }
-    bytes[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    )
+    traction_core::uuid_v7(ms, random)
 }
 
 /// macOS: FSEvents refuses (or, past the edge, corrupts descriptors) beyond
@@ -976,13 +982,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uuid_v7_carries_the_time_version_and_variant() {
-        let id = uuid_v7(0x0192_3456_789a);
-        assert!(id.starts_with("01923456-789a-7"), "{id}");
-        assert!(
-            matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
-            "{id}"
-        );
-        assert_ne!(uuid_v7(1), uuid_v7(1));
+    fn event_ids_at_the_same_millisecond_differ() {
+        assert_ne!(event_id(1), event_id(1));
+    }
+
+    fn project(id: &str, root: &Path) -> RegisteredProject {
+        RegisteredProject {
+            project_id: id.to_owned(),
+            kind: crate::storage::ProjectKind::Dir,
+            root: root.to_path_buf(),
+            merged_into: None,
+        }
+    }
+
+    /// A fake home with a Project folder inside it, and the watch table.
+    fn table_with_project(tmp: &Path) -> (Watches, PathBuf) {
+        let home = paths::canonicalize(tmp).unwrap();
+        let root = home.join("notes");
+        fs::create_dir(&root).unwrap();
+        let exclusions = Exclusions::load(Some(&home), &home.join(".traction"), &home.join("none"));
+        let (watches, _notifications) = Watches::new(exclusions);
+        (watches, root)
+    }
+
+    #[test]
+    fn a_merge_on_the_same_root_hands_the_watch_over_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (watches, root) = table_with_project(tmp.path());
+        watches.attach(&project("dir:a", &root));
+        #[cfg(target_os = "macos")]
+        let attached_at = watches.lock().roots[0].attached_at;
+
+        watches.merge("dir:a", "git:b");
+        watches.attach(&project("git:b", &root));
+
+        let table = watches.lock();
+        let ids: Vec<&str> = table.roots.iter().map(|w| w.project_id.as_str()).collect();
+        assert_eq!(ids, ["git:b"]);
+        // Not re-attached: in-flight notifications still predate nothing.
+        #[cfg(target_os = "macos")]
+        assert_eq!(table.roots[0].attached_at, attached_at);
+    }
+
+    #[test]
+    fn a_merged_sub_root_gives_way_to_the_new_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (watches, repo) = table_with_project(tmp.path());
+        let sub = repo.join("docs");
+        fs::create_dir(&sub).unwrap();
+        watches.attach(&project("dir:a", &sub));
+
+        watches.merge("dir:a", "git:b");
+        watches.attach(&project("git:b", &repo));
+
+        let table = watches.lock();
+        let roots: Vec<(&str, &Path)> = table
+            .roots
+            .iter()
+            .map(|w| (w.project_id.as_str(), w.root.as_path()))
+            .collect();
+        assert_eq!(roots, [("git:b", repo.as_path())]);
+    }
+
+    #[test]
+    fn a_merge_into_an_already_watched_project_drops_the_old_watch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (watches, repo) = table_with_project(tmp.path());
+        let sub = repo.join("docs");
+        fs::create_dir(&sub).unwrap();
+        watches.attach(&project("git:b", &repo));
+        watches.attach(&project("dir:a", &sub));
+
+        watches.merge("dir:a", "git:b");
+
+        let table = watches.lock();
+        let ids: Vec<&str> = table.roots.iter().map(|w| w.project_id.as_str()).collect();
+        assert_eq!(ids, ["git:b"]);
     }
 }

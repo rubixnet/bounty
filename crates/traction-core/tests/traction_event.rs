@@ -6,7 +6,7 @@
 use serde_json::{Value, json};
 use traction_core::{
     AttributionSource, EndReason, EventError, EventType, HarnessId, MetricsOnly, MutationKind,
-    NetworkClass, TractionEvent, ValidationError,
+    NetworkClass, TractionEvent, ValidationError, uuid_v7,
 };
 
 /// The `docs/protocol.md` section 2 example Traction Event, with each enum
@@ -245,6 +245,22 @@ fn as_str_matches_the_serde_spelling_of_every_enum_value() {
     for kind in MutationKind::ALL {
         assert_eq!(kind.as_str(), serde_spelling(kind));
     }
+}
+
+/// `uuid_v7` builds an `event_id` the validator accepts: the 48-bit
+/// millisecond prefix, version 7, the RFC 9562 variant, then the random bits.
+#[test]
+fn uuid_v7_is_a_valid_event_id_with_time_version_and_variant() {
+    assert_eq!(
+        uuid_v7(0x0192_3456_789a, [0xff; 10]),
+        "01923456-789a-7fff-bfff-ffffffffffff"
+    );
+    assert_eq!(uuid_v7(1, [0; 10]), "00000000-0001-7000-8000-000000000000");
+
+    let mut wire = protocol_example();
+    wire["event_id"] = json!(uuid_v7(1_795_432_800_000, [0x5a; 10]));
+    let event = parse(&wire).expect("a uuid_v7 event_id is valid");
+    assert_eq!(event.event_id, "01a20822-5f00-7a5a-9a5a-5a5a5a5a5a5a");
 }
 
 #[test]

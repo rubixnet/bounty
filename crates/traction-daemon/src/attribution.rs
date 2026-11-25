@@ -19,12 +19,19 @@
 //! Precedence is hook, then log-tailed turn, then trailing; among windows
 //! of one kind the most recently opened wins.
 //!
+//! A closed hook or log-tailed turn window still covers mutations stamped up
+//! to [`WINDOW_CLOSE_GRACE`] after its close: a mutation is stamped when its
+//! file-system notification arrives, which can trail the closing event.
+//!
 //! [`LOG_TAIL_TRAILING_WINDOW`]: crate::config::LOG_TAIL_TRAILING_WINDOW
+//! [`WINDOW_CLOSE_GRACE`]: crate::config::WINDOW_CLOSE_GRACE
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use traction_core::{AttributionSource, EventType, HarnessId, NetworkClass, TractionEvent};
+
+use crate::config::WINDOW_CLOSE_GRACE;
 
 /// How long after it closed (or after a session's last event) window state
 /// is kept beyond the hold, for mutations decided late (a busy Router).
@@ -58,8 +65,12 @@ struct Window {
 }
 
 impl Window {
-    fn covers(&self, ts: u64) -> bool {
-        self.opened_ms <= ts && self.closed_ms.is_none_or(|closed| ts <= closed)
+    /// `ts` falls between the open and the close plus `grace_ms`.
+    fn covers(&self, ts: u64, grace_ms: u64) -> bool {
+        self.opened_ms <= ts
+            && self
+                .closed_ms
+                .is_none_or(|closed| ts <= closed.saturating_add(grace_ms))
     }
 }
 
@@ -188,7 +199,7 @@ impl Attribution {
             let windows = state
                 .windows
                 .iter()
-                .filter(|w| on(&w.project) && w.covers(ts))
+                .filter(|w| on(&w.project) && w.covers(ts, millis(WINDOW_CLOSE_GRACE)))
                 .map(|w| (w.kind, w.opened_ms));
             let trailing = state
                 .marks
@@ -226,10 +237,11 @@ impl Attribution {
     fn sweep(&mut self, now_ms: u64) {
         let horizon = now_ms.saturating_sub(self.retention_ms);
         let trailing = self.trailing_ms;
+        let grace = millis(WINDOW_CLOSE_GRACE);
         self.sessions.retain(|_, state| {
             state
                 .windows
-                .retain(|w| w.closed_ms.is_none_or(|closed| closed >= horizon));
+                .retain(|w| w.closed_ms.is_none_or(|closed| closed + grace >= horizon));
             state
                 .marks
                 .retain(|(mark, _)| mark.saturating_add(trailing) >= horizon);
