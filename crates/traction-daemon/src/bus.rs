@@ -3,10 +3,10 @@
 //!
 //! Checks run in a fixed order and the first failure answers the request:
 //!
-//! 1. `Host` allowlist (HTTP only)        -- ticket 05
-//! 2. `Origin` allowlist                  -- ticket 05
+//! 1. `Host` allowlist (HTTP only)        -> `403 forbidden_host`
+//! 2. `Origin` allowlist                  -> `403 forbidden_origin`
 //! 3. bearer token                        -> `401`
-//! 4. route (`POST /v1/event`)            -> `404`
+//! 4. route (`POST /v1/event`)            -> `404`, or `405` for another method
 //! 5. body size cap                       -> `413`
 //! 6. deserialize + validate              -> `400` with a reason code
 //! 7. enqueue to the writer               -> `503` when full, else `202`
@@ -17,7 +17,7 @@ use std::convert::Infallible;
 
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue, ORIGIN};
 use hyper::{Method, Request, Response, StatusCode};
 use traction_core::TractionEvent;
 
@@ -35,6 +35,18 @@ pub type BusResponse = Response<Full<Bytes>>;
 pub struct Bus {
     token: BusToken,
     writer: WriterSender,
+    /// The bound loopback HTTP port: the only port allowed in `Host` and
+    /// `Origin`.
+    port: u16,
+}
+
+/// Which listener a request arrived on. Only loopback HTTP checks `Host`: a
+/// Unix-socket request has no TCP origin, so DNS rebinding cannot reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Http,
+    #[allow(dead_code)] // ticket 08 constructs this for the Unix socket.
+    Unix,
 }
 
 /// Why a request was refused: a status and a fixed reason code. Holds no
@@ -46,8 +58,12 @@ struct Rejection {
 }
 
 impl Rejection {
+    const FORBIDDEN_HOST: Self = Self::new(StatusCode::FORBIDDEN, "forbidden_host");
+    const FORBIDDEN_ORIGIN: Self = Self::new(StatusCode::FORBIDDEN, "forbidden_origin");
     const UNAUTHORIZED: Self = Self::new(StatusCode::UNAUTHORIZED, "unauthorized");
     const NOT_FOUND: Self = Self::new(StatusCode::NOT_FOUND, "not_found");
+    const METHOD_NOT_ALLOWED: Self =
+        Self::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
     const BODY_TOO_LARGE: Self = Self::new(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large");
     const UNREADABLE_BODY: Self = Self::new(StatusCode::BAD_REQUEST, "unreadable_body");
     const BUSY: Self = Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy");
@@ -62,22 +78,49 @@ impl Rejection {
 }
 
 impl Bus {
-    pub fn new(token: BusToken, writer: WriterSender) -> Self {
-        Self { token, writer }
+    pub fn new(token: BusToken, writer: WriterSender, port: u16) -> Self {
+        Self {
+            token,
+            writer,
+            port,
+        }
     }
 
     /// Runs the full check pipeline for one request.
-    pub async fn handle(&self, request: Request<Incoming>) -> Result<BusResponse, Infallible> {
-        Ok(match self.check(request).await {
+    pub async fn handle(
+        &self,
+        request: Request<Incoming>,
+        transport: Transport,
+    ) -> Result<BusResponse, Infallible> {
+        Ok(match self.check(request, transport).await {
             Ok(()) => respond(StatusCode::ACCEPTED, "status", "accepted"),
-            Err(rejection) => respond(rejection.status, "error", rejection.code),
+            Err(rejection) => {
+                let mut response = respond(rejection.status, "error", rejection.code);
+                if rejection == Rejection::METHOD_NOT_ALLOWED {
+                    response
+                        .headers_mut()
+                        .insert(ALLOW, HeaderValue::from_static("POST"));
+                }
+                response
+            }
         })
     }
 
-    async fn check(&self, request: Request<Incoming>) -> Result<(), Rejection> {
+    async fn check(
+        &self,
+        request: Request<Incoming>,
+        transport: Transport,
+    ) -> Result<(), Rejection> {
+        if transport == Transport::Http {
+            self.check_host(&request)?;
+        }
+        self.check_origin(&request)?;
         self.authorize(&request)?;
-        if request.uri().path() != EVENT_PATH || request.method() != Method::POST {
+        if request.uri().path() != EVENT_PATH {
             return Err(Rejection::NOT_FOUND);
+        }
+        if request.method() != Method::POST {
+            return Err(Rejection::METHOD_NOT_ALLOWED);
         }
         let body = read_capped_body(request.into_body()).await?;
         let event = TractionEvent::from_json(&body)
@@ -85,6 +128,57 @@ impl Bus {
         let row = EventRow::try_from(event)
             .map_err(|IntegerOutOfRange| Rejection::bad_request(IntegerOutOfRange::CODE))?;
         self.writer.try_enqueue(row).map_err(|_| Rejection::BUSY)
+    }
+
+    /// Exactly one `Host` header naming loopback on the bound port. An
+    /// absolute-form request target must name the same. Blocks DNS rebinding.
+    fn check_host(&self, request: &Request<Incoming>) -> Result<(), Rejection> {
+        let mut hosts = request.headers().get_all(HOST).iter();
+        let allowed = match (hosts.next(), hosts.next()) {
+            (Some(host), None) => self.is_own_authority(host.as_bytes()),
+            _ => false,
+        };
+        let target_ok = request
+            .uri()
+            .authority()
+            .is_none_or(|authority| self.is_own_authority(authority.as_str().as_bytes()));
+        if allowed && target_ok {
+            Ok(())
+        } else {
+            Err(Rejection::FORBIDDEN_HOST)
+        }
+    }
+
+    /// No `Origin` (non-browser clients), or exactly the daemon's own
+    /// `http://` origin. Blocks browser CSRF, including `Origin: null`.
+    fn check_origin(&self, request: &Request<Incoming>) -> Result<(), Rejection> {
+        let mut origins = request.headers().get_all(ORIGIN).iter();
+        let allowed = match (origins.next(), origins.next()) {
+            (None, _) => true,
+            (Some(origin), None) => origin
+                .as_bytes()
+                .split_at_checked(HTTP_SCHEME.len())
+                .is_some_and(|(scheme, authority)| {
+                    scheme.eq_ignore_ascii_case(HTTP_SCHEME) && self.is_own_authority(authority)
+                }),
+            _ => false,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(Rejection::FORBIDDEN_ORIGIN)
+        }
+    }
+
+    /// `127.0.0.1:<port>` or `localhost:<port>` (host case-insensitive).
+    fn is_own_authority(&self, authority: &[u8]) -> bool {
+        let Some(colon) = authority.iter().rposition(|&b| b == b':') else {
+            return false;
+        };
+        let (host, port) = (&authority[..colon], &authority[colon + 1..]);
+        let port_ok = port == self.port.to_string().as_bytes();
+        let host_ok = host == b"127.0.0.1" || host.eq_ignore_ascii_case(b"localhost");
+        port_ok && host_ok
     }
 
     fn authorize(&self, request: &Request<Incoming>) -> Result<(), Rejection> {
@@ -98,6 +192,8 @@ impl Bus {
         }
     }
 }
+
+const HTTP_SCHEME: &[u8] = b"http://";
 
 /// The credentials of an `Authorization: Bearer <token>` header.
 fn bearer_value(header: &[u8]) -> Option<&[u8]> {

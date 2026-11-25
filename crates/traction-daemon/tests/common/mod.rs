@@ -127,6 +127,11 @@ impl BusClient {
         &self.token
     }
 
+    /// The daemon's bound loopback port.
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
     /// `POST /v1/event` with the default, valid `Host` and `Authorization`.
     pub fn post_event(&self, body: &str) -> BusResponse {
         self.request("POST", "/v1/event").body(body).send()

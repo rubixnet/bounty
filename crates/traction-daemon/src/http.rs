@@ -12,7 +12,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::bus::Bus;
+use crate::bus::{Bus, Transport};
 use crate::log;
 
 /// A client must finish sending request headers within this time.
@@ -27,7 +27,7 @@ pub async fn serve(listener: TcpListener, bus: Arc<Bus>, mut shutdown: oneshot::
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => serve_connection(TokioIo::new(stream), &bus, &graceful),
+                Ok((stream, _)) => serve_connection(TokioIo::new(stream), Transport::Http, &bus, &graceful),
                 Err(error) => {
                     log::error("failed to accept a bus connection", &error);
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -40,16 +40,16 @@ pub async fn serve(listener: TcpListener, bus: Arc<Bus>, mut shutdown: oneshot::
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, graceful.shutdown()).await;
 }
 
-/// Serves one HTTP/1.1 connection through the bus pipeline. Transport
-/// agnostic, so the Unix-socket listener can reuse it.
-pub fn serve_connection<I>(io: I, bus: &Arc<Bus>, graceful: &GracefulShutdown)
+/// Serves one HTTP/1.1 connection through the bus pipeline. `transport` tells
+/// the bus whether to check `Host`, so the Unix-socket listener can reuse it.
+pub fn serve_connection<I>(io: I, transport: Transport, bus: &Arc<Bus>, graceful: &GracefulShutdown)
 where
     I: Read + Write + Unpin + Send + 'static,
 {
     let bus = Arc::clone(bus);
     let service = service_fn(move |request| {
         let bus = Arc::clone(&bus);
-        async move { bus.handle(request).await }
+        async move { bus.handle(request, transport).await }
     });
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
