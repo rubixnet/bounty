@@ -6,13 +6,20 @@
 //! shutdown. The caller writes raw request bytes so tests can send arbitrary
 //! (or missing) `Host`, `Origin` and `Authorization` headers.
 //!
+//! Since Step 1b every daemon also gets a fake `home_dir` (its own temp
+//! folder, canonicalized), so routing fixtures live under a fake home and
+//! never the developer's real one. [`fixtures`] builds real Git repos and
+//! folders; [`poll_until`] waits for asynchronous results.
+//!
 //! Each test binary uses a different subset of this module.
 #![allow(dead_code)]
+
+pub mod fixtures;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
@@ -23,6 +30,8 @@ use traction_daemon::{DB_FILE, DaemonConfig, DaemonHandle, TOKEN_FILE};
 /// A daemon running on its own temp data folder. Shut down on drop.
 pub struct TestDaemon {
     data_dir: TempDir,
+    /// The daemon's `home_dir`: a temp folder, canonicalized.
+    home: TempDir,
     handle: Option<DaemonHandle>,
     addr: SocketAddr,
 }
@@ -37,22 +46,32 @@ impl TestDaemon {
     /// Starts a daemon after letting the test adjust the config.
     pub fn start_with(adjust: impl FnOnce(&mut DaemonConfig)) -> Self {
         let data_dir = tempfile::tempdir().expect("temp data folder");
+        let home = tempfile::tempdir().expect("temp fake home");
         let mut config = test_config(data_dir.path());
+        config.home_dir = Some(canonical(home.path()));
         adjust(&mut config);
         let handle = traction_daemon::start(config).expect("daemon starts");
         let addr = handle.local_addr();
         Self {
             data_dir,
+            home,
             handle: Some(handle),
             addr,
         }
     }
 
     /// Starts a new daemon on the data folder of a previous, shut-down one.
-    pub fn restart(mut self) -> Self {
+    pub fn restart(self) -> Self {
+        self.restart_with(|_| {})
+    }
+
+    /// [`Self::restart`], letting the test adjust the new daemon's config.
+    pub fn restart_with(mut self, adjust: impl FnOnce(&mut DaemonConfig)) -> Self {
         self.shutdown();
-        let config = test_config(self.data_dir.path());
-        let handle = traction_daemon::start(config).expect("daemon restarts");
+        let mut config = test_config(self.data_dir.path());
+        config.home_dir = Some(self.home());
+        adjust(&mut config);
+        let handle = start_after_shutdown(config);
         self.addr = handle.local_addr();
         self.handle = Some(handle);
         self
@@ -64,6 +83,24 @@ impl TestDaemon {
 
     pub fn data_dir(&self) -> &Path {
         self.data_dir.path()
+    }
+
+    /// The daemon's fake `$HOME` (canonical). Build fixtures below it.
+    pub fn home(&self) -> PathBuf {
+        canonical(self.home.path())
+    }
+
+    /// The 32-byte device secret the daemon wrote (keys `dir:` IDs).
+    pub fn device_secret(&self) -> [u8; 32] {
+        std::fs::read(self.data_dir().join(traction_daemon::DEVICE_SECRET_FILE))
+            .expect("device secret")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    /// The `dir:` Project ID this daemon derives for the Project Root `root`.
+    pub fn dir_id(&self, root: &Path) -> String {
+        traction_core::dir_project_id(&self.device_secret(), &canonical_string(root))
     }
 
     pub fn token_path(&self) -> PathBuf {
@@ -108,6 +145,84 @@ impl TestDaemon {
         self.shutdown();
         open_db_read_only(self.data_dir())
     }
+
+    /// A read-only connection to the running daemon's database (WAL readers
+    /// never block the writer). Sees only committed batches.
+    pub fn live_db(&self) -> Connection {
+        open_db_read_only(self.data_dir())
+    }
+
+    /// Polls the running daemon until exactly `count` `FILE_MUTATION` rows
+    /// are committed (panics on more, or after [`WATCH_DEADLINE`]).
+    pub fn wait_for_mutations(&self, count: usize) -> Vec<MutationRow> {
+        let db = self.live_db();
+        poll_until(WATCH_DEADLINE, "FILE_MUTATION rows", || {
+            let rows = stored_mutations(&db);
+            assert!(
+                rows.len() <= count,
+                "more mutations than expected: {rows:?}"
+            );
+            (rows.len() == count).then_some(rows)
+        })
+    }
+}
+
+/// How long a test waits for the watcher: generous, for loaded CI runners.
+pub const WATCH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Watcher test settings: a short hold (the test-only override of
+/// `LOG_TAIL_HOLD`) and frequent commits, so rows appear while the daemon
+/// runs.
+pub fn fast_watcher(config: &mut DaemonConfig) {
+    config.writer.commit_interval = Duration::from_millis(50);
+    config.watcher.hold = Duration::from_secs(1);
+}
+
+/// A stored `FILE_MUTATION`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationRow {
+    pub project_id: Option<String>,
+    pub cwd: Option<String>,
+    pub harness_id: Option<String>,
+    pub session_id: Option<String>,
+    pub network_class: String,
+    pub attribution_source: String,
+    pub mutation_kind: Option<String>,
+}
+
+/// Every stored `FILE_MUTATION`, oldest first.
+pub fn stored_mutations(db: &Connection) -> Vec<MutationRow> {
+    let mut stmt = db
+        .prepare(
+            "SELECT project_id, cwd, harness_id, session_id, network_class,
+                    attribution_source, mutation_kind
+             FROM traction_event WHERE event_type = 'FILE_MUTATION' ORDER BY timestamp_ms, event_id",
+        )
+        .expect("prepare");
+    stmt.query_map([], |row| {
+        Ok(MutationRow {
+            project_id: row.get(0)?,
+            cwd: row.get(1)?,
+            harness_id: row.get(2)?,
+            session_id: row.get(3)?,
+            network_class: row.get(4)?,
+            attribution_source: row.get(5)?,
+            mutation_kind: row.get(6)?,
+        })
+    })
+    .expect("query")
+    .map(|row| row.expect("row"))
+    .collect()
+}
+
+/// The sorted `mutation_kind`s of `rows`.
+pub fn kinds(rows: &[MutationRow]) -> Vec<String> {
+    let mut kinds: Vec<String> = rows
+        .iter()
+        .map(|row| row.mutation_kind.clone().expect("mutation_kind"))
+        .collect();
+    kinds.sort();
+    kinds
 }
 
 impl Drop for TestDaemon {
@@ -140,6 +255,8 @@ pub fn open_db_read_only(data_dir: &Path) -> Connection {
 
 pub fn test_config(data_dir: &Path) -> DaemonConfig {
     let mut config = DaemonConfig::new(data_dir.to_path_buf());
+    // Hermetic: never the developer's real home folder.
+    config.home_dir = Some(data_dir.join("fake-home"));
     config.http_port = 0;
     config.writer.commit_interval = Duration::from_secs(60);
     // Hermetic: never the real `$XDG_RUNTIME_DIR`. A temp data folder keeps
@@ -197,6 +314,12 @@ impl BusCaller {
     /// `POST /v1/event` with the default, valid `Host` and `Authorization`.
     pub fn post_event(&self, body: &str) -> BusResponse {
         self.request("POST", "/v1/event").body(body).send()
+    }
+
+    /// `POST /v1/project` registering `path`.
+    pub fn register_project(&self, path: &Path) -> BusResponse {
+        let body = serde_json::json!({ "path": path_str(path) }).to_string();
+        self.request("POST", "/v1/project").body(body).send()
     }
 
     /// A request preloaded with a valid `Host` and bearer token. Headers can
@@ -403,6 +526,7 @@ pub fn valid_event_value(n: u32) -> serde_json::Value {
         "project_id": "git:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "model_id": "optional-model-string",
         "network_class": "cloud_api",
+        "attribution_source": "harness_hook",
         "metrics_only": {
             "prompt_char_len": 142,
             "repo_symbol_hits": 3,
@@ -422,4 +546,194 @@ pub fn event_id(n: u32) -> String {
 pub fn stored_event_count(db: &Connection) -> i64 {
     db.query_row("SELECT COUNT(*) FROM traction_event", [], |row| row.get(0))
         .expect("count events")
+}
+
+/// Starts a daemon on a data folder whose previous daemon was just shut down.
+///
+/// The test binary hosts many daemons at once. If another test thread forks
+/// a child (a fixture `git`, say) at the instant the previous daemon still
+/// held its lock file open, the child briefly holds a copy of that
+/// descriptor until it execs, and the `flock` outlives the shutdown by a few
+/// milliseconds. A real restart is a new process and never sees this, so
+/// only `AlreadyRunning` is retried, and only for a bounded time; a lock that
+/// is never released still fails the test.
+pub fn start_after_shutdown(config: DaemonConfig) -> DaemonHandle {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match traction_daemon::start(config.clone()) {
+            Err(traction_daemon::StartError::AlreadyRunning) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            result => return result.expect("daemon restarts"),
+        }
+    }
+}
+
+/// Calls `probe` until it returns `Some`, or panics after `timeout`.
+pub fn poll_until<T>(timeout: Duration, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `path` as UTF-8 (fixture paths always are).
+pub fn path_str(path: &Path) -> &str {
+    path.to_str().expect("UTF-8 path")
+}
+
+/// The OS canonical form of `path`, as the daemon stores it: symlinks
+/// resolved and, on Windows, no `\\?\` prefix and an uppercase drive letter.
+pub fn canonical(path: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(path).expect("canonicalize fixture path");
+    #[cfg(windows)]
+    {
+        let text = canon.to_str().expect("UTF-8 path");
+        let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else {
+            text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()
+        };
+        let mut text = text.into_bytes();
+        if text.get(1) == Some(&b':') {
+            text[0] = text[0].to_ascii_uppercase();
+        }
+        PathBuf::from(String::from_utf8(text).expect("UTF-8 path"))
+    }
+    #[cfg(not(windows))]
+    canon
+}
+
+pub fn canonical_string(path: &Path) -> String {
+    path_str(&canonical(path)).to_owned()
+}
+
+/// A routed Traction Event: no `project_id`, the given type, session and
+/// optional `cwd`. `n` makes the `event_id` (and timestamp) distinct.
+pub fn routed_event(n: u32, event_type: &str, session: &str, cwd: Option<&Path>) -> String {
+    let mut event = valid_event_value(n);
+    event["project_id"] = serde_json::Value::Null;
+    event["event_type"] = serde_json::json!(event_type);
+    event["session_id"] = serde_json::json!(session);
+    event["cwd"] = match cwd {
+        Some(cwd) => serde_json::json!(path_str(cwd)),
+        None => serde_json::Value::Null,
+    };
+    if event_type != "TURN_END" {
+        event["end_reason"] = serde_json::Value::Null;
+    }
+    event.to_string()
+}
+
+/// Every stored `(event_id, project_id)`, ordered by `event_id`.
+pub fn stored_project_ids(db: &Connection) -> Vec<(String, Option<String>)> {
+    let mut stmt = db
+        .prepare("SELECT event_id, project_id FROM traction_event ORDER BY event_id")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .map(|row| row.expect("row"))
+        .collect()
+}
+
+/// The `project_id` stored for event `n`.
+pub fn stored_project_id(db: &Connection, n: u32) -> Option<String> {
+    db.query_row(
+        "SELECT project_id FROM traction_event WHERE event_id = ?1",
+        [event_id(n)],
+        |row| row.get(0),
+    )
+    .expect("stored event")
+}
+
+/// A registered Project row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRow {
+    pub project_id: String,
+    pub kind: String,
+    pub root_path: String,
+    pub home_relative_path: Option<String>,
+    pub name: String,
+    pub git_common_dir: Option<String>,
+}
+
+/// Every registered Project, ordered by `root_path`.
+pub fn registered_projects(db: &Connection) -> Vec<ProjectRow> {
+    let mut stmt = db
+        .prepare(
+            "SELECT project_id, kind, root_path, home_relative_path, name, git_common_dir
+             FROM project ORDER BY root_path",
+        )
+        .expect("prepare");
+    stmt.query_map([], |row| {
+        Ok(ProjectRow {
+            project_id: row.get(0)?,
+            kind: row.get(1)?,
+            root_path: row.get(2)?,
+            home_relative_path: row.get(3)?,
+            name: row.get(4)?,
+            git_common_dir: row.get(5)?,
+        })
+    })
+    .expect("query")
+    .map(|row| row.expect("row"))
+    .collect()
+}
+
+/// Counts copies of `needle` in every column of every table, read as text.
+pub fn sentinel_hits_in_tables(db: &Connection, needle: &str) -> usize {
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")
+        .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect())
+        .expect("list tables");
+    assert!(tables.iter().any(|t| t == "traction_event"));
+    let mut hits = 0;
+    for table in tables {
+        let columns: Vec<String> = db
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect())
+            .expect("list columns");
+        for column in columns {
+            let sql = format!(
+                "SELECT COUNT(*) FROM \"{table}\" WHERE instr(CAST(\"{column}\" AS TEXT), ?1) > 0"
+            );
+            let count: i64 = db
+                .query_row(&sql, [needle], |row| row.get(0))
+                .expect("scan column");
+            hits += usize::try_from(count).expect("non-negative");
+        }
+    }
+    hits
+}
+
+/// Asserts no file in `data_dir` (database, `-wal`/`-shm`, token, secret)
+/// holds `needle` as raw bytes. Call after shutdown. Returns the names
+/// scanned.
+pub fn assert_no_file_contains(data_dir: &Path, needle: &str) -> Vec<String> {
+    let mut scanned = Vec::new();
+    for entry in std::fs::read_dir(data_dir).expect("data folder") {
+        let path = entry.expect("entry").path();
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read file");
+        assert!(
+            !bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes()),
+            "sentinel found in {}",
+            path.display()
+        );
+        scanned.push(
+            path.file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    scanned
 }

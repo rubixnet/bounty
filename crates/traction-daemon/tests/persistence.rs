@@ -152,11 +152,12 @@ fn a_full_writer_queue_answers_503_at_once_and_loses_nothing_accepted() {
     let caller = daemon.caller();
     let lock = hold_write_lock(&daemon);
 
-    // While the writer is stuck, it holds at most one event and the queue
-    // one more, so a 503 comes within three sends.
+    // While the writer is stuck it holds one event and its queue one more;
+    // the Project Router holds one it cannot hand over and its own queue
+    // one more. So a 503 comes within five sends.
     let mut accepted = 0;
     let mut busy = None;
-    for n in 0..3 {
+    for n in 0..5 {
         let sent = Instant::now();
         let response = caller.post_event(&valid_event(n));
         match response.status {

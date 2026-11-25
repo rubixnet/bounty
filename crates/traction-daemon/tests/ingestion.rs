@@ -41,7 +41,7 @@ fn every_accepted_event_is_stored_and_the_database_is_in_wal_mode() {
     let schema_version: i64 = db
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user_version");
-    assert_eq!(schema_version, 1);
+    assert_eq!(schema_version, 3);
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn stored_row_holds_the_validated_fields_as_typed_columns() {
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(8)?,
                     ),
                     (
                         row.get::<_, Option<String>>(9)?,
@@ -100,7 +100,8 @@ fn stored_row_holds_the_validated_fields_as_typed_columns() {
             "TURN_END".to_owned(),
             Some("completed".to_owned()),
             "/abs/path/to/working/dir".to_owned(),
-            "git:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            // The Router replaced the Adapter's ID; this `cwd` routes nowhere.
+            None,
         )
     );
     assert_eq!(

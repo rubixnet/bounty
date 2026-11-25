@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use crate::event::{EventType, SCHEMA_VERSION, TractionEvent};
+use crate::event::{AttributionSource, EventType, NetworkClass, SCHEMA_VERSION, TractionEvent};
 
 /// Longest accepted `tool_name` or `model_id`, in bytes.
 pub const MAX_IDENTIFIER_LEN: usize = 64;
@@ -75,6 +75,25 @@ pub enum ValidationError {
     /// A `metrics_only.tool_name` that is empty, too long or not a safe
     /// identifier.
     InvalidToolName,
+    /// No `harness_id` where one is required: on every event type except
+    /// `FILE_MUTATION`, and on a `FILE_MUTATION` that has a `session_id`.
+    MissingHarness,
+    /// No `session_id` where one is required: on every event type except
+    /// `FILE_MUTATION`, and on a `FILE_MUTATION` that has a `harness_id`.
+    MissingSession,
+    /// A manual `FILE_MUTATION` (no Harness, no session) whose
+    /// `network_class` is not `manual`.
+    ManualMutationNotManual,
+    /// `attribution_source: file_watcher` on an event type other than
+    /// `FILE_MUTATION`.
+    UnexpectedFileWatcher,
+    /// A `FILE_MUTATION` whose `attribution_source` is not `file_watcher`.
+    InvalidAttributionSource,
+    /// A `FILE_MUTATION` without a `metrics_only.mutation_kind`.
+    MissingMutationKind,
+    /// A `metrics_only.mutation_kind` on an event type other than
+    /// `FILE_MUTATION`.
+    UnexpectedMutationKind,
 }
 
 impl ValidationError {
@@ -91,6 +110,13 @@ impl ValidationError {
             ValidationError::InvalidProjectId => "invalid_project_id",
             ValidationError::InvalidModelId => "invalid_model_id",
             ValidationError::InvalidToolName => "invalid_tool_name",
+            ValidationError::MissingHarness => "missing_harness",
+            ValidationError::MissingSession => "missing_session",
+            ValidationError::ManualMutationNotManual => "manual_mutation_not_manual",
+            ValidationError::UnexpectedFileWatcher => "unexpected_file_watcher",
+            ValidationError::InvalidAttributionSource => "invalid_attribution_source",
+            ValidationError::MissingMutationKind => "missing_mutation_kind",
+            ValidationError::UnexpectedMutationKind => "unexpected_mutation_kind",
         }
     }
 }
@@ -124,10 +150,9 @@ impl TractionEvent {
             ValidationError::UnsupportedSchemaVersion,
         )?;
         check(is_uuid(&self.event_id), ValidationError::InvalidEventId)?;
-        check(
-            is_session_id(&self.session_id),
-            ValidationError::InvalidSessionId,
-        )?;
+        if let Some(session_id) = &self.session_id {
+            check(is_session_id(session_id), ValidationError::InvalidSessionId)?;
+        }
         if let Some(parent) = &self.parent_orchestrator_id {
             check(
                 is_session_id(parent),
@@ -139,16 +164,51 @@ impl TractionEvent {
             (EventType::TurnEnd, Some(_)) | (_, None) => {}
             (_, Some(_)) => return Err(ValidationError::UnexpectedEndReason),
         }
-        check(is_absolute_cwd(&self.cwd), ValidationError::InvalidCwd)?;
-        check(
-            is_project_id(&self.project_id),
-            ValidationError::InvalidProjectId,
-        )?;
+        self.validate_attribution()?;
+        if let Some(cwd) = &self.cwd {
+            check(is_absolute_cwd(cwd), ValidationError::InvalidCwd)?;
+        }
+        if let Some(project_id) = &self.project_id {
+            check(is_project_id(project_id), ValidationError::InvalidProjectId)?;
+        }
         if let Some(model_id) = &self.model_id {
             check(is_identifier(model_id), ValidationError::InvalidModelId)?;
         }
         if let Some(tool_name) = &self.metrics_only.tool_name {
             check(is_identifier(tool_name), ValidationError::InvalidToolName)?;
+        }
+        Ok(())
+    }
+
+    /// Harness, session, network class, attribution source and mutation
+    /// kind rules. Only a `FILE_MUTATION` may lack a Harness (manual work),
+    /// and only the file watcher produces `FILE_MUTATION`s.
+    fn validate_attribution(&self) -> Result<(), ValidationError> {
+        let is_mutation = self.event_type == EventType::FileMutation;
+        let manual = is_mutation && self.harness_id.is_none() && self.session_id.is_none();
+        if !manual {
+            check(self.harness_id.is_some(), ValidationError::MissingHarness)?;
+            check(self.session_id.is_some(), ValidationError::MissingSession)?;
+        }
+        if manual {
+            check(
+                self.network_class == NetworkClass::Manual,
+                ValidationError::ManualMutationNotManual,
+            )?;
+        }
+        let from_watcher = self.attribution_source == AttributionSource::FileWatcher;
+        if is_mutation {
+            check(from_watcher, ValidationError::InvalidAttributionSource)?;
+            check(
+                self.metrics_only.mutation_kind.is_some(),
+                ValidationError::MissingMutationKind,
+            )?;
+        } else {
+            check(!from_watcher, ValidationError::UnexpectedFileWatcher)?;
+            check(
+                self.metrics_only.mutation_kind.is_none(),
+                ValidationError::UnexpectedMutationKind,
+            )?;
         }
         Ok(())
     }
@@ -166,6 +226,27 @@ fn is_uuid(value: &str) -> bool {
             .iter()
             .zip([8, 4, 4, 4, 12])
             .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A UUIDv7 (RFC 9562) for `unix_ms`: the 48-bit millisecond timestamp,
+/// version 7, the variant bits, and `random` in the remaining bits (the
+/// caller supplies the randomness; this crate does no I/O). Always passes
+/// the `event_id` check.
+pub fn uuid_v7(unix_ms: u64, random: [u8; 10]) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..6].copy_from_slice(&unix_ms.to_be_bytes()[2..]);
+    bytes[6..].copy_from_slice(&random);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 /// A bounded session-style ID: letters, digits, `.`, `_`, `-`, `:`.

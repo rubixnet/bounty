@@ -3,12 +3,13 @@
 //! on the user-profile ACL), reused across restarts and compared in constant
 //! time. The value is never logged or formatted.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::Path;
 
 use subtle::ConstantTimeEq;
 
+use crate::fsutil::write_atomically;
 use crate::log;
 
 pub const TOKEN_FILE: &str = "daemon.token";
@@ -33,7 +34,7 @@ impl BusToken {
             Err(error) => return Err(error),
         }
         let token = Self::generate()?;
-        write_atomically(data_dir, &path, &token.0)?;
+        write_atomically(data_dir, TOKEN_FILE, &token.0)?;
         Ok(token)
     }
 
@@ -63,29 +64,4 @@ impl BusToken {
         }
         Ok(Self(hex))
     }
-}
-
-/// Writes `contents` to a fresh temp file (mode `0600` from creation on
-/// Unix), syncs it and renames it over `path`, so the token file is never
-/// observed half-written or with wider permissions.
-fn write_atomically(dir: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
-    let temp = dir.join(format!("{TOKEN_FILE}.tmp-{}", std::process::id()));
-    let _ = fs::remove_file(&temp);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| {
-        let mut file = options.open(&temp)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
 }

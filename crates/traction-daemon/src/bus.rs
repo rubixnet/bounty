@@ -6,10 +6,24 @@
 //! 1. `Host` allowlist (HTTP only)        -> `403 forbidden_host`
 //! 2. `Origin` allowlist                  -> `403 forbidden_origin`
 //! 3. bearer token                        -> `401`
-//! 4. route (`POST /v1/event`)            -> `404`, or `405` for another method
+//! 4. route (`POST /v1/event`, `POST /v1/project`) -> `404`, or `405`
 //! 5. body size cap                       -> `413`
+//!
+//! Then, for `/v1/event`:
+//!
 //! 6. deserialize + validate              -> `400` with a reason code
-//! 7. enqueue to the writer               -> `503` when full, else `202`
+//! 7. bus policy (see [`check_policy`])   -> `400` with a reason code
+//! 8. enqueue to the Project Router       -> `503` when full, else `202`
+//!
+//! The bus answers as soon as the event is queued: routing (Git calls
+//! included) happens later on the Router thread.
+//!
+//! And for `/v1/project` (`{"path": "<absolute folder>"}`):
+//!
+//! 6. deserialize (unknown fields refused) -> `400 malformed_registration`
+//! 7. absolute, bounded path               -> `400 invalid_path`
+//! 8. the Router registers it              -> `422` with a reason code, `503`
+//!    when busy, else `200 {"project_id": "..."}`
 //!
 //! Responses never echo the request: every body is a fixed reason code.
 //!
@@ -19,6 +33,7 @@
 //! destroy the reply before the caller reads it (always on Windows).
 
 use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
@@ -26,13 +41,18 @@ use hyper::body::{Body, Bytes, Incoming};
 use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, EXPECT, HOST, HeaderValue, ORIGIN};
 use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
-use traction_core::TractionEvent;
+use serde::Deserialize;
+use traction_core::{AttributionSource, EventType, MAX_CWD_LEN, TractionEvent};
 
-use crate::storage::{EventRow, IntegerOutOfRange};
+use crate::router::RouterSender;
+use crate::storage::EventRow;
 use crate::token::BusToken;
-use crate::writer::WriterSender;
 
 pub const EVENT_PATH: &str = "/v1/event";
+/// Registers a Project path (`docs/protocol.md` section 2a).
+pub const PROJECT_PATH: &str = "/v1/project";
+/// A registration still unanswered after this long gets `503 busy`.
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Request bodies above this many bytes are refused with `413`.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
@@ -47,7 +67,7 @@ pub type BusResponse = Response<Full<Bytes>>;
 /// What every transport needs to answer a request.
 pub struct Bus {
     token: BusToken,
-    writer: WriterSender,
+    router: RouterSender,
     /// The bound loopback HTTP port: the only port allowed in `Host` and
     /// `Origin`.
     port: u16,
@@ -81,6 +101,8 @@ impl Rejection {
     const BODY_TOO_LARGE: Self = Self::new(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large");
     const UNREADABLE_BODY: Self = Self::new(StatusCode::BAD_REQUEST, "unreadable_body");
     const BUSY: Self = Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy");
+    const MALFORMED_REGISTRATION: Self = Self::bad_request("malformed_registration");
+    const INVALID_PATH: Self = Self::bad_request("invalid_path");
 
     const fn new(status: StatusCode, code: &'static str) -> Self {
         Self { status, code }
@@ -91,11 +113,26 @@ impl Rejection {
     }
 }
 
+/// What a request that passed every check gets.
+enum Reply {
+    /// `202`: the event is queued for routing and storage.
+    Accepted,
+    /// `200`: the path's Project is registered under this ID.
+    Registered(String),
+}
+
+/// The `/v1/project` body.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Registration {
+    path: String,
+}
+
 impl Bus {
-    pub fn new(token: BusToken, writer: WriterSender, port: u16) -> Self {
+    pub fn new(token: BusToken, router: RouterSender, port: u16) -> Self {
         Self {
             token,
-            writer,
+            router,
             port,
         }
     }
@@ -107,7 +144,8 @@ impl Bus {
         transport: Transport,
     ) -> Result<BusResponse, Infallible> {
         Ok(match self.check(request, transport).await {
-            Ok(()) => respond(StatusCode::ACCEPTED, "status", "accepted"),
+            Ok(Reply::Accepted) => respond(StatusCode::ACCEPTED, "status", "accepted"),
+            Ok(Reply::Registered(project_id)) => respond_registered(&project_id),
             Err(rejection) => {
                 let mut response = respond(rejection.status, "error", rejection.code);
                 if rejection == Rejection::METHOD_NOT_ALLOWED {
@@ -124,7 +162,7 @@ impl Bus {
         &self,
         request: Request<Incoming>,
         transport: Transport,
-    ) -> Result<(), Rejection> {
+    ) -> Result<Reply, Rejection> {
         let (parts, mut body) = request.into_parts();
         let mut read = 0;
         let result = self
@@ -143,24 +181,50 @@ impl Bus {
         body: &mut Incoming,
         read: &mut usize,
         transport: Transport,
-    ) -> Result<(), Rejection> {
+    ) -> Result<Reply, Rejection> {
         if transport == Transport::Http {
             self.check_host(parts)?;
         }
         self.check_origin(parts)?;
         self.authorize(parts)?;
-        if parts.uri.path() != EVENT_PATH {
+        let path = parts.uri.path();
+        if path != EVENT_PATH && path != PROJECT_PATH {
             return Err(Rejection::NOT_FOUND);
         }
         if parts.method != Method::POST {
             return Err(Rejection::METHOD_NOT_ALLOWED);
         }
         let body = read_capped_body(body, read).await?;
+        if path == PROJECT_PATH {
+            return self.register(&body).await;
+        }
         let event = TractionEvent::from_json(&body)
             .map_err(|error| Rejection::bad_request(error.code()))?;
-        let row = EventRow::try_from(event)
-            .map_err(|IntegerOutOfRange| Rejection::bad_request(IntegerOutOfRange::CODE))?;
-        self.writer.try_enqueue(row).map_err(|_| Rejection::BUSY)
+        check_policy(&event)?;
+        EventRow::check(&event).map_err(|error| Rejection::bad_request(error.code()))?;
+        self.router
+            .try_route(event)
+            .map(|()| Reply::Accepted)
+            .map_err(|_| Rejection::BUSY)
+    }
+
+    /// `/v1/project`: asks the Router to register the body's path.
+    async fn register(&self, body: &[u8]) -> Result<Reply, Rejection> {
+        let registration: Registration =
+            serde_json::from_slice(body).map_err(|_| Rejection::MALFORMED_REGISTRATION)?;
+        let path = registration_path(&registration.path).ok_or(Rejection::INVALID_PATH)?;
+        let answer = self
+            .router
+            .try_register(path)
+            .map_err(|_| Rejection::BUSY)?;
+        match tokio::time::timeout(REGISTER_TIMEOUT, answer).await {
+            Ok(Ok(Ok(project_id))) => Ok(Reply::Registered(project_id)),
+            Ok(Ok(Err(error))) => Err(Rejection::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error.code(),
+            )),
+            Ok(Err(_)) | Err(_) => Err(Rejection::BUSY),
+        }
     }
 
     /// Exactly one `Host` header naming loopback on the bound port. An
@@ -226,6 +290,35 @@ impl Bus {
     }
 }
 
+/// What an external caller may send, on top of `traction-core` validation.
+///
+/// - Every `FILE_MUTATION` is refused (`external_file_mutation`): in v1 only
+///   the daemon's own file watcher produces them, and it never uses the bus.
+/// - `file_watcher` is daemon-internal (`internal_attribution_source`). Core
+///   already allows it only on a `FILE_MUTATION`, so today this guards
+///   against core loosening that rule.
+/// - `browser_extension`, `editor_extension` and `manual_pick` are reserved
+///   until their sub-step turns them on (`reserved_attribution_source`).
+fn check_policy(event: &TractionEvent) -> Result<(), Rejection> {
+    if event.event_type == EventType::FileMutation {
+        return Err(Rejection::bad_request("external_file_mutation"));
+    }
+    match event.attribution_source {
+        AttributionSource::HarnessHook
+        | AttributionSource::HarnessPlugin
+        | AttributionSource::HarnessLog
+        | AttributionSource::HarnessDbPoll => Ok(()),
+        AttributionSource::FileWatcher => {
+            Err(Rejection::bad_request("internal_attribution_source"))
+        }
+        AttributionSource::BrowserExtension
+        | AttributionSource::EditorExtension
+        | AttributionSource::ManualPick => {
+            Err(Rejection::bad_request("reserved_attribution_source"))
+        }
+    }
+}
+
 const HTTP_SCHEME: &[u8] = b"http://";
 
 /// The credentials of an `Authorization: Bearer <token>` header.
@@ -273,6 +366,25 @@ async fn discard_body(body: &mut Incoming, mut read: usize) {
 /// body would invite it, so a refused request of this kind is not drained.
 fn expects_continue(parts: &Parts) -> bool {
     parts.headers.contains_key(EXPECT)
+}
+
+/// A registration path: absolute for this OS, bounded, no control chars.
+fn registration_path(path: &str) -> Option<PathBuf> {
+    (Path::new(path).is_absolute()
+        && path.len() <= MAX_CWD_LEN
+        && !path.chars().any(char::is_control))
+    .then(|| PathBuf::from(path))
+}
+
+/// `200 {"project_id":"<id>"}`. The ID is daemon-derived (`git:`/`dir:`
+/// plus hex), never request input.
+fn respond_registered(project_id: &str) -> BusResponse {
+    let body = format!("{{\"project_id\":\"{project_id}\"}}");
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
 }
 
 /// A JSON response `{"<key>":"<code>"}` built only from static strings.
