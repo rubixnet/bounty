@@ -30,6 +30,13 @@ pub const LOG_TAIL_HOLD: Duration = Duration::from_secs(5);
 /// section 2): a log-tailed session that has never reported a turn boundary
 /// claims a `FILE_MUTATION` stamped within this long after one of its events.
 pub const LOG_TAIL_TRAILING_WINDOW: Duration = Duration::from_secs(30);
+/// File-system notification latency grace (`docs/protocol.md` section 2):
+/// a hook window, or a log-tailed turn window, still claims a
+/// `FILE_MUTATION` first observed up to this long after the event that
+/// closed it (`TOOL_POST` / `TOOL_FAIL` / turn end), because the watcher
+/// stamps a mutation when its notification arrives, which can be after the
+/// Harness already reported the tool call done.
+pub const WINDOW_CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// Files the watcher may hold per Project at once; past this, the oldest
 /// held mutation of that Project is decided early (bounded memory).
 pub const DEFAULT_WATCHER_PENDING_CAP: usize = 1024;

@@ -4,9 +4,11 @@
 //!
 //! Windows compare event timestamps with the mutation's timestamp (its
 //! first observation, on the wall clock), so every test sets event
-//! timestamps explicitly relative to the wall clock: a window close is
-//! stamped well after the edit it must cover, and an edit that must fall
-//! outside a window is made only once the wall clock is well past the close.
+//! timestamps explicitly relative to the wall clock. A window close is
+//! stamped when it is sent, right after the edit it must cover: the
+//! documented [`WINDOW_CLOSE_GRACE`] absorbs file-system notification
+//! latency. An edit that must fall outside a window is made only once the
+//! wall clock is well past the close plus that grace.
 
 mod common;
 
@@ -15,10 +17,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{MutationRow, TestDaemon, fast_watcher, fixtures, valid_event_value};
-
-/// Slack between an edit and the timestamp of the event that must still
-/// cover it (or must not), for slow file-system notification delivery.
-const SLACK_MS: u64 = 1500;
+use traction_daemon::WINDOW_CLOSE_GRACE;
 
 fn now_ms() -> u64 {
     u64::try_from(
@@ -30,9 +29,11 @@ fn now_ms() -> u64 {
     .unwrap()
 }
 
-/// Sleeps until the wall clock is past `ts_ms` by a safe margin.
+/// Sleeps until the wall clock is past a window close at `ts_ms`, plus its
+/// [`WINDOW_CLOSE_GRACE`], by a safe margin.
 fn wait_past(ts_ms: u64) {
-    let target = ts_ms + 300;
+    let grace = u64::try_from(WINDOW_CLOSE_GRACE.as_millis()).unwrap();
+    let target = ts_ms + grace + 300;
     let now = now_ms();
     if now < target {
         std::thread::sleep(Duration::from_millis(target - now));
@@ -124,7 +125,7 @@ fn a_hook_window_attributes_and_edits_after_tool_post_or_turn_end_are_manual() {
     send(&daemon, 1, HOOK, "PROMPT_SUBMIT", &root, t0);
     send(&daemon, 2, HOOK, "TOOL_PRE", &root, t0);
     fs::write(root.join("a.txt"), "by the agent").unwrap();
-    let post = now_ms() + SLACK_MS;
+    let post = now_ms();
     send(&daemon, 3, HOOK, "TOOL_POST", &root, post);
     let rows = daemon.wait_for_mutations(1);
     assert_attributed(&rows[0], HOOK, &project);
@@ -138,7 +139,7 @@ fn a_hook_window_attributes_and_edits_after_tool_post_or_turn_end_are_manual() {
     // A new tool window, closed by TURN_END instead of TOOL_POST.
     send(&daemon, 4, HOOK, "TOOL_PRE", &root, now_ms());
     fs::write(root.join("c.txt"), "by the agent").unwrap();
-    let end = now_ms() + SLACK_MS;
+    let end = now_ms();
     send(&daemon, 5, HOOK, "TURN_END", &root, end);
     let rows = daemon.wait_for_mutations(3);
     assert_attributed(&rows[2], HOOK, &project);
@@ -159,7 +160,7 @@ fn a_log_tailed_turn_attributes_until_turn_end() {
 
     send(&daemon, 1, LOG, "PROMPT_SUBMIT", &root, now_ms());
     fs::write(root.join("a.txt"), "by the agent").unwrap();
-    let end = now_ms() + SLACK_MS;
+    let end = now_ms();
     send(&daemon, 2, LOG, "TURN_END", &root, end);
     let rows = daemon.wait_for_mutations(1);
     assert_attributed(&rows[0], LOG, &project);
@@ -185,7 +186,7 @@ fn a_late_prompt_submit_claims_an_edit_within_the_hold_but_not_after_it() {
     fs::write(root.join("a.txt"), "by the agent").unwrap();
     std::thread::sleep(Duration::from_secs(1));
     send(&daemon, 1, LOG, "PROMPT_SUBMIT", &root, before - 500);
-    let end = now_ms() + SLACK_MS;
+    let end = now_ms();
     send(&daemon, 2, LOG, "TURN_END", &root, end);
     let rows = daemon.wait_for_mutations(1);
     assert_attributed(&rows[0], LOG, &project);
@@ -286,7 +287,7 @@ fn hook_beats_log_turn_beats_trailing_and_the_latest_opened_wins() {
     send(&daemon, 5, second, "PROMPT_SUBMIT", &root, t1 + 1);
     send(&daemon, 6, second, "TOOL_PRE", &root, t1 + 1);
     fs::write(root.join("b.txt"), "2").unwrap();
-    let close = now_ms() + SLACK_MS;
+    let close = now_ms();
     let rows = daemon.wait_for_mutations(2);
     assert_attributed(&rows[1], second, &project);
 
