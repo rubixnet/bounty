@@ -12,3 +12,8 @@
 - [ ] The two 1a gate items are ticked in `.scratch/step-1a/spec.md` only after all 3 OSes pass:
   - the Local Ingestion Bus rejects bad tokens, `Host` and `Origin`;
   - no raw text is stored in SQLite.
+
+## Comments
+
+- 2026-11-25: The human created the repo themselves as **public** at https://github.com/Gitstar-OC/Bounty, overriding the "private, via `gh repo create`" plan. The remote's GitHub-generated initial `LICENSE` commit (095f4da) was merged into `main` with `--allow-unrelated-histories`. The integration branch keeps the gnu.org AGPLv3 text; the two differ only in line wrapping. `main` and `step-1a-foundation` are pushed.
+- 2026-11-25: CI run 45569559809 did not start on any OS: "The job was not started because your account is locked due to a billing issue." Blocked on the GitHub account's billing. Re-run once it is unlocked; the Exit Gate items stay unticked until all 3 OSes pass.
