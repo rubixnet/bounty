@@ -133,6 +133,69 @@ fn surrounding_whitespace_is_trimmed_and_the_command_body_text_also_matches() {
     );
 }
 
+/// The body of the command file the real installer writes (everything
+/// after the frontmatter), for `file_name`.
+fn installed_command_body(dir: &Path, file_name: &str) -> String {
+    let home = dir.join("home");
+    let settings = dir.join("claude").join("settings.json");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_traction-daemon"));
+    command
+        .args(["install", "claude-code", "--settings"])
+        .arg(&settings)
+        .arg("--claude-program")
+        .arg(dir.join("no-such-claude"))
+        .arg("--profile")
+        .arg(dir.join("profile.sh"))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    let scratch_key = format!(
+        "Software\\TractionTest\\pause-{}",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    #[cfg(windows)]
+    command.args(["--windows-env-key", &scratch_key]);
+    let output = command.output().expect("run the installer");
+    #[cfg(windows)]
+    let _ = std::process::Command::new("reg")
+        .args(["delete", &format!("HKCU\\{scratch_key}"), "/f"])
+        .output();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = fs::read_to_string(settings.with_file_name("commands").join(file_name)).unwrap();
+    let rest = text.strip_prefix("---\n").expect("frontmatter");
+    let end = rest.find("\n---\n").expect("frontmatter end");
+    rest[end + "\n---\n".len()..].to_owned()
+}
+
+/// Whichever text Claude Code hands the hook for a typed `/stop-track`
+/// (the literal command, or the installed file's expanded body), the hook
+/// blocks it with the pause answer.
+#[test]
+fn the_literal_command_and_the_installed_files_body_are_both_blocked() {
+    let mut daemon = TestDaemon::start();
+    let repo = fixtures::repo(&daemon.home().join("repo"), None);
+    let install_dir = tempfile::tempdir().unwrap();
+    let stop_body = installed_command_body(install_dir.path(), STOP_TRACK.file_name);
+    let resume_body = installed_command_body(install_dir.path(), RESUME_TRACK.file_name);
+
+    send_command(&daemon, "lit", &repo, STOP_TRACK.literal, PAUSED);
+    send_command(&daemon, "lit", &repo, RESUME_TRACK.literal, RESUMED);
+    send_command(&daemon, "file", &repo, &stop_body, PAUSED);
+    send_command(&daemon, "file", &repo, &resume_body, RESUMED);
+
+    let db = daemon.shutdown_and_open_db();
+    assert_eq!(stored(&db), vec![]);
+    assert_eq!(
+        spans(&db),
+        vec![("file".to_owned(), true), ("lit".to_owned(), true)]
+    );
+}
+
 #[test]
 fn only_the_exact_command_pauses_and_other_prompts_are_normal() {
     let mut daemon = TestDaemon::start();

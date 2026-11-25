@@ -13,9 +13,14 @@
 //!
 //! Subcommands:
 //! - `install claude-code [--settings <path>] [--claude-program <path>]
-//!   [--port <n>]` merges Traction's hooks into Claude Code's
-//!   `settings.json` (default `$CLAUDE_CONFIG_DIR/settings.json`, else
-//!   `~/.claude/settings.json`), prints a summary to stdout and exits.
+//!   [--port <n>] [--profile <path>]...` merges Traction's hooks into Claude
+//!   Code's `settings.json` (default `$CLAUDE_CONFIG_DIR/settings.json`, else
+//!   `~/.claude/settings.json`), writes the `/stop-track` and `/resume-track`
+//!   command files next to it, adds the `TRACTION_TOKEN` block to each shell
+//!   profile (default: the existing zsh, bash, fish and PowerShell ones; any
+//!   `--profile` replaces that list), prints a summary to stdout and exits.
+//!   On Windows it also sets `TRACTION_TOKEN` under `HKCU\Environment`
+//!   (`--windows-env-key <subkey>` redirects that, for tests).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -106,6 +111,7 @@ fn install(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         _ => return Err(INSTALL_USAGE.to_owned()),
     }
     let mut install = ClaudeCodeInstall::for_user().map_err(|e| e.to_string())?;
+    let mut profiles: Vec<PathBuf> = Vec::new();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--settings") => {
@@ -124,8 +130,22 @@ fn install(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
                     .filter(|&port| port != 0)
                     .ok_or("--port needs a number from 1 to 65535")?;
             }
+            Some("--profile") => {
+                profiles.push(PathBuf::from(args.next().ok_or("--profile needs a path")?));
+            }
+            #[cfg(windows)]
+            Some("--windows-env-key") => {
+                install.windows_env_key = args
+                    .next()
+                    .and_then(|v| v.into_string().ok())
+                    .filter(|v| !v.is_empty())
+                    .ok_or("--windows-env-key needs an HKCU subkey")?;
+            }
             _ => return Err(INSTALL_USAGE.to_owned()),
         }
+    }
+    if !profiles.is_empty() {
+        install.profiles = profiles;
     }
     let report = install.run().map_err(|e| e.to_string())?;
     for warning in &report.warnings {
@@ -136,7 +156,7 @@ fn install(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
 }
 
 const INSTALL_USAGE: &str = "usage: traction-daemon install claude-code \
-    [--settings <path>] [--claude-program <path>] [--port <n>]";
+    [--settings <path>] [--claude-program <path>] [--port <n>] [--profile <path>]...";
 
 #[cfg(unix)]
 const USAGE: &str = "unknown argument (use --data-dir <path>, --port <n>, --socket-path <path>)";
