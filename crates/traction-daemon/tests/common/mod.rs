@@ -403,6 +403,7 @@ pub fn valid_event_value(n: u32) -> serde_json::Value {
         "project_id": "git:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "model_id": "optional-model-string",
         "network_class": "cloud_api",
+        "attribution_source": "harness_hook",
         "metrics_only": {
             "prompt_char_len": 142,
             "repo_symbol_hits": 3,

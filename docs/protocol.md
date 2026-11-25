@@ -17,36 +17,71 @@ Raw prompt text, file contents, secrets, and raw tool stdout/stderr are **FORBID
   "schema_version": 1,
   "event_id": "019a7c2e-8b4d-7000-8000-000000000001",
   "timestamp_ms": 1795432800000,
-  "harness_id": "claude-code | opencode | codex-cli | codex-desktop",
-  "session_id": "string",
+  "harness_id": "claude-code | opencode | codex-cli | codex-desktop | null (manual FILE_MUTATION only)",
+  "session_id": "string | null (manual FILE_MUTATION only)",
   "parent_orchestrator_id": null,
   "event_type": "SESSION_START | PROMPT_SUBMIT | PERMISSION_REQUEST | TOOL_PRE | TOOL_POST | TOOL_FAIL | SUBAGENT_START | SUBAGENT_STOP | CWD_CHANGE | TURN_END | STOP_FAILURE | SESSION_END | FILE_MUTATION",
   "end_reason": "completed | aborted | null (TURN_END only)",
-  "cwd": "/abs/path/to/working/dir",
-  "project_id": "git:<sha256(root-commit || normalized-origin)> | dir:<sha256(device-secret || canonical-project-root-path)>",
+  "cwd": "/abs/path/to/working/dir | null",
+  "project_id": "git:<64 hex> | dir:<64 hex> | null (see 2a)",
   "model_id": "optional-model-string",
   "network_class": "cloud_api | local_model | manual",
+  "attribution_source": "harness_hook | harness_plugin | harness_log | harness_db_poll | file_watcher | browser_extension | editor_extension | manual_pick",
   "metrics_only": {
     "prompt_char_len": 142,
     "repo_symbol_hits": 3,
     "has_stacktrace": true,
     "tool_name": "Bash",
     "exit_code": 1,
-    "diff_lines_delta": 24
+    "diff_lines_delta": 24,
+    "mutation_kind": "created | modified | removed | renamed | null (FILE_MUTATION only)"
   }
 }
 ```
 
+Field rules (still `schema_version: 1`; every rejection is a value-free reason code):
+
+- Unknown fields are rejected at every level. Optional fields may be omitted or sent as `null`; canonical JSON always writes them as explicit `null`.
+- `cwd` is optional (a browser tab has none). When present it is absolute, at most 4096 bytes, with no control characters (`invalid_cwd`).
+- `project_id` is optional on the wire. When present it must be `git:<64 lowercase hex>` or `dir:<64 lowercase hex>` (`invalid_project_id`). The daemon's Project Router is authoritative and replaces any Adapter-supplied value with its own, so Adapters should omit it.
+- `attribution_source` is required and closed (unknown spellings are `malformed_event`):
+  - `harness_hook` (Claude Code HTTP hooks), `harness_plugin` (OpenCode plugin), `harness_log` (Codex rollout tailing), `harness_db_poll` (OpenCode read-only SQLite fallback), `file_watcher` (the daemon's own watcher; daemon-internal only).
+  - Reserved, accepted by `traction-core` but refused by the Local Ingestion Bus until their sub-step turns them on: `browser_extension`, `editor_extension` (Open Ingestion Spec, Step 6d) and `manual_pick` (a later user-driven attribution; semantics defined when enabled).
+- `harness_id` and `session_id`: every event type except `FILE_MUTATION` requires both (`missing_harness`, `missing_session`). A `FILE_MUTATION` carries both (attributed to a Harness session) or neither (manual work); one without the other is rejected with the missing one's code. A manual `FILE_MUTATION` must have `network_class: manual` (`manual_mutation_not_manual`).
+- `attribution_source: file_watcher` is valid only on `FILE_MUTATION` (`unexpected_file_watcher`), and a `FILE_MUTATION` must have `attribution_source: file_watcher` (`invalid_attribution_source`).
+- `metrics_only.mutation_kind` is required on a `FILE_MUTATION` (`missing_mutation_kind`) and forbidden on every other event type (`unexpected_mutation_kind`).
+- A `FILE_MUTATION` never carries the mutated file's path or name; its `cwd` is the Project Root.
+
+### `FILE_MUTATION` attribution windows
+
+The daemon's file watcher emits every `FILE_MUTATION` itself (never over HTTP; the bus refuses external ones). An observed mutation is attributed to a Harness session only inside that session's window, otherwise it is manual work (no Harness, no session, `network_class: manual`). Attribution is live-only: mutations while the daemon was down are never backfilled.
+
+- `LOG_TAIL_HOLD` = **5 s**: each observed mutation is held this long (a delivery-lag buffer, not an attribution window) so late log-tailed events can still claim it.
+- `LOG_TAIL_TRAILING_WINDOW` = **30 s**: the single "short fallback window" for sessions that never report turn boundaries; covers a mutation within 30 s after that session's latest event.
+- Hook windows (`harness_hook` / `harness_plugin`) run from `TOOL_PRE` to the matching `TOOL_POST` / `TOOL_FAIL` in an open turn.
+
 ## 2a. Project Identity
 
 - A **Project** is a folder, Git or not (see `docs/adr/0001`). Project root resolution: Git repo root (worktrees collapsed via `--git-common-dir`) → nearest ancestor with a project marker → the Harness session's starting folder. System, home-root, cache, and dependency folders never become Projects.
-- `git:` IDs are used once a repo has a first commit; a `dir:` Project that gains one is migrated to its `git:` ID with history preserved.
+- The daemon is the only place `project_id` is derived (the pure derivation lives in `traction-core`; all file system and Git work stays in the daemon). The exact formulas are under "Project ID derivation" below. The per-device secret is a 32-byte random file in the daemon data folder, separate from the bus token.
+- **ID pinning:** the first time a Git Project Root resolves with a commit, its `git:` ID is stored against the repo's canonical common dir and reused afterwards, even if `origin` changes later. Another device may compute a different ID if its remote was added at a different time; the website merge (Step 4b) reconciles that.
+- `git:` IDs are used once a repo has a first commit. **Migration is alias-only:** when a registered `dir:` Project gains its first commit, the daemon records an alias (`dir:` ID → `git:` ID) in one transaction. Stored Traction Events are append-only and are never rewritten, so events hashed under the `dir:` ID keep verifying; new events (including late ones carrying the old `dir:` ID) are stored under the `git:` ID, and every Project query includes aliased IDs so history stays together.
+- **Hardened Git:** every daemon `git` call is read-only plumbing (`rev-parse`, `rev-list`, `config --get`) through one wrapper with `--no-optional-locks -c core.fsmonitor=false -c safe.bareRepository=explicit` and a null `core.hooksPath`, killed after a **5 s** hard timeout (treated as "not a Git repo" for that resolution). Repos rooted at `$HOME` are skipped.
+- **Registration:** `POST /v1/project` with a JSON body `{"path": "/abs/path"}` (unknown fields rejected, same size cap and same `Host`/`Origin`/token checks as `/v1/event`) registers the Project Root the path resolves to. Excluded, missing or non-folder paths get `422` with a reason code.
 - Project metadata synced to the server (owner- and reviewer-visible; public profiles show only `project_name`):
   - `project_name` (folder basename by default, user-renamable)
   - `project_root_path` (absolute path)
   - `project_home_relative_path` (e.g. `~/code/my-game`)
   - `os_username`
   - `linked_repo` (optional `github.com/<owner>/<repo>`, set from the website)
+
+### Project ID derivation
+
+Derived only by the daemon's Router, using the pure functions in `traction-core` (`git_project_id`, `dir_project_id`, `normalize_origin`). `||` is byte concatenation, `0x00` is the fixed separator, and the digest is lowercase hex.
+
+- `git:` = `"git:" || hex(SHA-256(lower(root_commit_hex) || 0x00 || normalize_origin(origin)))`. A missing or blank `origin` hashes as the empty string.
+- `dir:` = `"dir:" || hex(SHA-256(device_secret || 0x00 || canonical_root_utf8))`. `device_secret` is the 32-byte per-device secret, so a `dir:` ID cannot be confirmed from a path alone.
+- **Origin normalization:** trim whitespace; strip the scheme, userinfo and port; lowercase the host (path case is kept); rewrite scp-style `user@host:owner/repo` to `host/owner/repo`; strip any trailing `/` and `.git`. Local paths (`file://`, Windows drive paths) keep only their path. `https://github.com/A/B.git`, `git@github.com:A/B` and `ssh://git@github.com:22/A/B/` all normalize to `github.com/A/B`.
 
 ## 3. Server Sync Heartbeat (Every 2 Minutes — No PII)
 
