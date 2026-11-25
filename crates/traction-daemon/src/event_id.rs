@@ -64,7 +64,10 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(&id[14..15], "8");
         assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"));
-        assert_ne!(derived_event_id(&[b"ab", b"c"]), derived_event_id(&[b"a", b"bc"]));
+        assert_ne!(
+            derived_event_id(&[b"ab", b"c"]),
+            derived_event_id(&[b"a", b"bc"])
+        );
         assert_ne!(
             id,
             derived_event_id(&[b"claude-code", b"s", b"u", b"1", b"TOOL_PRE"])

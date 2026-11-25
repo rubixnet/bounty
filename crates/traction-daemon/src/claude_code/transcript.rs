@@ -536,7 +536,10 @@ mod tests {
             Some(1_795_624_590_382)
         );
         assert_eq!(parse_timestamp_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_timestamp_ms("2000-02-29T12:00:00.5Z"), Some(951_825_600_500));
+        assert_eq!(
+            parse_timestamp_ms("2000-02-29T12:00:00.5Z"),
+            Some(951_825_600_500)
+        );
         assert_eq!(
             parse_timestamp_ms("2026-11-25T17:36:30.382123+01:00"),
             Some(1_795_624_590_382)

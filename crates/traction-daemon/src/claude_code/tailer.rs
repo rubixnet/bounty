@@ -252,10 +252,7 @@ impl Worker {
         if let Some(previous) = self.ancestor_watched.take() {
             let _ = backend.unwatch(&previous);
         }
-        if backend
-            .watch(ancestor, RecursiveMode::NonRecursive)
-            .is_ok()
-        {
+        if backend.watch(ancestor, RecursiveMode::NonRecursive).is_ok() {
             self.ancestor_watched = Some(ancestor.to_path_buf());
         }
     }
@@ -287,8 +284,7 @@ impl Worker {
                 continue;
             };
             offsets.push(offset_row(&key, &identity, meta.len()));
-            self.files
-                .insert(key, FileState::new(identity, meta.len()));
+            self.files.insert(key, FileState::new(identity, meta.len()));
         }
         let start = TailerStartRow {
             started_ms: now_ms(),
@@ -368,7 +364,14 @@ impl Worker {
         self.files.insert(key, state);
     }
 
-    fn read_lines(&mut self, key: &str, mut file: File, len: u64, state: &mut FileState, dirty: bool) {
+    fn read_lines(
+        &mut self,
+        key: &str,
+        mut file: File,
+        len: u64,
+        state: &mut FileState,
+        dirty: bool,
+    ) {
         if file.seek(SeekFrom::Start(state.offset)).is_err() {
             return;
         }

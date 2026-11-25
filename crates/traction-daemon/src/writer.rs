@@ -3,7 +3,8 @@
 //! registrations, session upserts) over a bounded channel, applied in order.
 //!
 //! A batch is committed when it is `commit_interval` old or holds `max_batch`
-//! events (registry and session writes ride along and are not counted)
+//! events (registry and session writes ride along and are not counted; a
+//! tailer batch counts its events and commits with its transcript offset)
 //! whichever comes first. When every [`WriterSender`] has been dropped,
 //! the thread drains the channel, commits and exits; [`WriterThread::join`]
 //! waits for that, so a graceful shutdown loses nothing already accepted.

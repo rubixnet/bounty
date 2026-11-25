@@ -239,3 +239,295 @@ fn a_tailer_only_session_is_fully_recorded() {
     assert!(rows[1].prompt_char_len.is_some_and(|len| len > 0));
     daemon.shutdown();
 }
+
+/// The first index of a `user` line with prompt text in `lines`.
+fn prompt_index(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .position(|line| {
+            let value: Value = serde_json::from_str(line).expect("JSON");
+            value["type"] == "user" && value["message"]["content"].is_string()
+        })
+        .expect("a prompt line")
+}
+
+#[test]
+fn records_map_to_tool_failures_api_errors_and_nothing_for_a_blocked_prompt() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    let mut sessions = Vec::new();
+    for scenario in ["tool-failure", "api-error-stop", "stop-track", "subagent"] {
+        let lines = transcript_lines(scenario, &repo, &home);
+        let session = session_of(&lines);
+        append_lines(&transcript_path(&claude, &repo, &session), &lines);
+        sessions.push(session);
+    }
+    // A subagent transcript is never tailed.
+    let subagent_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/claude-code/subagent/subagents/agent-a0308422526856e05.jsonl");
+    let subagents = transcript_path(&claude, &repo, &sessions[3])
+        .with_extension("")
+        .join("subagents");
+    fs::create_dir_all(&subagents).expect("subagents folder");
+    fs::copy(
+        &subagent_file,
+        subagents.join("agent-a0308422526856e05.jsonl"),
+    )
+    .expect("copy subagent transcript");
+
+    let rows = wait_for_events(&daemon, 14);
+    let of = |session: &str| -> Vec<(String, Option<String>)> {
+        let rows: Vec<Tailed> = rows
+            .iter()
+            .filter(|row| row.session_id.as_deref() == Some(session))
+            .cloned()
+            .collect();
+        shapes(&rows)
+    };
+    assert_eq!(
+        of(&sessions[0]),
+        vec![
+            shape("SESSION_START", None),
+            shape("PROMPT_SUBMIT", None),
+            shape("TOOL_PRE", Some("Read")),
+            shape("TOOL_FAIL", Some("Read")),
+            shape("TOOL_PRE", Some("Bash")),
+            shape("TOOL_FAIL", Some("Bash")),
+        ]
+    );
+    // `isApiErrorMessage: true` is the API-error record.
+    assert_eq!(
+        of(&sessions[1]),
+        vec![
+            shape("SESSION_START", None),
+            shape("PROMPT_SUBMIT", None),
+            shape("STOP_FAILURE", None),
+        ]
+    );
+    // A `/stop-track` block writes only `system` records: no prompt.
+    assert_eq!(of(&sessions[2]), vec![]);
+    // The main transcript only; the task notification is a prompt (its
+    // `UserPromptSubmit` hook fires too).
+    assert_eq!(
+        of(&sessions[3]),
+        vec![
+            shape("SESSION_START", None),
+            shape("PROMPT_SUBMIT", None),
+            shape("TOOL_PRE", Some("Agent")),
+            shape("TOOL_POST", Some("Agent")),
+            shape("PROMPT_SUBMIT", None),
+        ]
+    );
+    daemon.shutdown();
+}
+
+#[test]
+fn only_complete_lines_are_read() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    let lines = transcript_lines("normal-multi-tool", &repo, &home);
+    let path = transcript_path(&claude, &repo, &session_of(&lines));
+    let prompt = prompt_index(&lines);
+
+    append_lines(&path, &lines[..prompt]);
+    let (head, tail) = lines[prompt].split_at(lines[prompt].len() / 2);
+    append(&path, head.as_bytes());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(tailed(&daemon.live_db()), vec![], "a partial line was read");
+
+    append(&path, format!("{tail}\n").as_bytes());
+    let rows = wait_for_events(&daemon, 2);
+    assert_eq!(
+        shapes(&rows),
+        vec![shape("SESSION_START", None), shape("PROMPT_SUBMIT", None)]
+    );
+    append_lines(&path, &lines[prompt + 1..]);
+    let rows = wait_for_events(&daemon, 8);
+    assert_eq!(shapes(&rows), normal_multi_tool_shapes());
+    daemon.shutdown();
+}
+
+#[test]
+fn a_malformed_line_is_skipped_and_the_rest_is_read() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    let mut lines = transcript_lines("normal-multi-tool", &repo, &home);
+    let path = transcript_path(&claude, &repo, &session_of(&lines));
+    let prompt = prompt_index(&lines);
+    lines.insert(
+        prompt + 1,
+        "{\"type\": \"user\", \"sessionId\": tru".to_owned(),
+    );
+    lines.insert(
+        prompt + 1,
+        "{\"type\": \"user\", \"sessionId\": 7}".to_owned(),
+    );
+    lines.insert(prompt + 1, String::new());
+
+    append_lines(&path, &lines);
+
+    let rows = wait_for_events(&daemon, 8);
+    assert_eq!(shapes(&rows), normal_multi_tool_shapes());
+    daemon.shutdown();
+}
+
+#[test]
+fn a_replaced_file_is_reread_without_duplicates() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    let lines = transcript_lines("normal-multi-tool", &repo, &home);
+    let path = transcript_path(&claude, &repo, &session_of(&lines));
+    let prompt = prompt_index(&lines);
+    append_lines(&path, &lines[..=prompt]);
+    wait_for_events(&daemon, 2);
+
+    // A new file (new identity) renamed over the old one: read from 0.
+    let replacement = path.with_extension("tmp");
+    append_lines(&replacement, &lines);
+    fs::rename(&replacement, &path).expect("replace transcript");
+
+    let rows = wait_for_events(&daemon, 8);
+    assert_eq!(shapes(&rows), normal_multi_tool_shapes());
+    daemon.shutdown();
+}
+
+#[test]
+fn a_truncated_file_is_reread_from_the_start() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    let lines = transcript_lines("normal-multi-tool", &repo, &home);
+    let path = transcript_path(&claude, &repo, &session_of(&lines));
+    append_lines(&path, &lines);
+    wait_for_events(&daemon, 8);
+
+    // Same file, now shorter than the stored offset: one prompt of
+    // another session.
+    let other = transcript_lines("api-error-stop", &repo, &home);
+    let other_prompt = other[prompt_index(&other)].clone();
+    fs::write(&path, format!("{other_prompt}\n")).expect("truncate and rewrite");
+
+    let rows = wait_for_events(&daemon, 10);
+    let other_session = session_of(&other);
+    let new: Vec<Tailed> = rows
+        .into_iter()
+        .filter(|row| row.session_id.as_deref() == Some(other_session.as_str()))
+        .collect();
+    assert_eq!(
+        shapes(&new),
+        vec![shape("SESSION_START", None), shape("PROMPT_SUBMIT", None)]
+    );
+    daemon.shutdown();
+}
+
+#[test]
+fn a_file_that_existed_before_the_first_start_begins_at_its_end() {
+    let fixture = std::sync::Mutex::new(None);
+    let mut daemon = TestDaemon::start_with(|config| {
+        fast(config);
+        let home = config.home_dir.clone().expect("fake home");
+        let claude = claude_dir(&home);
+        let repo = repo_under(&home);
+        let lines = transcript_lines("normal-multi-tool", &repo, &home);
+        let path = transcript_path(&claude, &repo, &session_of(&lines));
+        let prompt = prompt_index(&lines);
+        // History from before Traction was installed.
+        append_lines(&path, &lines[..=prompt]);
+        *fixture.lock().unwrap() = Some((path, lines, prompt));
+    });
+    let (path, lines, prompt) = fixture.into_inner().unwrap().expect("fixture");
+
+    append_lines(&path, &lines[prompt + 1..]);
+
+    // Only what was appended after the start: the prompt came before it.
+    let rows = wait_for_events(&daemon, 7);
+    let mut expected = normal_multi_tool_shapes();
+    expected.remove(1);
+    assert_eq!(shapes(&rows), expected);
+    daemon.shutdown();
+}
+
+#[test]
+fn a_restart_resumes_from_saved_offsets_with_nothing_lost_or_duplicated() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    let lines = transcript_lines("normal-multi-tool", &repo, &home);
+    let path = transcript_path(&claude, &repo, &session_of(&lines));
+    // The prompt and the first tool call.
+    let split = lines
+        .iter()
+        .position(|line| line.contains("\"tool_result\""))
+        .expect("a tool result")
+        + 1;
+    append_lines(&path, &lines[..split]);
+    wait_for_events(&daemon, 4);
+
+    daemon.shutdown();
+    // Written while the daemon is down.
+    append_lines(&path, &lines[split..]);
+    let daemon = daemon.restart_with(fast);
+
+    let rows = wait_for_events(&daemon, 8);
+    assert_eq!(shapes(&rows), normal_multi_tool_shapes());
+    // A later restart reads nothing again.
+    let mut daemon = daemon.restart_with(fast);
+    std::thread::sleep(Duration::from_millis(500));
+    let db = daemon.shutdown_and_open_db();
+    assert_eq!(shapes(&tailed(&db)), normal_multi_tool_shapes());
+    // The resume point is the stored offset, not a reread from 0 absorbed
+    // by the deterministic IDs.
+    let stored: Vec<(String, i64)> = db
+        .prepare("SELECT path, \"offset\" FROM transcript_offset")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect()
+        })
+        .expect("offsets");
+    let size = i64::try_from(fs::metadata(&path).expect("transcript").len()).unwrap();
+    assert_eq!(stored, vec![(path_str(&path).to_owned(), size)]);
+}
+
+#[test]
+fn no_transcript_text_reaches_sqlite() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    for scenario in [
+        "normal-multi-tool",
+        "tool-failure",
+        "permission-request",
+        "subagent",
+        "cwd-change",
+        "interrupted-turn",
+        "api-error-stop",
+        "stop-track",
+    ] {
+        let lines = transcript_lines(scenario, &repo, &home);
+        append_lines(
+            &transcript_path(&claude, &repo, &session_of(&lines)),
+            &lines,
+        );
+    }
+    wait_for_events(&daemon, 40);
+
+    let db = daemon.shutdown_and_open_db();
+    assert_eq!(
+        common::sentinel_hits_in_tables(&db, "TRACTION-CANARY"),
+        0,
+        "a canary string reached SQLite"
+    );
+    drop(db);
+    common::assert_no_file_contains(daemon.data_dir(), "TRACTION-CANARY");
+}
