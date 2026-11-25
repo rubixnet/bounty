@@ -247,12 +247,31 @@ impl BusRequest {
     }
 
     pub fn send(self) -> BusResponse {
+        self.send_with(Delivery::Together)
+    }
+
+    /// Sends the body [`BODY_PAUSE`] after the head and fails unless every
+    /// byte was written and the daemon closed cleanly (no reset). The pause
+    /// lets the daemon refuse on headers alone before the body arrives, which
+    /// is when closing with the body unread makes the kernel reset the
+    /// connection. Callers on Windows lose already-received bytes on a reset,
+    /// so real Adapters rely on this.
+    pub fn send_expecting_clean_close(self) -> BusResponse {
+        self.send_with(Delivery::Paused)
+    }
+
+    /// Sends only the head (still declaring the body's `Content-Length`) and
+    /// keeps the connection open: a stalled caller.
+    pub fn send_withholding_body(self) -> BusResponse {
+        self.send_with(Delivery::Withheld)
+    }
+
+    fn send_with(self, delivery: Delivery) -> BusResponse {
         let mut raw = format!("{} {} HTTP/1.1\r\n", self.method, self.path).into_bytes();
         for (name, value) in &self.headers {
             raw.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
         raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
-        raw.extend_from_slice(&self.body);
 
         let response = match &self.endpoint {
             Endpoint::Tcp(addr) => {
@@ -260,7 +279,7 @@ impl BusRequest {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .expect("read timeout");
-                exchange(stream, &raw)
+                exchange(stream, &raw, &self.body, delivery)
             }
             #[cfg(unix)]
             Endpoint::Unix(path) => {
@@ -269,19 +288,80 @@ impl BusRequest {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .expect("read timeout");
-                exchange(stream, &raw)
+                exchange(stream, &raw, &self.body, delivery)
             }
         };
         BusResponse::parse(&response)
     }
 }
 
-/// Writes the raw request and reads until the daemon closes the connection.
-fn exchange(mut stream: impl Read + Write, raw: &[u8]) -> Vec<u8> {
-    stream.write_all(raw).expect("send request");
+/// How long [`BusRequest::send_expecting_clean_close`] waits between the
+/// head and the body, and again before reading. Well inside the daemon's
+/// drain window.
+const BODY_PAUSE: Duration = Duration::from_millis(10);
+
+/// How [`exchange`] sends the body, and so how it treats the close.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Head and body back to back. A failed write, or a reset after response
+    /// bytes arrived, is tolerated.
+    Together,
+    /// The body follows the head after [`BODY_PAUSE`]. Every byte must be
+    /// written and the read must end in a clean EOF.
+    Paused,
+    /// The body is never sent. Tolerates disconnects like `Together`.
+    Withheld,
+}
+
+/// Writes the request and reads until the daemon closes the connection.
+///
+/// The daemon may answer and close before reading the whole body (an early
+/// refusal), so unless [`Delivery::Paused`] demands a clean close, a failed
+/// write is not fatal and a reset after response bytes arrived ends the read
+/// instead of failing it. A reset before any response byte always fails the
+/// test: that is a lost response.
+fn exchange(
+    mut stream: impl Read + Write,
+    head: &[u8],
+    body: &[u8],
+    delivery: Delivery,
+) -> Vec<u8> {
+    let may_reset = delivery != Delivery::Paused;
+    let written = stream.write_all(head).and_then(|()| match delivery {
+        Delivery::Together => stream.write_all(body),
+        Delivery::Paused => {
+            std::thread::sleep(BODY_PAUSE);
+            stream.write_all(body)?;
+            // Let a reset, if the daemon sends one, arrive before reading.
+            std::thread::sleep(BODY_PAUSE);
+            Ok(())
+        }
+        Delivery::Withheld => Ok(()),
+    });
+    if let Err(error) = written {
+        assert!(may_reset && is_disconnect(&error), "send request: {error}");
+    }
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).expect("read response");
+    let mut chunk = [0; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if may_reset && is_disconnect(&error) && !response.is_empty() => break,
+            Err(error) => panic!("read response: {error}"),
+        }
+    }
     response
+}
+
+/// The peer closed or reset the connection.
+fn is_disconnect(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    matches!(
+        error.kind(),
+        BrokenPipe | ConnectionAborted | ConnectionReset
+    )
 }
 
 #[derive(Debug)]

@@ -269,6 +269,63 @@ fn oversized_body_without_a_token_returns_401() {
     assert_rejected(&response, 401, "unauthorized");
 }
 
+/// Bodies up to this size are read and discarded after an early refusal.
+/// Under the daemon's internal drain bound (64 KiB), with headroom.
+const WITHIN_DRAIN_BOUND: usize = 48 * 1024;
+
+/// An Adapter that sends its whole body before reading the reply must get the
+/// refusal and a clean close. If the daemon closed with the body unread, the
+/// kernel would reset the connection, and on Windows the caller would lose
+/// the already-received response.
+#[test]
+fn early_refusal_reads_the_unread_body_and_closes_without_a_reset() {
+    let daemon = TestDaemon::start();
+    let client = daemon.client();
+    let body = " ".repeat(WITHIN_DRAIN_BOUND);
+
+    for _ in 0..3 {
+        let no_token = client
+            .request("POST", "/v1/event")
+            .without_header("Authorization")
+            .body(&body)
+            .send_expecting_clean_close();
+        assert_rejected(&no_token, 401, "unauthorized");
+
+        let foreign_host = client
+            .request("POST", "/v1/event")
+            .header("Host", "evil.example")
+            .body(&body)
+            .send_expecting_clean_close();
+        assert_rejected(&foreign_host, 403, "forbidden_host");
+
+        let too_large = client
+            .request("POST", "/v1/event")
+            .body(&body)
+            .send_expecting_clean_close();
+        assert_rejected(&too_large, 413, "body_too_large");
+    }
+}
+
+/// The drain after a refusal is bounded in time: a caller that declares a
+/// body and never sends it still gets the refusal, promptly.
+#[test]
+fn early_refusal_answers_a_caller_that_withholds_its_body() {
+    let daemon = TestDaemon::start();
+    let started = std::time::Instant::now();
+
+    let response = daemon
+        .client()
+        .request("POST", "/v1/event")
+        .without_header("Authorization")
+        .body(" ".repeat(WITHIN_DRAIN_BOUND))
+        .send_withholding_body();
+
+    assert_rejected(&response, 401, "unauthorized");
+    // The helper's read timeout is 10 s; the daemon's drain window is far
+    // shorter. A generous bound keeps this steady on loaded CI runners.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
 // --- Validation: 400 with a reason code, never echoing input ----------------
 
 const MARKER: &str = "SECRET-PROMPT-TEXT-do-not-echo";

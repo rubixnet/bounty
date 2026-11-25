@@ -12,12 +12,19 @@
 //! 7. enqueue to the writer               -> `503` when full, else `202`
 //!
 //! Responses never echo the request: every body is a fixed reason code.
+//!
+//! A request refused before its body is fully read has the rest of the body
+//! read and discarded (bounded in bytes and time) before the reply. Closing
+//! with unread bytes makes the kernel reset the connection, and a reset can
+//! destroy the reply before the caller reads it (always on Windows).
 
 use std::convert::Infallible;
+use std::time::Duration;
 
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::body::{Bytes, Incoming};
-use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue, ORIGIN};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Body, Bytes, Incoming};
+use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, EXPECT, HOST, HeaderValue, ORIGIN};
+use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
 use traction_core::TractionEvent;
 
@@ -28,6 +35,12 @@ use crate::writer::WriterSender;
 pub const EVENT_PATH: &str = "/v1/event";
 /// Request bodies above this many bytes are refused with `413`.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
+
+/// After a refusal, at most this many body bytes in total are read (and
+/// dropped) before the reply. Discarded chunk by chunk, never buffered.
+const DRAIN_MAX_BYTES: usize = 64 * 1024;
+/// After a refusal, the rest of the body must arrive within this time.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub type BusResponse = Response<Full<Bytes>>;
 
@@ -112,18 +125,37 @@ impl Bus {
         request: Request<Incoming>,
         transport: Transport,
     ) -> Result<(), Rejection> {
-        if transport == Transport::Http {
-            self.check_host(&request)?;
+        let (parts, mut body) = request.into_parts();
+        let mut read = 0;
+        let result = self
+            .check_parts(&parts, &mut body, &mut read, transport)
+            .await;
+        if result.is_err() && !body.is_end_stream() && !expects_continue(&parts) {
+            discard_body(&mut body, read).await;
         }
-        self.check_origin(&request)?;
-        self.authorize(&request)?;
-        if request.uri().path() != EVENT_PATH {
+        result
+    }
+
+    /// The pipeline proper. `read` counts the body bytes consumed so far.
+    async fn check_parts(
+        &self,
+        parts: &Parts,
+        body: &mut Incoming,
+        read: &mut usize,
+        transport: Transport,
+    ) -> Result<(), Rejection> {
+        if transport == Transport::Http {
+            self.check_host(parts)?;
+        }
+        self.check_origin(parts)?;
+        self.authorize(parts)?;
+        if parts.uri.path() != EVENT_PATH {
             return Err(Rejection::NOT_FOUND);
         }
-        if request.method() != Method::POST {
+        if parts.method != Method::POST {
             return Err(Rejection::METHOD_NOT_ALLOWED);
         }
-        let body = read_capped_body(request.into_body()).await?;
+        let body = read_capped_body(body, read).await?;
         let event = TractionEvent::from_json(&body)
             .map_err(|error| Rejection::bad_request(error.code()))?;
         let row = EventRow::try_from(event)
@@ -133,14 +165,14 @@ impl Bus {
 
     /// Exactly one `Host` header naming loopback on the bound port. An
     /// absolute-form request target must name the same. Blocks DNS rebinding.
-    fn check_host(&self, request: &Request<Incoming>) -> Result<(), Rejection> {
-        let mut hosts = request.headers().get_all(HOST).iter();
+    fn check_host(&self, parts: &Parts) -> Result<(), Rejection> {
+        let mut hosts = parts.headers.get_all(HOST).iter();
         let allowed = match (hosts.next(), hosts.next()) {
             (Some(host), None) => self.is_own_authority(host.as_bytes()),
             _ => false,
         };
-        let target_ok = request
-            .uri()
+        let target_ok = parts
+            .uri
             .authority()
             .is_none_or(|authority| self.is_own_authority(authority.as_str().as_bytes()));
         if allowed && target_ok {
@@ -150,10 +182,10 @@ impl Bus {
         }
     }
 
-    /// No `Origin` (non-browser clients), or exactly the daemon's own
+    /// No `Origin` (non-browser callers), or exactly the daemon's own
     /// `http://` origin. Blocks browser CSRF, including `Origin: null`.
-    fn check_origin(&self, request: &Request<Incoming>) -> Result<(), Rejection> {
-        let mut origins = request.headers().get_all(ORIGIN).iter();
+    fn check_origin(&self, parts: &Parts) -> Result<(), Rejection> {
+        let mut origins = parts.headers.get_all(ORIGIN).iter();
         let allowed = match (origins.next(), origins.next()) {
             (None, _) => true,
             (Some(origin), None) => origin
@@ -182,9 +214,9 @@ impl Bus {
         port_ok && host_ok
     }
 
-    fn authorize(&self, request: &Request<Incoming>) -> Result<(), Rejection> {
-        let presented = request
-            .headers()
+    fn authorize(&self, parts: &Parts) -> Result<(), Rejection> {
+        let presented = parts
+            .headers
             .get(AUTHORIZATION)
             .and_then(|value| bearer_value(value.as_bytes()));
         match presented {
@@ -205,12 +237,42 @@ fn bearer_value(header: &[u8]) -> Option<&[u8]> {
         .then(|| rest.trim_ascii())
 }
 
-async fn read_capped_body(body: Incoming) -> Result<Bytes, Rejection> {
-    match Limited::new(body, MAX_BODY_BYTES).collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(error) if error.is::<LengthLimitError>() => Err(Rejection::BODY_TOO_LARGE),
-        Err(_) => Err(Rejection::UNREADABLE_BODY),
+/// Reads the whole body, refusing it once it passes [`MAX_BODY_BYTES`].
+/// Adds every byte read to `read`, so a refusal can drain the rest.
+async fn read_capped_body(body: &mut Incoming, read: &mut usize) -> Result<Vec<u8>, Rejection> {
+    let mut collected = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| Rejection::UNREADABLE_BODY)?;
+        if let Some(data) = frame.data_ref() {
+            *read += data.len();
+            if *read > MAX_BODY_BYTES {
+                return Err(Rejection::BODY_TOO_LARGE);
+            }
+            collected.extend_from_slice(data);
+        }
     }
+    Ok(collected)
+}
+
+/// Reads and drops the rest of a refused request's body until it ends, the
+/// total read reaches [`DRAIN_MAX_BYTES`], it fails, or [`DRAIN_TIMEOUT`]
+/// passes. Memory stays bounded: each chunk is dropped as it arrives.
+async fn discard_body(body: &mut Incoming, mut read: usize) {
+    let drain = async {
+        while read < DRAIN_MAX_BYTES {
+            match body.frame().await {
+                Some(Ok(frame)) => read += frame.data_ref().map_or(0, Bytes::len),
+                Some(Err(_)) | None => break,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, drain).await;
+}
+
+/// The caller waits for `100 Continue` before sending a body. Reading the
+/// body would invite it, so a refused request of this kind is not drained.
+fn expects_continue(parts: &Parts) -> bool {
+    parts.headers.contains_key(EXPECT)
 }
 
 /// A JSON response `{"<key>":"<code>"}` built only from static strings.
