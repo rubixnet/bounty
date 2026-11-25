@@ -5,12 +5,14 @@
 
 mod canonical;
 mod event;
+mod project_id;
 mod validate;
 
 pub use canonical::{CanonicalJsonError, canonical_json};
 pub use event::{
     EndReason, EventType, HarnessId, MetricsOnly, NetworkClass, SCHEMA_VERSION, TractionEvent,
 };
+pub use project_id::{DEVICE_SECRET_LEN, dir_project_id, git_project_id, normalize_origin};
 pub use validate::{
     EventError, MAX_CWD_LEN, MAX_IDENTIFIER_LEN, MAX_SESSION_ID_LEN, ValidationError,
 };

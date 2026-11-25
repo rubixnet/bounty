@@ -4,10 +4,10 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `sha2` added to core; derivation functions public and documented.
-- [ ] Golden IDs pinned for fixed inputs (root commit, origin, secret, path).
-- [ ] Origin normalization goldens: `https://github.com/A/B.git`, `git@github.com:A/B`, `ssh://git@github.com:22/A/B/` give the same ID; host lowercased; userinfo/port/scheme/trailing `.git` or `/` stripped.
-- [ ] Different secrets or paths give different `dir:` IDs; empty origin handled.
-- [ ] Formulas recorded in `docs/protocol.md` §2a (coordinate with 01 if it already landed).
+- [x] `sha2` added to core; derivation functions public and documented.
+- [x] Golden IDs pinned for fixed inputs (root commit, origin, secret, path).
+- [x] Origin normalization goldens: `https://github.com/A/B.git`, `git@github.com:A/B`, `ssh://git@github.com:22/A/B/` give the same ID; host lowercased; userinfo/port/scheme/trailing `.git` or `/` stripped.
+- [x] Different secrets or paths give different `dir:` IDs; empty origin handled.
+- [x] Formulas recorded in `docs/protocol.md` §2a (coordinate with 01 if it already landed).
