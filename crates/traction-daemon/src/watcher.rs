@@ -784,7 +784,7 @@ impl Worker {
         };
         let mutation = TractionEvent {
             schema_version: SCHEMA_VERSION,
-            event_id: uuid_v7(decided.first_ms),
+            event_id: event_id(decided.first_ms),
             timestamp_ms: decided.first_ms,
             harness_id: None,
             session_id: None,
@@ -941,28 +941,16 @@ fn new_folder(table: &mut WatchTable, index: usize, path: &Path, found: Option<&
     }
 }
 
-/// A UUIDv7 for `ms` (RFC 9562): 48-bit milliseconds, version 7, the
-/// variant bits, and random bits elsewhere.
-fn uuid_v7(ms: u64) -> String {
-    let mut bytes = [0u8; 16];
-    if getrandom::fill(&mut bytes[6..]).is_err() {
+/// A fresh event ID for `ms`: [`traction_core::uuid_v7`] with OS randomness.
+fn event_id(ms: u64) -> String {
+    let mut random = [0u8; 10];
+    if getrandom::fill(&mut random).is_err() {
         // No OS randomness: still unique enough within one daemon.
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
-        bytes[8..].copy_from_slice(&n.to_be_bytes());
+        random[2..].copy_from_slice(&n.to_be_bytes());
     }
-    bytes[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    )
+    traction_core::uuid_v7(ms, random)
 }
 
 /// macOS: FSEvents refuses (or, past the edge, corrupts descriptors) beyond
@@ -994,14 +982,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uuid_v7_carries_the_time_version_and_variant() {
-        let id = uuid_v7(0x0192_3456_789a);
-        assert!(id.starts_with("01923456-789a-7"), "{id}");
-        assert!(
-            matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
-            "{id}"
-        );
-        assert_ne!(uuid_v7(1), uuid_v7(1));
+    fn event_ids_at_the_same_millisecond_differ() {
+        assert_ne!(event_id(1), event_id(1));
     }
 
     fn project(id: &str, root: &Path) -> RegisteredProject {

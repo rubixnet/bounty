@@ -228,6 +228,27 @@ fn is_uuid(value: &str) -> bool {
             .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// A UUIDv7 (RFC 9562) for `unix_ms`: the 48-bit millisecond timestamp,
+/// version 7, the variant bits, and `random` in the remaining bits (the
+/// caller supplies the randomness; this crate does no I/O). Always passes
+/// the `event_id` check.
+pub fn uuid_v7(unix_ms: u64, random: [u8; 10]) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..6].copy_from_slice(&unix_ms.to_be_bytes()[2..]);
+    bytes[6..].copy_from_slice(&random);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 /// A bounded session-style ID: letters, digits, `.`, `_`, `-`, `:`.
 fn is_session_id(value: &str) -> bool {
     (1..=MAX_SESSION_ID_LEN).contains(&value.len())
