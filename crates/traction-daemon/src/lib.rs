@@ -6,8 +6,11 @@
 
 mod attribution;
 mod bus;
+mod claude_code;
 mod config;
+mod content_metrics;
 mod daemon;
+mod event_id;
 mod exclusions;
 mod fsutil;
 mod git;
@@ -25,6 +28,7 @@ mod watcher;
 mod writer;
 
 pub use bus::{EVENT_PATH, MAX_BODY_BYTES, PROJECT_PATH};
+pub use claude_code::hook::{HOOK_PATH as CLAUDE_CODE_HOOK_PATH, MAX_HOOK_BODY_BYTES};
 pub use config::{
     ConfigError, DEFAULT_COMMIT_INTERVAL, DEFAULT_GIT_PROGRAM, DEFAULT_HTTP_PORT,
     DEFAULT_MAX_BATCH, DEFAULT_WATCHER_PENDING_CAP, DEFAULT_WRITER_QUEUE_CAPACITY, DaemonConfig,

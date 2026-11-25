@@ -6,8 +6,10 @@
 //! 1. `Host` allowlist (HTTP only)        -> `403 forbidden_host`
 //! 2. `Origin` allowlist                  -> `403 forbidden_origin`
 //! 3. bearer token                        -> `401`
-//! 4. route (`POST /v1/event`, `POST /v1/project`) -> `404`, or `405`
-//! 5. body size cap                       -> `413`
+//! 4. route (`POST /v1/event`, `POST /v1/project`,
+//!    `POST /v1/hooks/claude-code`)       -> `404`, or `405`
+//! 5. body size cap                       -> `413` (8 MiB for the hook
+//!    route, [`MAX_BODY_BYTES`] otherwise)
 //!
 //! Then, for `/v1/event`:
 //!
@@ -25,6 +27,15 @@
 //! 8. the Router registers it              -> `422` with a reason code, `503`
 //!    when busy, else `200 {"project_id": "..."}`
 //!
+//! And for `/v1/hooks/claude-code` (a Claude Code native hook payload):
+//!
+//! 6. map to at most one content-free Traction Event (or a `DirectoryAdded`
+//!    registration); the body buffer is dropped right after
+//! 7. queue it to the Project Router, never waiting for an answer
+//! 8. always `200 {}`: an unusable payload, a hook outside the mapping and
+//!    a full Router queue (the event is dropped and counted in the log)
+//!    all get the same non-blocking answer
+//!
 //! Responses never echo the request: every body is a fixed reason code.
 //!
 //! A request refused before its body is fully read has the rest of the body
@@ -34,7 +45,8 @@
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Incoming};
@@ -44,6 +56,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
 use traction_core::{AttributionSource, EventType, MAX_CWD_LEN, TractionEvent};
 
+use crate::claude_code::hook::{self, HOOK_PATH, HookAction, MAX_HOOK_BODY_BYTES};
+use crate::log;
 use crate::router::RouterSender;
 use crate::storage::EventRow;
 use crate::token::BusToken;
@@ -71,6 +85,8 @@ pub struct Bus {
     /// The bound loopback HTTP port: the only port allowed in `Host` and
     /// `Origin`.
     port: u16,
+    /// Hook events dropped because the Router queue was full.
+    dropped_hooks: AtomicU64,
 }
 
 /// Which listener a request arrived on. Only loopback HTTP checks `Host`: a
@@ -119,6 +135,8 @@ enum Reply {
     Accepted,
     /// `200`: the path's Project is registered under this ID.
     Registered(String),
+    /// `200 {}`: a Claude Code hook, handled or not. Never blocks Claude.
+    Hook,
 }
 
 /// The `/v1/project` body.
@@ -134,6 +152,7 @@ impl Bus {
             token,
             router,
             port,
+            dropped_hooks: AtomicU64::new(0),
         }
     }
 
@@ -146,6 +165,7 @@ impl Bus {
         Ok(match self.check(request, transport).await {
             Ok(Reply::Accepted) => respond(StatusCode::ACCEPTED, "status", "accepted"),
             Ok(Reply::Registered(project_id)) => respond_registered(&project_id),
+            Ok(Reply::Hook) => respond_json(StatusCode::OK, "{}".to_owned()),
             Err(rejection) => {
                 let mut response = respond(rejection.status, "error", rejection.code);
                 if rejection == Rejection::METHOD_NOT_ALLOWED {
@@ -188,13 +208,20 @@ impl Bus {
         self.check_origin(parts)?;
         self.authorize(parts)?;
         let path = parts.uri.path();
-        if path != EVENT_PATH && path != PROJECT_PATH {
+        if path != EVENT_PATH && path != PROJECT_PATH && path != HOOK_PATH {
             return Err(Rejection::NOT_FOUND);
         }
         if parts.method != Method::POST {
             return Err(Rejection::METHOD_NOT_ALLOWED);
         }
-        let body = read_capped_body(body, read).await?;
+        if path == HOOK_PATH {
+            let body = read_capped_body(body, read, MAX_HOOK_BODY_BYTES).await?;
+            let action = hook::map_hook(&body, now_ms());
+            drop(body);
+            self.queue_hook(action);
+            return Ok(Reply::Hook);
+        }
+        let body = read_capped_body(body, read, MAX_BODY_BYTES).await?;
         if path == PROJECT_PATH {
             return self.register(&body).await;
         }
@@ -206,6 +233,28 @@ impl Bus {
             .try_route(event)
             .map(|()| Reply::Accepted)
             .map_err(|_| Rejection::BUSY)
+    }
+
+    /// Queues what a Claude Code hook asked for, without waiting: the
+    /// answer goes back to Claude as soon as this returns.
+    fn queue_hook(&self, action: HookAction) {
+        let queued = match action {
+            HookAction::Nothing => return,
+            HookAction::Event(event) => self.router.try_route(*event),
+            // The answer (or refusal) is not waited for: a hook never
+            // blocks on a registration.
+            HookAction::AddDirectory(path) => match registration_path(&path) {
+                Some(path) => self.router.try_register(path).map(drop),
+                None => return,
+            },
+        };
+        if queued.is_err() {
+            let count = self.dropped_hooks.fetch_add(1, Ordering::Relaxed) + 1;
+            log::warn_counted(
+                "dropped a Claude Code hook event: the Project Router queue is full",
+                count,
+            );
+        }
     }
 
     /// `/v1/project`: asks the Router to register the body's path.
@@ -330,15 +379,19 @@ fn bearer_value(header: &[u8]) -> Option<&[u8]> {
         .then(|| rest.trim_ascii())
 }
 
-/// Reads the whole body, refusing it once it passes [`MAX_BODY_BYTES`].
-/// Adds every byte read to `read`, so a refusal can drain the rest.
-async fn read_capped_body(body: &mut Incoming, read: &mut usize) -> Result<Vec<u8>, Rejection> {
+/// Reads the whole body, refusing it once it passes `limit` bytes. Adds
+/// every byte read to `read`, so a refusal can drain the rest.
+async fn read_capped_body(
+    body: &mut Incoming,
+    read: &mut usize,
+    limit: usize,
+) -> Result<Vec<u8>, Rejection> {
     let mut collected = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| Rejection::UNREADABLE_BODY)?;
         if let Some(data) = frame.data_ref() {
             *read += data.len();
-            if *read > MAX_BODY_BYTES {
+            if *read > limit {
                 return Err(Rejection::BODY_TOO_LARGE);
             }
             collected.extend_from_slice(data);
@@ -369,27 +422,35 @@ fn expects_continue(parts: &Parts) -> bool {
 }
 
 /// A registration path: absolute for this OS, bounded, no control chars.
-fn registration_path(path: &str) -> Option<PathBuf> {
-    (Path::new(path).is_absolute()
-        && path.len() <= MAX_CWD_LEN
-        && !path.chars().any(char::is_control))
-    .then(|| PathBuf::from(path))
+fn registration_path(path: impl AsRef<Path>) -> Option<PathBuf> {
+    let path = path.as_ref();
+    let text = path.to_str()?;
+    (path.is_absolute() && text.len() <= MAX_CWD_LEN && !text.chars().any(char::is_control))
+        .then(|| path.to_path_buf())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// `200 {"project_id":"<id>"}`. The ID is daemon-derived (`git:`/`dir:`
 /// plus hex), never request input.
 fn respond_registered(project_id: &str) -> BusResponse {
-    let body = format!("{{\"project_id\":\"{project_id}\"}}");
-    let mut response = Response::new(Full::new(Bytes::from(body)));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response
+    respond_json(
+        StatusCode::OK,
+        format!("{{\"project_id\":\"{project_id}\"}}"),
+    )
 }
 
 /// A JSON response `{"<key>":"<code>"}` built only from static strings.
 fn respond(status: StatusCode, key: &'static str, code: &'static str) -> BusResponse {
-    let body = format!("{{\"{key}\":\"{code}\"}}");
+    respond_json(status, format!("{{\"{key}\":\"{code}\"}}"))
+}
+
+/// A JSON response with `body`, which never holds request data.
+fn respond_json(status: StatusCode, body: String) -> BusResponse {
     let mut response = Response::new(Full::new(Bytes::from(body)));
     *response.status_mut() = status;
     response
