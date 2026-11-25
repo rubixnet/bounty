@@ -7,9 +7,11 @@
 //! span for a session is `[first_hook_ms, end]`, where `end` is the run's
 //! `last_alive_ms` (the last commit before it stopped) or, for the current
 //! run, open-ended. A tailed record whose timestamp falls in any span is a
-//! duplicate. Both ends are widened by [`HOOK_COVERAGE_SKEW`], because hook
-//! timestamps are daemon receive times while transcript timestamps are
-//! Claude Code's own write times.
+//! duplicate. Only the start is widened by [`HOOK_COVERAGE_SKEW`], because
+//! hook timestamps are daemon receive times while transcript timestamps are
+//! Claude Code's own write times. The end is not: a record stamped after
+//! the run's last commit was written while the daemon was down and must be
+//! emitted.
 //!
 //! The rule trusts that once a session's hooks authenticate in a run they
 //! keep delivering for the rest of that run; a hook dropped mid-run is lost,
@@ -97,7 +99,9 @@ impl HookCoverage {
                 return false;
             }
             match self.ended.get(&run) {
-                Some(&last_alive_ms) => ts_ms <= last_alive_ms.saturating_add(skew),
+                // Not widened: a record after the last commit was written
+                // while the daemon was down, so no hook can have covered it.
+                Some(&last_alive_ms) => ts_ms <= last_alive_ms,
                 // The current run: open-ended.
                 None => true,
             }
@@ -138,15 +142,18 @@ mod tests {
     }
 
     #[test]
-    fn an_earlier_run_covers_its_span_widened_by_the_skew_at_both_ends() {
+    fn an_earlier_run_covers_its_span_widened_by_the_skew_at_the_start_only() {
         let coverage = earlier_run();
         let skew = skew_ms();
         let covers = |ts| coverage.covers(CLAUDE, "s", ts);
         assert!(covers(15_000));
         assert!(covers(10_000 - skew), "a skew before the first hook");
         assert!(!covers(10_000 - skew - 1), "before the skewed start");
-        assert!(covers(20_000 + skew), "a skew after the last commit");
-        assert!(!covers(20_000 + skew + 1), "the daemon was down");
+        assert!(covers(20_000), "the last commit itself");
+        assert!(
+            !covers(20_000 + 1),
+            "just after the last commit: daemon down"
+        );
         assert!(!coverage.covers(CLAUDE, "other", 15_000));
         assert!(!coverage.covers(HarnessId::OpenCode, "s", 15_000));
     }

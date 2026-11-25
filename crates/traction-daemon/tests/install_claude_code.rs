@@ -7,7 +7,8 @@
 //! `--settings` and `--claude-program` (or a temp `CLAUDE_CONFIG_DIR`),
 //! points `HOME`/`USERPROFILE`/`XDG_CONFIG_HOME` at a temp home so default
 //! profiles resolve inside it, and on Windows redirects the per-user env var
-//! to a scratch `HKCU` key (`--windows-env-key`) that is deleted afterwards.
+//! to a scratch `HKCU` key (the test-only `--windows-env-key`) that is
+//! deleted afterwards, with its `HKCU\Software\TractionTest` parent once empty.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -56,12 +57,23 @@ struct Setup {
     env_key: String,
 }
 
+/// The scratch parent key every test's `HKCU` subkey sits under.
+#[cfg(windows)]
+const TEST_ENV_PARENT: &str = "Software\\TractionTest";
+
 #[cfg(windows)]
 impl Drop for Setup {
     fn drop(&mut self) {
         let _ = Command::new("reg")
             .args(["delete", &format!("HKCU\\{}", self.env_key), "/f"])
             .output();
+        // Then the parent, once no other test's subkey is left under it.
+        // `RegDeleteKeyW` refuses a key that still has subkeys, so tests
+        // running in parallel never lose theirs (unlike `reg delete /f`).
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyW};
+        let parent: Vec<u16> = TEST_ENV_PARENT.encode_utf16().chain([0]).collect();
+        // SAFETY: `parent` is a live, NUL-terminated UTF-16 buffer.
+        let _ = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, parent.as_ptr()) };
     }
 }
 
@@ -78,7 +90,7 @@ impl Setup {
         Self {
             #[cfg(windows)]
             env_key: format!(
-                "Software\\TractionTest\\{}",
+                "{TEST_ENV_PARENT}\\{}",
                 dir.path().file_name().unwrap().to_string_lossy()
             ),
             dir,
@@ -468,6 +480,37 @@ fn the_original_is_backed_up_once_and_never_overwritten() {
 
     assert_eq!(fs::read_to_string(setup.backup()).unwrap(), USER_SETTINGS);
     assert_eq!(setup.settings_json()["model"], "sonnet");
+}
+
+/// A dotfile manager's symlinked `settings.json` stays a link: the merge
+/// lands in its target, which keeps its permissions.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_settings_file_stays_a_link_and_its_target_gets_the_merge() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let setup = Setup::new();
+    let target = setup.dir.path().join("dotfiles").join("settings.json");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, USER_SETTINGS).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::create_dir_all(setup.settings().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, setup.settings()).unwrap();
+
+    setup.install_ok();
+
+    let link = fs::symlink_metadata(setup.settings()).unwrap();
+    assert!(
+        link.file_type().is_symlink(),
+        "settings.json is still a link"
+    );
+    assert_eq!(fs::read_link(setup.settings()).unwrap(), target);
+    let merged: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(traction_entries(&merged, "SessionStart").len(), 1);
+    assert_eq!(merged["model"], "opus");
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "the target keeps its permissions");
+    assert_eq!(fs::read_to_string(setup.backup()).unwrap(), USER_SETTINGS);
 }
 
 #[test]

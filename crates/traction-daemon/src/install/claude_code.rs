@@ -13,7 +13,7 @@
 //!    warning: the profiles still cover new terminals).
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::commands;
 use super::profile::{self, ProfileError};
@@ -66,6 +66,9 @@ impl ClaudeCodeInstall {
 
     /// Runs every install step.
     pub fn run(&self) -> Result<InstallReport, InstallError> {
+        // Checked first, so a bad path writes nothing.
+        #[cfg_attr(not(windows), allow(unused_variables))]
+        let data_dir = self.data_dir()?;
         let version = version::check(&self.claude_program);
         let outcome = settings::install(&self.settings, self.port).map_err(|error| {
             InstallError::Settings {
@@ -107,10 +110,6 @@ impl ClaudeCodeInstall {
 
         #[cfg(windows)]
         let user_env = {
-            let data_dir = self
-                .token_file
-                .parent()
-                .unwrap_or(std::path::Path::new("."));
             match super::user_env::set_token(data_dir, &self.windows_env_key) {
                 Ok(()) => Some(format!(
                     "HKCU\\{}\\{}",
@@ -139,6 +138,15 @@ impl ClaudeCodeInstall {
             user_env,
             warnings,
         })
+    }
+
+    /// The token file's folder (the daemon's data folder); a path with no
+    /// folder is an error rather than the current directory.
+    fn data_dir(&self) -> Result<&Path, InstallError> {
+        self.token_file
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .ok_or_else(|| InstallError::TokenFileWithoutFolder(self.token_file.clone()))
     }
 
     /// The Claude `commands` folder: next to `settings.json`, which by
@@ -216,6 +224,9 @@ pub enum InstallError {
     NoHomeDir,
     /// `settings.json` was refused or could not be written; it is untouched.
     Settings { path: PathBuf, error: SettingsError },
+    /// The token file path names no folder (the daemon's data folder), so
+    /// nothing was written rather than guessing the current directory.
+    TokenFileWithoutFolder(PathBuf),
     /// A command file or profile could not be written.
     Write {
         path: PathBuf,
@@ -236,8 +247,42 @@ impl fmt::Display for InstallError {
                 path.display()
             ),
             Self::Write { path, error } => write!(f, "cannot write {}: {error}", path.display()),
+            Self::TokenFileWithoutFolder(path) => write!(
+                f,
+                "the token file {} names no folder; give its full path",
+                path.display()
+            ),
         }
     }
 }
 
 impl std::error::Error for InstallError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_token_file_without_a_folder_stops_the_install_before_any_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let settings = dir.path().join("settings.json");
+        let profile = dir.path().join(".zshrc");
+        let install = ClaudeCodeInstall {
+            settings: settings.clone(),
+            claude_program: dir.path().join("no-claude"),
+            port: DEFAULT_HTTP_PORT,
+            profiles: vec![profile.clone()],
+            token_file: PathBuf::from(TOKEN_FILE),
+            #[cfg(windows)]
+            windows_env_key: String::from("Software\\TractionTest\\unused"),
+        };
+
+        let error = install.run().expect_err("a parentless token path");
+        assert!(
+            matches!(&error, InstallError::TokenFileWithoutFolder(path) if path.as_path() == Path::new(TOKEN_FILE)),
+            "{error}"
+        );
+        assert!(!settings.exists(), "nothing was written");
+        assert!(!profile.exists());
+    }
+}

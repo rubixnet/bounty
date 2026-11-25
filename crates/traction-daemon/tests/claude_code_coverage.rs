@@ -223,7 +223,7 @@ fn a_span_the_daemon_was_down_for_is_filled_in_from_the_transcript() {
     session_start(&daemon, session, &repo);
     user_prompt(&daemon, session, &repo);
     let hooked = wait_for_stored(&daemon.live_db(), session, 2);
-    let seen_by_hooks = now_ms();
+    let seen_by_hooks = hooked[1].2;
     daemon.shutdown();
     let after_stop = now_ms();
 
@@ -383,5 +383,43 @@ fn tailed_records_inside_a_paused_span_are_not_stored() {
         .map(|(_, _, ts)| ts)
         .collect();
     assert_eq!(prompts, vec![resumed_at]);
+    daemon.shutdown();
+}
+
+#[test]
+fn a_record_just_after_the_last_commit_is_filled_in_from_the_transcript() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let repo = repo_under(&home);
+    let session = "2f1c8a54-0000-4000-8000-000000000009";
+
+    session_start(&daemon, session, &repo);
+    let hooked = wait_for_stored(&daemon.live_db(), session, 1);
+    let last_alive_ms: i64 = daemon
+        .shutdown_and_open_db()
+        .query_row("SELECT last_alive_ms FROM daemon_run", [], |row| row.get(0))
+        .expect("the run's last commit");
+
+    // The last commit itself is covered; one millisecond later the daemon
+    // was down, so no hook can have seen it (the end is not widened).
+    let path = transcript_path(&home, session);
+    append_lines(
+        &path,
+        &[
+            prompt_line(session, 1, last_alive_ms, &repo),
+            prompt_line(session, 2, last_alive_ms + 1, &repo),
+        ],
+    );
+    let mut daemon = daemon.restart_with(fast);
+    let db = daemon.live_db();
+    wait_for_tailer(&db, &path);
+
+    assert_eq!(
+        stored(&db, session),
+        vec![
+            row("SESSION_START", "harness_hook", hooked[0].2),
+            row("PROMPT_SUBMIT", "harness_log", last_alive_ms + 1),
+        ]
+    );
     daemon.shutdown();
 }
