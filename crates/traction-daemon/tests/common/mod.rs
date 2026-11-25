@@ -119,6 +119,15 @@ pub fn try_start_on(
     traction_daemon::start(config)
 }
 
+/// Opens `<data dir>/traction.db` read-only (`mode=ro`).
+pub fn open_db_read_only(data_dir: &Path) -> Connection {
+    Connection::open_with_flags(
+        data_dir.join("traction.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("read-only database")
+}
+
 pub fn test_config(data_dir: &Path) -> DaemonConfig {
     let mut config = DaemonConfig::new(data_dir.to_path_buf());
     config.http_port = 0;
@@ -134,6 +143,11 @@ pub struct BusClient {
 }
 
 impl BusClient {
+    /// A client for a daemon started outside [`TestDaemon`] (e.g. the binary).
+    pub fn new(addr: SocketAddr, token: String) -> Self {
+        Self { addr, token }
+    }
+
     pub fn token(&self) -> &str {
         &self.token
     }
