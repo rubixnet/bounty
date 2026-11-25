@@ -10,12 +10,18 @@
 //! Options (mainly so tests stay hermetic): `--data-dir <path>`,
 //! `--port <n>` (`0` = ephemeral) and, on macOS/Linux, `--socket-path <path>`
 //! (default `$XDG_RUNTIME_DIR/traction.sock`, else `<data dir>/daemon.sock`).
+//!
+//! Subcommands:
+//! - `install claude-code [--settings <path>] [--claude-program <path>]
+//!   [--port <n>]` merges Traction's hooks into Claude Code's
+//!   `settings.json` (default `$CLAUDE_CONFIG_DIR/settings.json`, else
+//!   `~/.claude/settings.json`), prints a summary to stdout and exits.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use traction_daemon::DaemonConfig;
+use traction_daemon::{ClaudeCodeInstall, DaemonConfig};
 
 fn main() -> ExitCode {
     match run() {
@@ -28,7 +34,12 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let config = config_from_args(std::env::args_os().skip(1))?;
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().and_then(|arg| arg.to_str()) == Some("install") {
+        args.next();
+        return install(args);
+    }
+    let config = config_from_args(args)?;
 
     // Signals are registered before `start` so a signal that arrives during
     // startup is not lost (and does not kill the process mid-start).
@@ -87,6 +98,45 @@ fn config_from_args(mut args: impl Iterator<Item = OsString>) -> Result<DaemonCo
     }
     Ok(config)
 }
+
+/// `install <harness> [options]`.
+fn install(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
+    match args.next().as_ref().and_then(|arg| arg.to_str()) {
+        Some("claude-code") => {}
+        _ => return Err(INSTALL_USAGE.to_owned()),
+    }
+    let mut install = ClaudeCodeInstall::for_user().map_err(|e| e.to_string())?;
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--settings") => {
+                install.settings = PathBuf::from(args.next().ok_or("--settings needs a path")?);
+            }
+            Some("--claude-program") => {
+                install.claude_program =
+                    PathBuf::from(args.next().ok_or("--claude-program needs a path")?);
+            }
+            Some("--port") => {
+                install.port = args
+                    .next()
+                    .as_ref()
+                    .and_then(|v| v.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&port| port != 0)
+                    .ok_or("--port needs a number from 1 to 65535")?;
+            }
+            _ => return Err(INSTALL_USAGE.to_owned()),
+        }
+    }
+    let report = install.run().map_err(|e| e.to_string())?;
+    for warning in &report.warnings {
+        eprintln!("traction-daemon: warning: {warning}");
+    }
+    print!("{report}");
+    Ok(())
+}
+
+const INSTALL_USAGE: &str = "usage: traction-daemon install claude-code \
+    [--settings <path>] [--claude-program <path>] [--port <n>]";
 
 #[cfg(unix)]
 const USAGE: &str = "unknown argument (use --data-dir <path>, --port <n>, --socket-path <path>)";

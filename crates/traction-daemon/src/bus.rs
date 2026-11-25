@@ -32,9 +32,12 @@
 //! 6. map to at most one content-free Traction Event (or a `DirectoryAdded`
 //!    registration); the body buffer is dropped right after
 //! 7. queue it to the Project Router, never waiting for an answer
-//! 8. always `200 {}`: an unusable payload, a hook outside the mapping and
-//!    a full Router queue (the event is dropped and counted in the log)
-//!    all get the same non-blocking answer
+//! 8. `200 {}`: an unusable payload, a hook outside the mapping and a full
+//!    Router queue (the event is dropped and counted in the log) all get
+//!    the same non-blocking answer. The one exception is a `UserPromptSubmit`
+//!    that is exactly `/stop-track` or `/resume-track` (Session Pause): it
+//!    gets `200 {"decision":"block","reason":"..."}`, so the command never
+//!    reaches the model, and stores no event
 //!
 //! Responses never echo the request: every body is a fixed reason code.
 //!
@@ -54,11 +57,12 @@ use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, EXPECT, HOST, HeaderValu
 use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
-use traction_core::{AttributionSource, EventType, MAX_CWD_LEN, TractionEvent};
+use traction_core::{AttributionSource, EventType, HarnessId, MAX_CWD_LEN, TractionEvent};
 
 use crate::claude_code::hook::{self, HOOK_PATH, HookAction, MAX_HOOK_BODY_BYTES};
+use crate::claude_code::pause::BUSY_REASON;
 use crate::log;
-use crate::router::RouterSender;
+use crate::router::{Pause, RouterSender};
 use crate::storage::EventRow;
 use crate::token::BusToken;
 
@@ -137,6 +141,9 @@ enum Reply {
     Registered(String),
     /// `200 {}`: a Claude Code hook, handled or not. Never blocks Claude.
     Hook,
+    /// `200 {"decision":"block","reason":<reason>}`: a Session Pause
+    /// command, kept from the model.
+    BlockHook(&'static str),
 }
 
 /// The `/v1/project` body.
@@ -166,6 +173,10 @@ impl Bus {
             Ok(Reply::Accepted) => respond(StatusCode::ACCEPTED, "status", "accepted"),
             Ok(Reply::Registered(project_id)) => respond_registered(&project_id),
             Ok(Reply::Hook) => respond_json(StatusCode::OK, "{}".to_owned()),
+            Ok(Reply::BlockHook(reason)) => respond_json(
+                StatusCode::OK,
+                serde_json::json!({"decision": "block", "reason": reason}).to_string(),
+            ),
             Err(rejection) => {
                 let mut response = respond(rejection.status, "error", rejection.code);
                 if rejection == Rejection::METHOD_NOT_ALLOWED {
@@ -218,8 +229,7 @@ impl Bus {
             let body = read_capped_body(body, read, MAX_HOOK_BODY_BYTES).await?;
             let action = hook::map_hook(&body, now_ms());
             drop(body);
-            self.queue_hook(action);
-            return Ok(Reply::Hook);
+            return Ok(self.queue_hook(action));
         }
         let body = read_capped_body(body, read, MAX_BODY_BYTES).await?;
         if path == PROJECT_PATH {
@@ -237,15 +247,36 @@ impl Bus {
 
     /// Queues what a Claude Code hook asked for, without waiting: the
     /// answer goes back to Claude as soon as this returns.
-    fn queue_hook(&self, action: HookAction) {
+    fn queue_hook(&self, action: HookAction) -> Reply {
         let queued = match action {
-            HookAction::Nothing => return,
+            HookAction::Nothing => return Reply::Hook,
+            // The answer does not depend on the session's state (a repeat
+            // gives the same one), so it never waits for the Router.
+            HookAction::Pause {
+                command,
+                session_id,
+                at_ms,
+            } => {
+                let pause = Pause {
+                    action: command.action,
+                    harness: HarnessId::ClaudeCode,
+                    session_id,
+                    at_ms,
+                };
+                return match self.router.try_pause(pause) {
+                    Ok(()) => Reply::BlockHook(command.reason),
+                    Err(_) => {
+                        log::warn("could not queue a Session Pause command: the Router is full");
+                        Reply::BlockHook(BUSY_REASON)
+                    }
+                };
+            }
             HookAction::Event(event) => self.router.try_route(*event),
             // The answer (or refusal) is not waited for: a hook never
             // blocks on a registration.
             HookAction::AddDirectory(path) => match registration_path(&path) {
                 Some(path) => self.router.try_register(path).map(drop),
-                None => return,
+                None => return Reply::Hook,
             },
         };
         if queued.is_err() {
@@ -255,6 +286,7 @@ impl Bus {
                 count,
             );
         }
+        Reply::Hook
     }
 
     /// `/v1/project`: asks the Router to register the body's path.

@@ -216,7 +216,7 @@ pub const MAX_STDOUT_BYTES: u64 = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug)]
-enum RunError {
+pub(crate) enum RunError {
     /// The child outlived the timeout; it was killed and reaped.
     TimedOut,
     /// The child exited non-zero, or waiting on it failed.
@@ -230,7 +230,7 @@ enum RunError {
 /// [`MAX_STDOUT_BYTES`] (the pipe is dropped past the cap). That thread is
 /// never joined: its result is awaited only until the same deadline, so a
 /// grandchild holding the pipe open can never hang the caller.
-fn wait_bounded(mut child: Child, timeout: Duration) -> Result<Vec<u8>, RunError> {
+pub(crate) fn wait_bounded(mut child: Child, timeout: Duration) -> Result<Vec<u8>, RunError> {
     let deadline = Instant::now() + timeout;
     let (tx, rx) = mpsc::channel();
     if let Some(stdout) = child.stdout.take() {

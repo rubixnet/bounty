@@ -741,3 +741,8 @@ pub fn assert_no_file_contains(data_dir: &Path, needle: &str) -> Vec<String> {
     }
     scanned
 }
+
+/// The daemon's current SQLite `user_version` (the number of migrations in
+/// `storage::MIGRATIONS`). Bump it here, once, when a migration is appended.
+#[allow(dead_code)]
+pub const LATEST_SCHEMA_VERSION: i64 = 5;

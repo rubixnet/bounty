@@ -5,7 +5,10 @@
 //! parser and never kept, and the prompt is reduced to
 //! [`TextMetrics`] inside the deserializer, so its text never outlives
 //! parsing. Each hook maps to at most one Traction Event
-//! (`docs/protocol.md` section 1, "Claude Code hooks").
+//! (`docs/protocol.md` section 1, "Claude Code hooks"), except a
+//! `UserPromptSubmit` whose prompt is exactly a Session Pause command
+//! ([`pause::Command::matching`]), which maps to [`HookAction::Pause`] and no
+//! event.
 
 use std::path::PathBuf;
 
@@ -15,6 +18,7 @@ use traction_core::{
     NetworkClass, SCHEMA_VERSION, TractionEvent,
 };
 
+use super::pause::Command;
 use crate::content_metrics::{self, TextMetrics};
 use crate::event_id::fresh_event_id;
 
@@ -109,6 +113,22 @@ pub enum HookAction {
     Event(Box<TractionEvent>),
     /// `DirectoryAdded`: register this folder as a Project.
     AddDirectory(PathBuf),
+    /// `UserPromptSubmit` with exactly `/stop-track` or `/resume-track`:
+    /// flip this session's pause state, store nothing and answer with a
+    /// block decision so the command never reaches the model.
+    Pause {
+        command: Command,
+        session_id: String,
+        at_ms: u64,
+    },
+}
+
+/// A prompt as the daemon keeps it: its metrics, and the Session Pause
+/// command it is exactly, if any. The text itself is dropped in parsing.
+#[derive(Debug, Clone, Copy)]
+struct Prompt {
+    metrics: TextMetrics,
+    command: Option<Command>,
 }
 
 /// The only payload fields the daemon reads. Everything else is skipped.
@@ -118,9 +138,10 @@ struct Payload {
     hook_event_name: String,
     #[serde(default)]
     cwd: Option<String>,
-    /// Reduced to metrics while parsing; the text is never kept.
+    /// Reduced to metrics (and the pause-command match) while parsing; the
+    /// text is never kept.
     #[serde(default, deserialize_with = "measured")]
-    prompt: Option<TextMetrics>,
+    prompt: Option<Prompt>,
     #[serde(default)]
     tool_name: Option<String>,
     /// `SessionStart` only.
@@ -134,9 +155,12 @@ struct Payload {
     directory: Option<String>,
 }
 
-fn measured<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<TextMetrics>, D::Error> {
+fn measured<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Prompt>, D::Error> {
     let text: Option<std::borrow::Cow<'de, str>> = Option::deserialize(deserializer)?;
-    Ok(text.map(|text| content_metrics::measure(&text)))
+    Ok(text.map(|text| Prompt {
+        metrics: content_metrics::measure(&text),
+        command: Command::matching(&text),
+    }))
 }
 
 /// Maps one raw hook body, received at `received_ms`, to what the daemon
@@ -172,6 +196,8 @@ pub fn map_hook(body: &[u8], received_ms: u64) -> HookAction {
         _ => payload.cwd,
     };
     let prompt = payload.prompt.filter(|_| hook == Hook::UserPromptSubmit);
+    let command = prompt.and_then(|prompt| prompt.command);
+    let prompt = prompt.map(|prompt| prompt.metrics);
     let tool_name = payload
         .tool_name
         .filter(|_| hook.is_tool_hook())
@@ -202,9 +228,16 @@ pub fn map_hook(body: &[u8], received_ms: u64) -> HookAction {
             ..MetricsOnly::default()
         },
     };
-    match event.validate() {
-        Ok(()) => HookAction::Event(Box::new(event)),
-        Err(_) => HookAction::Nothing,
+    // Validated as the prompt's event would be, so a pause is keyed by a
+    // safe session ID, then the event itself is dropped.
+    match (event.validate(), command) {
+        (Err(_), _) => HookAction::Nothing,
+        (Ok(()), None) => HookAction::Event(Box::new(event)),
+        (Ok(()), Some(command)) => HookAction::Pause {
+            command,
+            session_id: event.session_id.unwrap_or_default(),
+            at_ms: received_ms,
+        },
     }
 }
 

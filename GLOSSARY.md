@@ -54,6 +54,10 @@ _Avoid_: Fallback window (that is only one kind), grace period, hold (the hold i
 A `FILE_MUTATION` in a Project that falls outside every Attribution Window, so it carries no Harness, no session and `network_class: manual`.
 _Avoid_: Unattributed edit, human edit, hand-written code
 
+**Session Pause**:
+A span during which one Harness session is not tracked, opened by the user typing exactly `/stop-track` in that session and closed by `/resume-track`. Its events are not stored but still feed the Attribution Windows, so a `FILE_MUTATION` it claims is dropped instead of counted as Manual Work. Per session, kept across daemon restarts.
+_Avoid_: Stop tracking (ambiguous with stopping the daemon), mute, tray Pause (that one is device-wide, Step 1e)
+
 **Linked Repo**:
 The hosted GitHub repository a user has attached to a Project from the website.
 _Avoid_: Remote, origin, connected repo
