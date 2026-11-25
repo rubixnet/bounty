@@ -70,7 +70,7 @@ fn stored_row_holds_the_validated_fields_as_typed_columns() {
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(8)?,
                     ),
                     (
                         row.get::<_, Option<String>>(9)?,
@@ -100,7 +100,8 @@ fn stored_row_holds_the_validated_fields_as_typed_columns() {
             "TURN_END".to_owned(),
             Some("completed".to_owned()),
             "/abs/path/to/working/dir".to_owned(),
-            "git:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            // The Router replaced the Adapter's ID; this `cwd` routes nowhere.
+            None,
         )
     );
     assert_eq!(

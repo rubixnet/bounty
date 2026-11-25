@@ -549,6 +549,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rusqlite",
+ "serde",
  "serde_json",
  "subtle",
  "tempfile",

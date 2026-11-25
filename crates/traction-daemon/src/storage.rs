@@ -201,6 +201,23 @@ impl RowError {
     }
 }
 
+impl EventRow {
+    /// Whether `event` fits the table, without converting it. The bus runs
+    /// this before answering, so the Router's later conversion cannot fail.
+    pub fn check(event: &TractionEvent) -> Result<(), RowError> {
+        let fits = |value: Option<u64>| value.is_none_or(|v| i64::try_from(v).is_ok());
+        let metrics = &event.metrics_only;
+        if fits(Some(event.timestamp_ms))
+            && fits(metrics.prompt_char_len)
+            && fits(metrics.repo_symbol_hits)
+        {
+            Ok(())
+        } else {
+            Err(RowError::IntegerOutOfRange)
+        }
+    }
+}
+
 impl TryFrom<TractionEvent> for EventRow {
     type Error = RowError;
 
@@ -232,44 +249,197 @@ impl TryFrom<TractionEvent> for EventRow {
     }
 }
 
-/// Inserts a batch in one transaction. A repeated `event_id` is ignored.
-pub fn insert_batch(conn: &mut Connection, rows: &[EventRow]) -> rusqlite::Result<()> {
+/// A Project registry row (`project` table), written once on first
+/// registration. `git_common_dir` is set for `git:` Projects (ID pinning).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRow {
+    pub project_id: String,
+    pub kind: ProjectKind,
+    pub root_path: String,
+    pub home_relative_path: Option<String>,
+    pub name: String,
+    pub first_seen_ms: i64,
+    pub git_common_dir: Option<String>,
+}
+
+/// A Project's ID form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectKind {
+    Git,
+    Dir,
+}
+
+impl ProjectKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Dir => "dir",
+        }
+    }
+}
+
+/// A Harness session's routing fallback (`session` table). Upserted:
+/// `start_folder` is kept once set, `last_cwd` is replaced when given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    pub harness_id: &'static str,
+    pub session_id: String,
+    pub start_folder: Option<String>,
+    pub last_cwd: Option<String>,
+}
+
+/// One write the single writer applies, in channel order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOp {
+    /// Appends a Traction Event. A repeated `event_id` is ignored.
+    Event(Box<EventRow>),
+    /// Registers a Project. A repeated `project_id` (or pinned
+    /// `git_common_dir`) is ignored, so a retry or replay is a no-op.
+    Project(ProjectRow),
+    /// Upserts a session's start folder and last `cwd`.
+    Session(SessionRow),
+}
+
+/// Registered, non-merged Projects, for the Router's in-memory registry.
+pub fn load_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT project_id, kind, root_path, home_relative_path, name, first_seen_ms,
+                git_common_dir
+         FROM project WHERE merged_into IS NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let kind: String = row.get(1)?;
+        Ok(ProjectRow {
+            project_id: row.get(0)?,
+            kind: if kind == "git" {
+                ProjectKind::Git
+            } else {
+                ProjectKind::Dir
+            },
+            root_path: row.get(2)?,
+            home_relative_path: row.get(3)?,
+            name: row.get(4)?,
+            first_seen_ms: row.get(5)?,
+            git_common_dir: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Every stored session, for the Router's `cwd` fallback after a restart.
+pub fn load_sessions(conn: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
+    let mut stmt =
+        conn.prepare("SELECT harness_id, session_id, start_folder, last_cwd FROM session")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get(2)?,
+            row.get(3)?,
+        ))
+    })?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        let (harness, session_id, start_folder, last_cwd) = row?;
+        // Only daemon-written spellings are stored; skip anything else.
+        let Some(harness_id) = HarnessId::ALL
+            .iter()
+            .map(|h| h.as_str())
+            .find(|h| *h == harness)
+        else {
+            continue;
+        };
+        sessions.push(SessionRow {
+            harness_id,
+            session_id,
+            start_folder,
+            last_cwd,
+        });
+    }
+    Ok(sessions)
+}
+
+/// Applies a batch of writes in order, in one transaction.
+pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    {
-        let mut insert = tx.prepare_cached(
-            "INSERT OR IGNORE INTO traction_event (
-                event_id, schema_version, timestamp_ms, harness_id, session_id,
-                parent_orchestrator_id, event_type, end_reason, cwd, project_id,
-                model_id, network_class, attribution_source, prompt_char_len,
-                repo_symbol_hits, has_stacktrace, tool_name, exit_code,
-                diff_lines_delta, mutation_kind
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                      ?16, ?17, ?18, ?19, ?20)",
-        )?;
-        for row in rows {
-            insert.execute(params![
-                row.event_id,
-                row.schema_version,
-                row.timestamp_ms,
-                row.harness_id,
-                row.session_id,
-                row.parent_orchestrator_id,
-                row.event_type,
-                row.end_reason,
-                row.cwd,
-                row.project_id,
-                row.model_id,
-                row.network_class,
-                row.attribution_source,
-                row.prompt_char_len,
-                row.repo_symbol_hits,
-                row.has_stacktrace,
-                row.tool_name,
-                row.exit_code,
-                row.diff_lines_delta,
-                row.mutation_kind,
-            ])?;
+    for op in ops {
+        match op {
+            WriteOp::Event(row) => insert_event(&tx, row)?,
+            WriteOp::Project(project) => insert_project(&tx, project)?,
+            WriteOp::Session(session) => upsert_session(&tx, session)?,
         }
     }
     tx.commit()
+}
+
+fn insert_project(conn: &Connection, row: &ProjectRow) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO project (
+            project_id, kind, root_path, home_relative_path, name, first_seen_ms,
+            git_common_dir, merged_into
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+    )?
+    .execute(params![
+        row.project_id,
+        row.kind.as_str(),
+        row.root_path,
+        row.home_relative_path,
+        row.name,
+        row.first_seen_ms,
+        row.git_common_dir,
+    ])?;
+    Ok(())
+}
+
+fn upsert_session(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO session (harness_id, session_id, start_folder, last_cwd)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (harness_id, session_id) DO UPDATE SET
+            start_folder = COALESCE(session.start_folder, excluded.start_folder),
+            last_cwd = COALESCE(excluded.last_cwd, session.last_cwd)",
+    )?
+    .execute(params![
+        row.harness_id,
+        row.session_id,
+        row.start_folder,
+        row.last_cwd,
+    ])?;
+    Ok(())
+}
+
+fn insert_event(conn: &Connection, row: &EventRow) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO traction_event (
+            event_id, schema_version, timestamp_ms, harness_id, session_id,
+            parent_orchestrator_id, event_type, end_reason, cwd, project_id,
+            model_id, network_class, attribution_source, prompt_char_len,
+            repo_symbol_hits, has_stacktrace, tool_name, exit_code,
+            diff_lines_delta, mutation_kind
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                  ?16, ?17, ?18, ?19, ?20)",
+    )?
+    .execute(params![
+        row.event_id,
+        row.schema_version,
+        row.timestamp_ms,
+        row.harness_id,
+        row.session_id,
+        row.parent_orchestrator_id,
+        row.event_type,
+        row.end_reason,
+        row.cwd,
+        row.project_id,
+        row.model_id,
+        row.network_class,
+        row.attribution_source,
+        row.prompt_char_len,
+        row.repo_symbol_hits,
+        row.has_stacktrace,
+        row.tool_name,
+        row.exit_code,
+        row.diff_lines_delta,
+        row.mutation_kind,
+    ])?;
+    Ok(())
 }

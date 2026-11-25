@@ -6,13 +6,6 @@
 //! prefix ([`HARDENED_PREFIX`]), a scrubbed `GIT_*` environment, closed
 //! stdin, discarded stderr, a stdout cap and a hard kill-and-reap timeout.
 //! `safe.bareRepository=explicit` needs Git >= 2.38 (older Git ignores it).
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by the Project Router (step 1b ticket 05)"
-    )
-)]
 
 use crate::log;
 
@@ -91,11 +84,13 @@ pub struct Git {
 
 impl Git {
     /// A client running `git` from `PATH`, refusing repos rooted at `home`.
+    #[cfg(test)]
     pub fn new(home: Option<&Path>) -> Self {
         Self::with_program(Path::new("git"), home)
     }
 
-    fn with_program(program: &Path, home: Option<&Path>) -> Self {
+    /// A client running `program` (the daemon's configured `git`).
+    pub fn with_program(program: &Path, home: Option<&Path>) -> Self {
         Self {
             program: program.to_owned(),
             home: home.map(canonical_or_raw),
@@ -106,6 +101,10 @@ impl Git {
 
     /// The work tree's top-level folder containing `folder`, as Git prints
     /// it (forward slashes on Windows).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the Router collapses worktrees via common_dir")
+    )]
     pub fn top_level(&self, folder: &Path) -> Result<PathBuf, GitError> {
         self.checked_top_level(folder)
     }

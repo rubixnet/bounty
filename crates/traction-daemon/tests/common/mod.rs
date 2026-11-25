@@ -6,13 +6,20 @@
 //! shutdown. The caller writes raw request bytes so tests can send arbitrary
 //! (or missing) `Host`, `Origin` and `Authorization` headers.
 //!
+//! Since Step 1b every daemon also gets a fake `home_dir` (its own temp
+//! folder, canonicalized), so routing fixtures live under a fake home and
+//! never the developer's real one. [`fixtures`] builds real Git repos and
+//! folders; [`poll_until`] waits for asynchronous results.
+//!
 //! Each test binary uses a different subset of this module.
 #![allow(dead_code)]
+
+pub mod fixtures;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
@@ -23,6 +30,8 @@ use traction_daemon::{DB_FILE, DaemonConfig, DaemonHandle, TOKEN_FILE};
 /// A daemon running on its own temp data folder. Shut down on drop.
 pub struct TestDaemon {
     data_dir: TempDir,
+    /// The daemon's `home_dir`: a temp folder, canonicalized.
+    home: TempDir,
     handle: Option<DaemonHandle>,
     addr: SocketAddr,
 }
@@ -37,12 +46,15 @@ impl TestDaemon {
     /// Starts a daemon after letting the test adjust the config.
     pub fn start_with(adjust: impl FnOnce(&mut DaemonConfig)) -> Self {
         let data_dir = tempfile::tempdir().expect("temp data folder");
+        let home = tempfile::tempdir().expect("temp fake home");
         let mut config = test_config(data_dir.path());
+        config.home_dir = Some(canonical(home.path()));
         adjust(&mut config);
         let handle = traction_daemon::start(config).expect("daemon starts");
         let addr = handle.local_addr();
         Self {
             data_dir,
+            home,
             handle: Some(handle),
             addr,
         }
@@ -51,7 +63,8 @@ impl TestDaemon {
     /// Starts a new daemon on the data folder of a previous, shut-down one.
     pub fn restart(mut self) -> Self {
         self.shutdown();
-        let config = test_config(self.data_dir.path());
+        let mut config = test_config(self.data_dir.path());
+        config.home_dir = Some(self.home());
         let handle = traction_daemon::start(config).expect("daemon restarts");
         self.addr = handle.local_addr();
         self.handle = Some(handle);
@@ -64,6 +77,24 @@ impl TestDaemon {
 
     pub fn data_dir(&self) -> &Path {
         self.data_dir.path()
+    }
+
+    /// The daemon's fake `$HOME` (canonical). Build fixtures below it.
+    pub fn home(&self) -> PathBuf {
+        canonical(self.home.path())
+    }
+
+    /// The 32-byte device secret the daemon wrote (keys `dir:` IDs).
+    pub fn device_secret(&self) -> [u8; 32] {
+        std::fs::read(self.data_dir().join(traction_daemon::DEVICE_SECRET_FILE))
+            .expect("device secret")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    /// The `dir:` Project ID this daemon derives for the Project Root `root`.
+    pub fn dir_id(&self, root: &Path) -> String {
+        traction_core::dir_project_id(&self.device_secret(), &canonical_string(root))
     }
 
     pub fn token_path(&self) -> PathBuf {
@@ -140,6 +171,8 @@ pub fn open_db_read_only(data_dir: &Path) -> Connection {
 
 pub fn test_config(data_dir: &Path) -> DaemonConfig {
     let mut config = DaemonConfig::new(data_dir.to_path_buf());
+    // Hermetic: never the developer's real home folder.
+    config.home_dir = Some(data_dir.join("fake-home"));
     config.http_port = 0;
     config.writer.commit_interval = Duration::from_secs(60);
     // Hermetic: never the real `$XDG_RUNTIME_DIR`. A temp data folder keeps
@@ -197,6 +230,12 @@ impl BusCaller {
     /// `POST /v1/event` with the default, valid `Host` and `Authorization`.
     pub fn post_event(&self, body: &str) -> BusResponse {
         self.request("POST", "/v1/event").body(body).send()
+    }
+
+    /// `POST /v1/project` registering `path`.
+    pub fn register_project(&self, path: &Path) -> BusResponse {
+        let body = serde_json::json!({ "path": path_str(path) }).to_string();
+        self.request("POST", "/v1/project").body(body).send()
     }
 
     /// A request preloaded with a valid `Host` and bearer token. Headers can
@@ -423,4 +462,119 @@ pub fn event_id(n: u32) -> String {
 pub fn stored_event_count(db: &Connection) -> i64 {
     db.query_row("SELECT COUNT(*) FROM traction_event", [], |row| row.get(0))
         .expect("count events")
+}
+
+/// Calls `probe` until it returns `Some`, or panics after `timeout`.
+pub fn poll_until<T>(timeout: Duration, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `path` as UTF-8 (fixture paths always are).
+pub fn path_str(path: &Path) -> &str {
+    path.to_str().expect("UTF-8 path")
+}
+
+/// The OS canonical form of `path`, as the daemon stores it: symlinks
+/// resolved and, on Windows, no `\\?\` prefix and an uppercase drive letter.
+pub fn canonical(path: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(path).expect("canonicalize fixture path");
+    #[cfg(windows)]
+    {
+        let text = canon.to_str().expect("UTF-8 path");
+        let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else {
+            text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()
+        };
+        let mut text = text.into_bytes();
+        if text.get(1) == Some(&b':') {
+            text[0] = text[0].to_ascii_uppercase();
+        }
+        PathBuf::from(String::from_utf8(text).expect("UTF-8 path"))
+    }
+    #[cfg(not(windows))]
+    canon
+}
+
+pub fn canonical_string(path: &Path) -> String {
+    path_str(&canonical(path)).to_owned()
+}
+
+/// A routed Traction Event: no `project_id`, the given type, session and
+/// optional `cwd`. `n` makes the `event_id` (and timestamp) distinct.
+pub fn routed_event(n: u32, event_type: &str, session: &str, cwd: Option<&Path>) -> String {
+    let mut event = valid_event_value(n);
+    event["project_id"] = serde_json::Value::Null;
+    event["event_type"] = serde_json::json!(event_type);
+    event["session_id"] = serde_json::json!(session);
+    event["cwd"] = match cwd {
+        Some(cwd) => serde_json::json!(path_str(cwd)),
+        None => serde_json::Value::Null,
+    };
+    if event_type != "TURN_END" {
+        event["end_reason"] = serde_json::Value::Null;
+    }
+    event.to_string()
+}
+
+/// Every stored `(event_id, project_id)`, ordered by `event_id`.
+pub fn stored_project_ids(db: &Connection) -> Vec<(String, Option<String>)> {
+    let mut stmt = db
+        .prepare("SELECT event_id, project_id FROM traction_event ORDER BY event_id")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .map(|row| row.expect("row"))
+        .collect()
+}
+
+/// The `project_id` stored for event `n`.
+pub fn stored_project_id(db: &Connection, n: u32) -> Option<String> {
+    db.query_row(
+        "SELECT project_id FROM traction_event WHERE event_id = ?1",
+        [event_id(n)],
+        |row| row.get(0),
+    )
+    .expect("stored event")
+}
+
+/// A registered Project row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRow {
+    pub project_id: String,
+    pub kind: String,
+    pub root_path: String,
+    pub home_relative_path: Option<String>,
+    pub name: String,
+    pub git_common_dir: Option<String>,
+}
+
+/// Every registered Project, ordered by `root_path`.
+pub fn registered_projects(db: &Connection) -> Vec<ProjectRow> {
+    let mut stmt = db
+        .prepare(
+            "SELECT project_id, kind, root_path, home_relative_path, name, git_common_dir
+             FROM project ORDER BY root_path",
+        )
+        .expect("prepare");
+    stmt.query_map([], |row| {
+        Ok(ProjectRow {
+            project_id: row.get(0)?,
+            kind: row.get(1)?,
+            root_path: row.get(2)?,
+            home_relative_path: row.get(3)?,
+            name: row.get(4)?,
+            git_common_dir: row.get(5)?,
+        })
+    })
+    .expect("query")
+    .map(|row| row.expect("row"))
+    .collect()
 }
