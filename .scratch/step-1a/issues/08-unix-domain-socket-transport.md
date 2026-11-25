@@ -14,3 +14,8 @@
   - a bad token returns `401`;
   - the socket file mode is `0600`.
 - [x] The daemon still builds and all tests pass on Windows, where the socket code is compiled out.
+
+## Comments
+
+- **Scope extra: `--socket-path` CLI flag (Unix only).** Alongside ticket 07's `--data-dir` and `--port`, the binary accepts `--socket-path <path>`. Why: story 43 wants the socket path configurable. The binary tests pass it (or set a temp `XDG_RUNTIME_DIR` on the child only) so parallel tests never bind the real `$XDG_RUNTIME_DIR/traction.sock` and collide with `SocketInUse`. Without the flag the default is `$XDG_RUNTIME_DIR/traction.sock`, else `<data dir>/daemon.sock`.
+- The socket's `Host` exemption is recorded in `docs/adr/0003-uds-skips-host-check.md`.

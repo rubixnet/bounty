@@ -15,3 +15,7 @@
 - [x] The binary sends `SIGINT`/`SIGTERM` on Unix, and Ctrl+C or console close on Windows, to the graceful shutdown, which flushes pending events before exit.
 - [x] If the configured port is already in use, startup fails with a clear error and never falls back to another port.
 - [x] Black-box integration tests cover the lock, the restart and the port conflict. The port-conflict test uses a port the test itself occupies.
+
+## Comments
+
+- **Scope extra: `--data-dir` and `--port` CLI flags.** The ticket asks for a thin binary that uses the defaults. The binary also accepts `--data-dir <path>` and `--port <n>` (`0` picks an ephemeral port). Why: story 43 wants the data directory and port configurable so tests never touch the real `~/.traction`. The black-box binary tests (signal flush, lock, port conflict) need each child process on its own temp folder and port to stay hermetic and parallel-safe. Without flags the binary uses the production defaults (`~/.traction`, `41937`).

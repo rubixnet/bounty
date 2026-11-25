@@ -15,3 +15,7 @@
   - valid events are also sent, then the daemon is shut down;
   - a scan of every table and column finds zero copies of the sentinel;
   - so does a scan of the raw database file bytes and any WAL file bytes.
+
+## Comments
+
+- **Scope extra: writer retry.** The ticket only asked that accepted events survive shutdown. The writer also keeps a batch whose commit fails (SQLite busy past its timeout, disk full, I/O error) and retries it one `commit_interval` later instead of dropping it. Inserts ignore a repeated `event_id`, so a retry never double-stores. While a failed batch is full the writer takes no more rows, so the channel fills and the bus answers `503`, which keeps memory bounded by `max_batch + queue_capacity`. Only the final commit at shutdown gives up, and it logs that the batch was dropped. Why: without it, one transient `SQLITE_BUSY` would silently lose up to a full batch of accepted events. Covered by `a_batch_whose_commit_fails_is_retried_not_dropped` in `tests/persistence.rs`.
