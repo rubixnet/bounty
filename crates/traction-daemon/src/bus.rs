@@ -61,6 +61,7 @@ use traction_core::{AttributionSource, EventType, HarnessId, MAX_CWD_LEN, Tracti
 
 use crate::claude_code::hook::{self, HOOK_PATH, HookAction, MAX_HOOK_BODY_BYTES};
 use crate::claude_code::pause::BUSY_REASON;
+use crate::claude_code::tailer::TranscriptHints;
 use crate::log;
 use crate::router::{Pause, RouterSender};
 use crate::storage::EventRow;
@@ -91,6 +92,8 @@ pub struct Bus {
     port: u16,
     /// Hook events dropped because the Router queue was full.
     dropped_hooks: AtomicU64,
+    /// Where hook-reported `transcript_path`s go (absent without a tailer).
+    transcript_hints: Option<TranscriptHints>,
 }
 
 /// Which listener a request arrived on. Only loopback HTTP checks `Host`: a
@@ -160,7 +163,15 @@ impl Bus {
             router,
             port,
             dropped_hooks: AtomicU64::new(0),
+            transcript_hints: None,
         }
+    }
+
+    /// Sends every hook-reported `transcript_path` to the transcript tailer.
+    #[must_use]
+    pub fn with_transcript_hints(mut self, hints: Option<TranscriptHints>) -> Self {
+        self.transcript_hints = hints;
+        self
     }
 
     /// Runs the full check pipeline for one request.
@@ -227,9 +238,12 @@ impl Bus {
         }
         if path == HOOK_PATH {
             let body = read_capped_body(body, read, MAX_HOOK_BODY_BYTES).await?;
-            let action = hook::map_hook(&body, now_ms());
+            let mapped = hook::map_hook(&body, now_ms());
             drop(body);
-            return Ok(self.queue_hook(action));
+            if let (Some(path), Some(hints)) = (mapped.transcript_path, &self.transcript_hints) {
+                hints.hint(path);
+            }
+            return Ok(self.queue_hook(mapped.action));
         }
         let body = read_capped_body(body, read, MAX_BODY_BYTES).await?;
         if path == PROJECT_PATH {

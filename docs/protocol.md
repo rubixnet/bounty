@@ -88,6 +88,17 @@ The daemon's file watcher emits every `FILE_MUTATION` itself (never over HTTP; t
 - Precedence: hook window, then log-tailed turn window, then trailing fallback window; among windows of one kind the most recently opened wins. The winner's `harness_id`, `session_id` and `network_class` are copied onto the mutation (`attribution_source` stays `file_watcher`).
 - All four constants are public in `traction-daemon` (`LOG_TAIL_HOLD`, `LOG_TAIL_TRAILING_WINDOW`, `WINDOW_CLOSE_GRACE`, `STALE_TURN_TIMEOUT`); the daemon config allows test-only overrides of all but `WINDOW_CLOSE_GRACE`.
 
+### Hook coverage (Claude Code hooks and the transcript tailer)
+
+A Claude Code session can reach the daemon two ways: HTTP hooks (`harness_hook`) and the tailed transcript (`harness_log`). Together they must give exactly one set of events, and the transcript must fill in what the hooks missed.
+
+- The daemon stores a `daemon_run` row per start (`run_id`, `started_ms`, `last_alive_ms`); the single writer bumps `last_alive_ms` in every commit. Per session and run it stores `session_hook_run` (`harness_id`, `session_id`, `run_id`, `first_hook_ms`): the `timestamp_ms` of the session's first accepted hook event in that run (hook timestamps are the daemon's receive times).
+- A tailed record is **dropped** when its `timestamp_ms` falls in `[first_hook_ms, last_alive_ms]` of any run for its session (the current run is open-ended). It is **emitted** otherwise: sessions whose hooks never authenticated, records before a run's first hook, and records from spans when the daemon was down. A tailed `SESSION_START` is also dropped when one is already stored for the session. Dropped records still advance the transcript's saved byte offset.
+- `HOOK_COVERAGE_SKEW` = **1 s** (public in `traction-daemon`) widens both ends of a span, because transcript timestamps are Claude Code's write times, not the daemon's clock. A record within 1 s outside a span is treated as covered; one further out is stored.
+- **Hook-coverage assumption:** once a session's hooks authenticate in a run, they are assumed to keep delivering for the rest of that run. A hook dropped mid-run (full Router queue, a later `401`) is lost, not filled in from the transcript. This trades a possible gap for zero duplicates.
+- Hooks may report a `transcript_path`. It is only a hint to the tailer: it is used only when it canonicalizes to a `.jsonl` file exactly one folder below `<claude config dir>/projects/` (no `..` or symlink escape, no subagent transcripts). Any other value is ignored and never opened.
+- A tailed record inside a Session Pause span of its session is never stored (spans compare the record's own `timestamp_ms`), like a live event.
+
 ## 2a. Project Identity
 
 - A **Project** is a folder, Git or not (see `docs/adr/0001`). Project root resolution: Git repo root (worktrees collapsed via `--git-common-dir`) → nearest ancestor with a project marker → the Harness session's starting folder. System, home-root, cache, and dependency folders never become Projects.

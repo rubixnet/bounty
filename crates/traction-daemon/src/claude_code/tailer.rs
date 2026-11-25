@@ -22,6 +22,11 @@
 //!   malformed line is skipped and logged by reason code only; a line
 //!   longer than [`MAX_LINE_BYTES`] is skipped without being buffered.
 //!
+//! - **Hints.** A `transcript_path` a hook reports is a hint, never trusted:
+//!   [`hint_target`] accepts it only when it canonicalizes to a `.jsonl`
+//!   file exactly one folder below `projects/`. Anything else is ignored and
+//!   never opened.
+//!
 //! Windows opens transcripts with `FILE_SHARE_READ | FILE_SHARE_WRITE |
 //! FILE_SHARE_DELETE`, so Claude Code can keep appending, renaming or
 //! deleting them while they are read. Transcript text never reaches a log
@@ -31,9 +36,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,8 +65,13 @@ const MAX_QUEUED_NOTIFICATIONS: usize = 4096;
 /// is cleared; the Router drops repeats anyway.
 const MAX_ANNOUNCED_SESSIONS: usize = 65_536;
 
+/// Hints remembered as already sent before the set is cleared.
+const MAX_SENT_HINTS: usize = 4096;
+
 enum Message {
     Changed(Vec<PathBuf>),
+    /// A hook-reported `transcript_path`, not yet validated.
+    Hint(PathBuf),
     Stop,
 }
 
@@ -71,7 +81,41 @@ pub struct TailerThread {
     handle: JoinHandle<()>,
 }
 
+/// Where the bus sends the `transcript_path` of every hook. Cheap to clone;
+/// never blocks.
+#[derive(Clone)]
+pub struct TranscriptHints {
+    tx: Sender<Message>,
+    sent: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl TranscriptHints {
+    /// Queues `path` for the tailer to validate, once per distinct path.
+    pub fn hint(&self, path: PathBuf) {
+        if !path.is_absolute() || !is_transcript_name(&path) {
+            return;
+        }
+        let Ok(mut sent) = self.sent.lock() else {
+            return;
+        };
+        if sent.len() >= MAX_SENT_HINTS {
+            sent.clear();
+        }
+        if sent.insert(path.clone()) {
+            let _ = self.tx.send(Message::Hint(path));
+        }
+    }
+}
+
 impl TailerThread {
+    /// A handle for hook-reported transcript paths.
+    pub fn hints(&self) -> TranscriptHints {
+        TranscriptHints {
+            tx: self.tx.clone(),
+            sent: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
     pub fn stop(self) -> thread::Result<()> {
         let _ = self.tx.send(Message::Stop);
         self.handle.join()
@@ -203,7 +247,20 @@ impl Worker {
     fn run(mut self, rx: &Receiver<Message>) {
         self.rescan();
         // Blocks with no timeout: no idle polling.
-        while let Ok(Message::Changed(changed)) = rx.recv() {
+        while let Ok(message) = rx.recv() {
+            let changed = match message {
+                Message::Changed(changed) => changed,
+                Message::Hint(path) => {
+                    if let Some(target) = hint_target(&self.projects, &path) {
+                        self.read(&target);
+                    }
+                    if self.router_gone {
+                        break;
+                    }
+                    continue;
+                }
+                Message::Stop => break,
+            };
             self.queued.fetch_sub(1, Ordering::AcqRel);
             if self.overflowed.swap(false, Ordering::AcqRel) {
                 self.watch();
@@ -474,6 +531,21 @@ impl Worker {
     }
 }
 
+/// The canonical transcript a hook-reported `path` names: a `.jsonl` file
+/// exactly one folder below `projects` (the same shape the watcher reads;
+/// subagent transcripts are never read). `None` for anything else, a path
+/// that does not exist or one that escapes `projects` through `..` or a
+/// symlink; nothing is opened here.
+fn hint_target(projects: &Path, path: &Path) -> Option<PathBuf> {
+    if !is_transcript_name(path) {
+        return None;
+    }
+    let canonical = paths::canonicalize(path)?;
+    let projects = paths::canonicalize(projects)?;
+    let rest = canonical.strip_prefix(&projects).ok()?;
+    (rest.components().count() == 2 && canonical.is_file()).then_some(canonical)
+}
+
 /// The `*.jsonl` files directly in `folder`.
 fn transcripts_in(folder: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(folder) else {
@@ -568,4 +640,62 @@ fn file_identity(file: &File, _meta: &Metadata) -> io::Result<String> {
         "{:08x}:{:08x}{:08x}",
         info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &Path) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("folder");
+        fs::write(path, b"{}\n").expect("file");
+    }
+
+    #[test]
+    fn a_hinted_path_must_be_a_transcript_directly_under_projects() {
+        let dir = tempfile::tempdir().expect("temp");
+        let claude = paths::canonicalize(dir.path()).expect("canonical");
+        let projects = claude.join(PROJECTS_DIR);
+        let good = projects.join("-code-app").join("abc.jsonl");
+        file(&good);
+        assert_eq!(hint_target(&projects, &good), Some(good.clone()));
+        // The spelling a hook reports may carry `.` or `..`.
+        let roundabout = projects
+            .join("-code-app")
+            .join("..")
+            .join("-code-app/abc.jsonl");
+        assert_eq!(hint_target(&projects, &roundabout), Some(good));
+
+        let outside = claude.join("elsewhere").join("abc.jsonl");
+        file(&outside);
+        let escaping = projects.join("..").join("elsewhere").join("abc.jsonl");
+        let too_shallow = projects.join("abc.jsonl");
+        file(&too_shallow);
+        let too_deep = projects
+            .join("-code-app")
+            .join("abc")
+            .join("subagents")
+            .join("a.jsonl");
+        file(&too_deep);
+        let not_jsonl = projects.join("-code-app").join("abc.txt");
+        file(&not_jsonl);
+        let missing = projects.join("-code-app").join("missing.jsonl");
+        for bad in [outside, escaping, too_shallow, too_deep, not_jsonl, missing] {
+            assert_eq!(hint_target(&projects, &bad), None, "{bad:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_projects_is_refused() {
+        let dir = tempfile::tempdir().expect("temp");
+        let claude = paths::canonicalize(dir.path()).expect("canonical");
+        let projects = claude.join(PROJECTS_DIR);
+        let secret = claude.join("elsewhere").join("abc.jsonl");
+        file(&secret);
+        let slug = projects.join("-code-app");
+        fs::create_dir_all(&slug).expect("slug");
+        std::os::unix::fs::symlink(&secret, slug.join("abc.jsonl")).expect("symlink");
+        assert_eq!(hint_target(&projects, &slug.join("abc.jsonl")), None);
+    }
 }

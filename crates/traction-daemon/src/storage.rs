@@ -40,6 +40,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_3,
     MIGRATION_4,
     MIGRATION_5,
+    MIGRATION_6,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -218,6 +219,29 @@ const MIGRATION_5: &str = "
 
     CREATE INDEX traction_event_session_start
         ON traction_event (harness_id, session_id) WHERE event_type = 'SESSION_START';
+";
+
+/// Step 1c: hook coverage (`docs/protocol.md`, "Hook coverage").
+///
+/// - `daemon_run`: one row per daemon start. `last_alive_ms` is bumped by
+///   the writer in every commit, so a run's span ends when its last write
+///   did.
+/// - `session_hook_run`: the timestamp of a session's first accepted hook
+///   event in a run.
+const MIGRATION_6: &str = "
+    CREATE TABLE daemon_run (
+        run_id        INTEGER PRIMARY KEY NOT NULL,
+        started_ms    INTEGER NOT NULL,
+        last_alive_ms INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE session_hook_run (
+        harness_id    TEXT NOT NULL,
+        session_id    TEXT NOT NULL,
+        run_id        INTEGER NOT NULL,
+        first_hook_ms INTEGER NOT NULL,
+        PRIMARY KEY (harness_id, session_id, run_id)
+    ) STRICT, WITHOUT ROWID;
 ";
 
 /// The alias-aware events view (see [`MIGRATION_3`]).
@@ -411,6 +435,10 @@ pub enum WriteOp {
     /// The tailer's first-ever start and the offsets (each file's end) of
     /// the transcripts that existed before it. A replay keeps the first.
     TailerStart(TailerStartRow),
+    /// Starts a daemon run (`last_alive_ms` starts at `started_ms`).
+    RunStart(RunRow),
+    /// A session's first accepted hook event in a run. A repeat is ignored.
+    HookRun(HookRunRow),
 }
 
 impl WriteOp {
@@ -425,9 +453,34 @@ impl WriteOp {
             | Self::Migration(_)
             | Self::PauseStart(_)
             | Self::PauseEnd(_)
-            | Self::TailerStart(_) => 0,
+            | Self::TailerStart(_)
+            | Self::RunStart(_)
+            | Self::HookRun(_) => 0,
         }
     }
+}
+
+/// One `daemon_run` row, as started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunRow {
+    pub run_id: i64,
+    pub started_ms: i64,
+}
+
+/// A stored run's end: when its last write committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredRun {
+    pub run_id: i64,
+    pub last_alive_ms: i64,
+}
+
+/// One `session_hook_run` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRunRow {
+    pub harness_id: HarnessId,
+    pub session_id: String,
+    pub run_id: i64,
+    pub first_hook_ms: i64,
 }
 
 /// One `transcript_offset` row.
@@ -527,6 +580,10 @@ pub struct StoredRegistry {
     pub pauses: Vec<PauseSpanRow>,
     /// Sessions with a stored `SESSION_START`.
     pub started_sessions: Vec<(HarnessId, String)>,
+    /// Every earlier daemon run.
+    pub runs: Vec<StoredRun>,
+    /// Every session's first hook in each earlier run.
+    pub hook_runs: Vec<HookRunRow>,
 }
 
 /// Loads the [`StoredRegistry`].
@@ -537,7 +594,49 @@ pub fn load_registry(conn: &Connection) -> rusqlite::Result<StoredRegistry> {
         sessions: load_sessions(conn)?,
         pauses: load_pauses(conn)?,
         started_sessions: load_started_sessions(conn)?,
+        runs: load_runs(conn)?,
+        hook_runs: load_hook_runs(conn)?,
     })
+}
+
+/// Every stored daemon run, oldest first.
+pub fn load_runs(conn: &Connection) -> rusqlite::Result<Vec<StoredRun>> {
+    let mut stmt = conn.prepare("SELECT run_id, last_alive_ms FROM daemon_run ORDER BY run_id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(StoredRun {
+            run_id: row.get(0)?,
+            last_alive_ms: row.get(1)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Every stored `session_hook_run` row.
+pub fn load_hook_runs(conn: &Connection) -> rusqlite::Result<Vec<HookRunRow>> {
+    let mut stmt =
+        conn.prepare("SELECT harness_id, session_id, run_id, first_hook_ms FROM session_hook_run")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get(2)?,
+            row.get(3)?,
+        ))
+    })?;
+    let mut runs = Vec::new();
+    for row in rows {
+        let (harness, session_id, run_id, first_hook_ms) = row?;
+        let Some(harness_id) = harness_by_name(&harness) else {
+            continue;
+        };
+        runs.push(HookRunRow {
+            harness_id,
+            session_id,
+            run_id,
+            first_hook_ms,
+        });
+    }
+    Ok(runs)
 }
 
 /// Every `(harness_id, session_id)` with a stored `SESSION_START` (through
@@ -689,9 +788,41 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
                     }
                 }
             }
+            WriteOp::RunStart(run) => {
+                tx.prepare_cached(
+                    "INSERT OR IGNORE INTO daemon_run (run_id, started_ms, last_alive_ms)
+                     VALUES (?1, ?2, ?2)",
+                )?
+                .execute(params![run.run_id, run.started_ms])?;
+            }
+            WriteOp::HookRun(hook) => {
+                tx.prepare_cached(
+                    "INSERT OR IGNORE INTO session_hook_run
+                         (harness_id, session_id, run_id, first_hook_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![
+                    hook.harness_id.as_str(),
+                    hook.session_id,
+                    hook.run_id,
+                    hook.first_hook_ms
+                ])?;
+            }
         }
     }
+    // The newest run is the live one: every commit proves it was alive.
+    tx.prepare_cached(
+        "UPDATE daemon_run SET last_alive_ms = max(last_alive_ms, ?1)
+         WHERE run_id = (SELECT max(run_id) FROM daemon_run)",
+    )?
+    .execute([now_ms()])?;
     tx.commit()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn upsert_offset(conn: &Connection, row: &TranscriptOffset) -> rusqlite::Result<()> {

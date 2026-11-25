@@ -44,6 +44,13 @@ pub const WINDOW_CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// turning the user's hand edits into Agent Compute. Any event of the
 /// session counts as activity; closed windows are unaffected.
 pub const STALE_TURN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Clock-skew tolerance of the hook-coverage rule (`docs/protocol.md`,
+/// "Hook coverage"): hook timestamps are the daemon's receive times,
+/// transcript timestamps are Claude Code's own write times, so a tailed
+/// record within this long of either end of a session's hook span (first
+/// hook of a run, last commit of that run) is treated as covered. Records
+/// further out than this are never dropped.
+pub const HOOK_COVERAGE_SKEW: Duration = Duration::from_secs(1);
 /// Files the watcher may hold per Project at once; past this, the oldest
 /// held mutation of that Project is decided early (bounded memory).
 pub const DEFAULT_WATCHER_PENDING_CAP: usize = 1024;

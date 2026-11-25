@@ -51,6 +51,7 @@ use crate::claude_code::pause::PauseAction;
 use crate::config::WatcherSettings;
 #[cfg(doc)]
 use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW, STALE_TURN_TIMEOUT};
+use crate::coverage::HookCoverage;
 use crate::exclusions::{Exclusions, has_project_marker};
 use crate::git::Git;
 use crate::log;
@@ -58,8 +59,8 @@ use crate::paths::{self, is_within, same};
 use crate::pause::Pauses;
 use crate::secret::DeviceSecret;
 use crate::storage::{
-    EventRow, MigrationRow, ProjectKind, ProjectRow, SessionRow, StoredRegistry, TailedBatch,
-    TailerStartRow, TranscriptOffset, WriteOp, final_alias,
+    EventRow, MigrationRow, ProjectKind, ProjectRow, RunRow, SessionRow, StoredRegistry,
+    TailedBatch, TailerStartRow, TranscriptOffset, WriteOp, final_alias,
 };
 use crate::writer::WriterSender;
 
@@ -166,6 +167,8 @@ pub struct Router {
     started: HashSet<(HarnessId, String)>,
     /// Session Pause spans, loaded at startup.
     pauses: Pauses,
+    /// Which spans of each session its hooks covered (this run and earlier).
+    coverage: HookCoverage,
     hooks: Vec<ProjectHook>,
     /// In-memory attribution windows (never persisted).
     windows: Attribution,
@@ -187,6 +190,8 @@ impl Router {
             sessions,
             started_sessions,
             pauses,
+            runs,
+            hook_runs,
         } = stored;
         let pinned = projects
             .iter()
@@ -217,7 +222,8 @@ impl Router {
                 ((row.harness_id, row.session_id), state)
             })
             .collect();
-        Self {
+        let coverage = HookCoverage::new(&runs, hook_runs);
+        let mut router = Self {
             git,
             exclusions,
             secret,
@@ -231,10 +237,18 @@ impl Router {
             sessions,
             started: started_sessions.into_iter().collect(),
             pauses: Pauses::new(pauses),
+            coverage,
             hooks: Vec::new(),
             windows: Attribution::new(&WatcherSettings::default()),
             writer_gone_logged: false,
-        }
+        };
+        // This start is a run; the writer keeps its `last_alive_ms` current.
+        let run = RunRow {
+            run_id: router.coverage.current_run(),
+            started_ms: now_ms(),
+        };
+        router.write(WriteOp::RunStart(run));
+        router
     }
 
     /// Replaces the attribution windows' timing (test overrides of
@@ -684,6 +698,7 @@ impl Router {
 
     /// Routes `event` and queues it for the writer.
     fn handle_event(&mut self, event: TractionEvent) {
+        self.note_hook(&event);
         if let Some(row) = self.routed_row(event) {
             self.write(WriteOp::Event(Box::new(row)));
         }
@@ -714,22 +729,42 @@ impl Router {
         }
     }
 
-    /// Whether a tailed (`harness_log`) event is stored. A synthesized
-    /// `SESSION_START` is dropped once one is stored for its session.
+    /// Records the first accepted hook event of a session in this run (its
+    /// `first_hook_ms`), the start of the span the transcript tailer must
+    /// not duplicate.
+    fn note_hook(&mut self, event: &TractionEvent) {
+        if event.attribution_source != AttributionSource::HarnessHook {
+            return;
+        }
+        let (Some(harness), Some(session)) = (event.harness_id, &event.session_id) else {
+            return;
+        };
+        let at_ms = i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX);
+        if let Some(row) = self.coverage.note_hook(harness, session, at_ms) {
+            self.write(WriteOp::HookRun(row));
+        }
+    }
+
+    /// Whether a tailed (`harness_log`) event is stored. Dropped: a
+    /// synthesized `SESSION_START` once one is stored for its session, and
+    /// a record inside a span the session's hooks covered (see
+    /// [`HookCoverage`]).
     ///
-    /// A tailed record inside a paused span is already dropped by
+    /// A tailed record inside a paused span is dropped later, by
     /// [`Self::routed_row`] (pause spans compare the record's own
-    /// timestamp). Ticket 08 extends this single decision point with hook
-    /// coverage: a tailed record inside a run's
-    /// `[first_hook_ms, last_alive_ms]` is dropped here too.
+    /// timestamp).
     fn keeps_tailed(&self, event: &TractionEvent) -> bool {
         debug_assert_eq!(event.attribution_source, AttributionSource::HarnessLog);
-        match (event.event_type, event.harness_id, &event.session_id) {
-            (EventType::SessionStart, Some(harness), Some(session)) => {
-                !self.started.contains(&(harness, session.clone()))
-            }
-            _ => true,
+        let (Some(harness), Some(session)) = (event.harness_id, &event.session_id) else {
+            return true;
+        };
+        if event.event_type == EventType::SessionStart
+            && self.started.contains(&(harness, session.clone()))
+        {
+            return false;
         }
+        let ts = i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX);
+        !self.coverage.covers(harness, session, ts)
     }
 
     /// Routes the events the transcript tailer read from one file and
