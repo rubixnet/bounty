@@ -9,6 +9,7 @@ mod bus;
 mod claude_code;
 mod config;
 mod content_metrics;
+mod coverage;
 mod daemon;
 mod event_id;
 mod exclusions;
@@ -36,7 +37,7 @@ pub use claude_code::pause::{Command as PauseCommand, PauseAction, RESUME_TRACK,
 pub use config::{
     ConfigError, DEFAULT_COMMIT_INTERVAL, DEFAULT_GIT_PROGRAM, DEFAULT_HTTP_PORT,
     DEFAULT_MAX_BATCH, DEFAULT_WATCHER_PENDING_CAP, DEFAULT_WRITER_QUEUE_CAPACITY, DaemonConfig,
-    GLOBAL_IGNORE_FILE, LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW, STALE_TURN_TIMEOUT,
+    GLOBAL_IGNORE_FILE, HOOK_COVERAGE_SKEW, LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW, STALE_TURN_TIMEOUT,
     WINDOW_CLOSE_GRACE, WatcherSettings, WriterSettings,
 };
 #[cfg(unix)]
