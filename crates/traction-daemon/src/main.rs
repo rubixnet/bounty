@@ -8,7 +8,8 @@
 //! taken port) is one stderr line and a non-zero exit.
 //!
 //! Options (mainly so tests stay hermetic): `--data-dir <path>`,
-//! `--port <n>` (`0` = ephemeral).
+//! `--port <n>` (`0` = ephemeral) and, on macOS/Linux, `--socket-path <path>`
+//! (default `$XDG_RUNTIME_DIR/traction.sock`, else `<data dir>/daemon.sock`).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -49,6 +50,8 @@ fn run() -> Result<(), String> {
 fn config_from_args(mut args: impl Iterator<Item = OsString>) -> Result<DaemonConfig, String> {
     let mut data_dir: Option<PathBuf> = None;
     let mut port: Option<u16> = None;
+    #[cfg(unix)]
+    let mut socket_path: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--data-dir") => {
@@ -63,7 +66,12 @@ fn config_from_args(mut args: impl Iterator<Item = OsString>) -> Result<DaemonCo
                     .ok_or("--port needs a number from 0 to 65535")?;
                 port = Some(value);
             }
-            _ => return Err("unknown argument (use --data-dir <path>, --port <n>)".to_owned()),
+            #[cfg(unix)]
+            Some("--socket-path") => {
+                let value = args.next().ok_or("--socket-path needs a path")?;
+                socket_path = Some(PathBuf::from(value));
+            }
+            _ => return Err(USAGE.to_owned()),
         }
     }
     let mut config = match data_dir {
@@ -73,8 +81,17 @@ fn config_from_args(mut args: impl Iterator<Item = OsString>) -> Result<DaemonCo
     if let Some(port) = port {
         config.http_port = port;
     }
+    #[cfg(unix)]
+    if let Some(socket_path) = socket_path {
+        config.socket_path = socket_path;
+    }
     Ok(config)
 }
+
+#[cfg(unix)]
+const USAGE: &str = "unknown argument (use --data-dir <path>, --port <n>, --socket-path <path>)";
+#[cfg(not(unix))]
+const USAGE: &str = "unknown argument (use --data-dir <path>, --port <n>)";
 
 #[cfg(unix)]
 struct ShutdownSignals {

@@ -6,12 +6,16 @@
 //! the SQLite writer. Startup order matters: data folder, single-instance
 //! lock, token, database, listener, writer, server. Nothing in the data
 //! folder (token, database, later the socket) is touched before the lock is
-//! held, and the lock is released only after every thread has stopped.
+//! held, and the lock is released only after every thread has stopped. On
+//! macOS/Linux the bus socket is bound after the TCP listener and removed on
+//! shutdown, before the lock is released.
 
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -19,7 +23,10 @@ use tokio::sync::oneshot;
 
 use crate::bus::Bus;
 use crate::config::DaemonConfig;
+use crate::http::Listeners;
 use crate::lock::{InstanceLock, LockError};
+#[cfg(unix)]
+use crate::socket::{self, SocketError, SocketFile};
 use crate::token::BusToken;
 use crate::writer::{self, WriterSettings, WriterThread};
 use crate::{http, log, storage};
@@ -30,6 +37,12 @@ pub struct DaemonHandle {
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
     writer: Option<WriterThread>,
+    #[cfg(unix)]
+    socket_path: PathBuf,
+    /// Removes the socket file on drop. Declared before `_lock` so the file
+    /// is gone before another daemon can take the lock and bind.
+    #[cfg(unix)]
+    _socket: SocketFile,
     /// Dropped last (after `stop` joined every thread), so a new daemon can
     /// only start once this one has flushed.
     _lock: InstanceLock,
@@ -64,6 +77,25 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         .map_err(StartError::Runtime)?;
     let local_addr = listener.local_addr().map_err(StartError::Runtime)?;
 
+    #[cfg(unix)]
+    let (unix_listener, socket_file) =
+        socket::bind(&config.socket_path, &lock).map_err(|error| match error {
+            SocketError::InUse => StartError::SocketInUse {
+                path: config.socket_path.clone(),
+            },
+            SocketError::NotASocket => StartError::Socket {
+                path: config.socket_path.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the path exists and is not a socket",
+                ),
+            },
+            SocketError::Io(source) => StartError::Socket {
+                path: config.socket_path.clone(),
+                source,
+            },
+        })?;
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -86,8 +118,12 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         .name("traction-bus".to_owned())
         .spawn(move || {
             runtime.block_on(async move {
-                match tokio::net::TcpListener::from_std(listener) {
-                    Ok(listener) => http::serve(listener, bus, shutdown_rx).await,
+                match register(
+                    listener,
+                    #[cfg(unix)]
+                    unix_listener,
+                ) {
+                    Ok(listeners) => http::serve(listeners, bus, shutdown_rx).await,
                     Err(error) => log::error("failed to register the bus listener", &error),
                 }
             });
@@ -109,7 +145,23 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         shutdown: Some(shutdown_tx),
         server: Some(server),
         writer: Some(writer_thread),
+        #[cfg(unix)]
+        socket_path: config.socket_path,
+        #[cfg(unix)]
+        _socket: socket_file,
         _lock: lock,
+    })
+}
+
+/// Hands the bound std listeners to the tokio runtime (inside it).
+fn register(
+    tcp: TcpListener,
+    #[cfg(unix)] unix: std::os::unix::net::UnixListener,
+) -> io::Result<Listeners> {
+    Ok(Listeners {
+        tcp: tokio::net::TcpListener::from_std(tcp)?,
+        #[cfg(unix)]
+        unix: tokio::net::UnixListener::from_std(unix)?,
     })
 }
 
@@ -117,6 +169,12 @@ impl DaemonHandle {
     /// The bound loopback HTTP address (useful when the port was `0`).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The bound Local Ingestion Bus Unix socket (macOS/Linux only).
+    #[cfg(unix)]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     /// Stops accepting requests, commits every accepted Traction Event and
@@ -176,6 +234,17 @@ pub enum StartError {
         port: u16,
         source: io::Error,
     },
+    /// A live daemon already serves the configured socket path.
+    #[cfg(unix)]
+    SocketInUse {
+        path: PathBuf,
+    },
+    /// The bus socket could not be created (or the path is not a socket).
+    #[cfg(unix)]
+    Socket {
+        path: PathBuf,
+        source: io::Error,
+    },
     Runtime(io::Error),
 }
 
@@ -197,6 +266,16 @@ impl fmt::Display for StartError {
             Self::Bind { port, source } => {
                 write!(f, "cannot listen on 127.0.0.1:{port}: {source}")
             }
+            #[cfg(unix)]
+            Self::SocketInUse { path } => write!(
+                f,
+                "another Traction daemon is already serving the socket {}",
+                path.display()
+            ),
+            #[cfg(unix)]
+            Self::Socket { path, source } => {
+                write!(f, "cannot create the socket {}: {source}", path.display())
+            }
             Self::Runtime(e) => write!(f, "cannot start the daemon runtime: {e}"),
         }
     }
@@ -208,6 +287,10 @@ impl std::error::Error for StartError {
             Self::DataDir(e) | Self::Lock(e) | Self::Token(e) | Self::Runtime(e) => Some(e),
             Self::AlreadyRunning | Self::PortInUse { .. } => None,
             Self::Bind { source, .. } => Some(source),
+            #[cfg(unix)]
+            Self::SocketInUse { .. } => None,
+            #[cfg(unix)]
+            Self::Socket { source, .. } => Some(source),
             Self::Database(e) => Some(e),
         }
     }

@@ -3,6 +3,8 @@
 //!
 //! Each test runs the real binary on its own temp data folder and an
 //! ephemeral port (`--data-dir`, `--port 0`), never the user's `~/.traction`.
+//! On Unix the socket goes in that folder too (`--socket-path`), or in a temp
+//! `XDG_RUNTIME_DIR` set on the child only, never the real runtime folder.
 
 mod common;
 
@@ -12,11 +14,26 @@ use std::path::Path;
 use std::process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{BusClient, open_db_read_only, stored_event_count, valid_event};
+use common::BusClient;
+#[cfg(unix)]
+use common::{open_db_read_only, stored_event_count, valid_event};
 
 const BIN: &str = env!("CARGO_BIN_EXE_traction-daemon");
 
+/// The binary on `data_dir` and `port`, with its socket inside `data_dir`.
 fn command(data_dir: &Path, port: u16) -> Command {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut command = command_without_socket_path(data_dir, port);
+    #[cfg(unix)]
+    command
+        .arg("--socket-path")
+        .arg(data_dir.join("daemon.sock"));
+    command
+}
+
+/// Leaves the socket path to the binary's default. Callers must control
+/// `XDG_RUNTIME_DIR` on the child.
+fn command_without_socket_path(data_dir: &Path, port: u16) -> Command {
     let mut command = Command::new(BIN);
     command
         .arg("--data-dir")
@@ -32,13 +49,19 @@ fn command(data_dir: &Path, port: u16) -> Command {
 /// A running binary. Killed on drop if a test fails midway.
 struct RunningDaemon {
     child: Child,
+    // The Windows build runs only the start-failure tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     addr: SocketAddr,
     _stderr: BufReader<ChildStderr>,
 }
 
 impl RunningDaemon {
     fn spawn(data_dir: &Path) -> Self {
-        let mut child = command(data_dir, 0).spawn().expect("spawn daemon binary");
+        Self::spawn_command(&mut command(data_dir, 0))
+    }
+
+    fn spawn_command(command: &mut Command) -> Self {
+        let mut child = command.spawn().expect("spawn daemon binary");
         let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
         let mut line = String::new();
         stderr.read_line(&mut line).expect("read startup line");
@@ -54,6 +77,7 @@ impl RunningDaemon {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn client(&self, data_dir: &Path) -> BusClient {
         let token = std::fs::read_to_string(data_dir.join("daemon.token")).expect("token file");
         BusClient::new(self.addr, token)
@@ -69,6 +93,7 @@ impl RunningDaemon {
         assert!(status.success(), "kill -{name}");
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn wait(&mut self, timeout: Duration) -> ExitStatus {
         let deadline = Instant::now() + timeout;
         loop {
@@ -161,4 +186,61 @@ fn the_lock_is_released_when_the_daemon_is_killed() {
     let mut restarted = RunningDaemon::spawn(data_dir.path());
     restarted.signal("TERM");
     assert!(restarted.wait(Duration::from_secs(10)).success());
+}
+
+#[cfg(unix)]
+fn assert_socket_accepts_events(daemon: &RunningDaemon, data_dir: &Path, socket: &Path) {
+    let client = daemon.client(data_dir).via_socket(socket.to_path_buf());
+    assert_eq!(client.post_event(&valid_event(1)).status, 202);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_socket_defaults_to_traction_sock_in_xdg_runtime_dir() {
+    let data_dir = tempfile::tempdir().expect("temp data folder");
+    let runtime_dir = tempfile::tempdir().expect("temp runtime folder");
+    let mut command = command_without_socket_path(data_dir.path(), 0);
+    command.env("XDG_RUNTIME_DIR", runtime_dir.path());
+
+    let daemon = RunningDaemon::spawn_command(&mut command);
+
+    assert_socket_accepts_events(
+        &daemon,
+        data_dir.path(),
+        &runtime_dir.path().join("traction.sock"),
+    );
+    assert!(!data_dir.path().join("daemon.sock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn without_xdg_runtime_dir_the_socket_is_daemon_sock_in_the_data_folder() {
+    let data_dir = tempfile::tempdir().expect("temp data folder");
+    let mut command = command_without_socket_path(data_dir.path(), 0);
+    command.env_remove("XDG_RUNTIME_DIR");
+
+    let daemon = RunningDaemon::spawn_command(&mut command);
+
+    assert_socket_accepts_events(
+        &daemon,
+        data_dir.path(),
+        &data_dir.path().join("daemon.sock"),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn socket_path_option_overrides_the_default() {
+    let data_dir = tempfile::tempdir().expect("temp data folder");
+    let socket_dir = tempfile::tempdir().expect("temp socket folder");
+    let socket = socket_dir.path().join("custom.sock");
+    let mut command = command_without_socket_path(data_dir.path(), 0);
+    command
+        .arg("--socket-path")
+        .arg(&socket)
+        .env_remove("XDG_RUNTIME_DIR");
+
+    let daemon = RunningDaemon::spawn_command(&mut command);
+
+    assert_socket_accepts_events(&daemon, data_dir.path(), &socket);
 }

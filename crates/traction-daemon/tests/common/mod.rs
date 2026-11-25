@@ -75,10 +75,23 @@ impl TestDaemon {
 
     /// A client holding the daemon's real token.
     pub fn client(&self) -> BusClient {
-        BusClient {
-            addr: self.addr,
-            token: self.token(),
-        }
+        BusClient::new(self.addr, self.token())
+    }
+
+    /// The configured Unix socket path (`<temp data dir>/daemon.sock`).
+    #[cfg(unix)]
+    pub fn socket_path(&self) -> PathBuf {
+        self.handle
+            .as_ref()
+            .expect("daemon is running")
+            .socket_path()
+            .to_path_buf()
+    }
+
+    /// A client holding the real token that talks over the Unix socket.
+    #[cfg(unix)]
+    pub fn socket_client(&self) -> BusClient {
+        self.client().via_socket(self.socket_path())
     }
 
     /// Graceful shutdown: flushes pending events, then stops. Idempotent.
@@ -132,6 +145,12 @@ pub fn test_config(data_dir: &Path) -> DaemonConfig {
     let mut config = DaemonConfig::new(data_dir.to_path_buf());
     config.http_port = 0;
     config.commit_interval = Duration::from_secs(60);
+    // Hermetic: never the real `$XDG_RUNTIME_DIR`. A temp data folder keeps
+    // the path well under the macOS 104-byte `sun_path` limit.
+    #[cfg(unix)]
+    {
+        config.socket_path = data_dir.join("daemon.sock");
+    }
     config
 }
 
@@ -140,12 +159,33 @@ pub fn test_config(data_dir: &Path) -> DaemonConfig {
 pub struct BusClient {
     addr: SocketAddr,
     token: String,
+    endpoint: Endpoint,
+}
+
+/// Where a request is sent: loopback TCP or (Unix only) the bus socket.
+#[derive(Clone)]
+enum Endpoint {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(PathBuf),
 }
 
 impl BusClient {
     /// A client for a daemon started outside [`TestDaemon`] (e.g. the binary).
     pub fn new(addr: SocketAddr, token: String) -> Self {
-        Self { addr, token }
+        Self {
+            addr,
+            token,
+            endpoint: Endpoint::Tcp(addr),
+        }
+    }
+
+    /// The same client, but sending over the Unix socket at `path`. Requests
+    /// still carry the HTTP `Host` header unless a test removes it.
+    #[cfg(unix)]
+    pub fn via_socket(mut self, path: PathBuf) -> Self {
+        self.endpoint = Endpoint::Unix(path);
+        self
     }
 
     pub fn token(&self) -> &str {
@@ -166,7 +206,7 @@ impl BusClient {
     /// be replaced or removed before sending.
     pub fn request(&self, method: &str, path: &str) -> BusRequest {
         BusRequest {
-            addr: self.addr,
+            endpoint: self.endpoint.clone(),
             method: method.to_owned(),
             path: path.to_owned(),
             headers: vec![
@@ -181,7 +221,7 @@ impl BusClient {
 }
 
 pub struct BusRequest {
-    addr: SocketAddr,
+    endpoint: Endpoint,
     method: String,
     path: String,
     headers: Vec<(String, String)>,
@@ -214,15 +254,34 @@ impl BusRequest {
         raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
         raw.extend_from_slice(&self.body);
 
-        let mut stream = TcpStream::connect(self.addr).expect("connect to bus");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
-        stream.write_all(&raw).expect("send request");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("read response");
+        let response = match &self.endpoint {
+            Endpoint::Tcp(addr) => {
+                let stream = TcpStream::connect(addr).expect("connect to bus");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                exchange(stream, &raw)
+            }
+            #[cfg(unix)]
+            Endpoint::Unix(path) => {
+                let stream =
+                    std::os::unix::net::UnixStream::connect(path).expect("connect to bus socket");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                exchange(stream, &raw)
+            }
+        };
         BusResponse::parse(&response)
     }
+}
+
+/// Writes the raw request and reads until the daemon closes the connection.
+fn exchange(mut stream: impl Read + Write, raw: &[u8]) -> Vec<u8> {
+    stream.write_all(raw).expect("send request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    response
 }
 
 #[derive(Debug)]

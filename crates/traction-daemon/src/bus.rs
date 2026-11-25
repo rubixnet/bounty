@@ -1,5 +1,5 @@
 //! The Local Ingestion Bus request pipeline, shared by every transport
-//! (loopback HTTP now, the Unix socket later).
+//! (loopback HTTP and, on macOS/Linux, the Unix socket).
 //!
 //! Checks run in a fixed order and the first failure answers the request:
 //!
@@ -45,7 +45,8 @@ pub struct Bus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Http,
-    #[allow(dead_code)] // ticket 08 constructs this for the Unix socket.
+    /// The macOS/Linux bus socket (no socket on Windows in Step 1a).
+    #[cfg(unix)]
     Unix,
 }
 
