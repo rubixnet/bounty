@@ -79,6 +79,14 @@ The daemon's file watcher emits every `FILE_MUTATION` itself (never over HTTP; t
   - `os_username`
   - `linked_repo` (optional `github.com/<owner>/<repo>`, set from the website)
 
+### Project ID derivation
+
+Derived only by the daemon's Router, using the pure functions in `traction-core` (`git_project_id`, `dir_project_id`, `normalize_origin`). `||` is byte concatenation, `0x00` is the fixed separator, and the digest is lowercase hex.
+
+- `git:` = `"git:" || hex(SHA-256(lower(root_commit_hex) || 0x00 || normalize_origin(origin)))`. A missing or blank `origin` hashes as the empty string.
+- `dir:` = `"dir:" || hex(SHA-256(device_secret || 0x00 || canonical_root_utf8))`. `device_secret` is the 32-byte per-device secret, so a `dir:` ID cannot be confirmed from a path alone.
+- **Origin normalization:** trim whitespace; strip the scheme, userinfo and port; lowercase the host (path case is kept); rewrite scp-style `user@host:owner/repo` to `host/owner/repo`; strip any trailing `/` and `.git`. Local paths (`file://`, Windows drive paths) keep only their path. `https://github.com/A/B.git`, `git@github.com:A/B` and `ssh://git@github.com:22/A/B/` all normalize to `github.com/A/B`.
+
 ## 3. Server Sync Heartbeat (Every 2 Minutes — No PII)
 
 Sent to `POST /v1/anchors` per `project_id`, containing aggregated 60-second `WorkBucket` records plus the rolling chain tip:
