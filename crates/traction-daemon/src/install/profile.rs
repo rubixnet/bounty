@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::files::replace_file;
+use crate::fsutil::replace_file;
 
 pub const BLOCK_START: &str = "# >>> traction >>>";
 pub const BLOCK_END: &str = "# <<< traction <<<";

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use super::ordered_json::Json;
 use crate::claude_code::hook::{HOOK_PATH, Hook};
-use crate::fsutil::write_atomically;
+use crate::fsutil::replace_file;
 
 /// The suffix of the one-time copy of the user's original file.
 pub const BACKUP_SUFFIX: &str = ".traction-backup";
@@ -57,7 +57,8 @@ pub struct SettingsOutcome {
 
 /// Merges Traction's hooks for `port` into the file at `path`: created when
 /// missing, backed up once before the first edit, written through a temp
-/// file and a rename in the same folder, and left untouched on any error.
+/// file and a rename (at a symlink's target, keeping its permissions), and
+/// left untouched on any error.
 pub fn install(path: &Path, port: u16) -> Result<SettingsOutcome, SettingsError> {
     let original = match fs::read(path) {
         Ok(bytes) => Some(bytes),
@@ -72,26 +73,23 @@ pub fn install(path: &Path, port: u16) -> Result<SettingsOutcome, SettingsError>
         });
     }
 
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
     let name = path
         .file_name()
-        .and_then(|name| name.to_str())
         .ok_or_else(|| SettingsError::Malformed("the settings path has no file name".into()))?;
-    fs::create_dir_all(dir).map_err(SettingsError::Io)?;
 
     let mut backup_written = None;
     if let Some(original) = &original {
-        let backup_name = format!("{name}{BACKUP_SUFFIX}");
-        let backup = dir.join(&backup_name);
+        let mut backup_name = name.to_os_string();
+        backup_name.push(BACKUP_SUFFIX);
+        let backup = path.with_file_name(backup_name);
         if !backup.exists() {
-            write_atomically(dir, &backup_name, original).map_err(SettingsError::Io)?;
+            replace_file(&backup, original).map_err(SettingsError::Io)?;
             backup_written = Some(backup);
         }
     }
-    write_atomically(dir, name, &merged).map_err(SettingsError::Io)?;
+    // A symlinked settings file is written at its target, so the link and
+    // the target's permissions survive.
+    replace_file(path, &merged).map_err(SettingsError::Io)?;
     Ok(SettingsOutcome {
         changed: true,
         backup_written,

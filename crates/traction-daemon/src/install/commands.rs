@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::files::replace_file;
+use crate::fsutil::replace_file;
 use crate::claude_code::pause::Command;
 
 /// The frontmatter comment that marks a command file as Traction's.

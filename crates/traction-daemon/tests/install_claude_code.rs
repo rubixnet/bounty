@@ -470,6 +470,34 @@ fn the_original_is_backed_up_once_and_never_overwritten() {
     assert_eq!(setup.settings_json()["model"], "sonnet");
 }
 
+/// A dotfile manager's symlinked `settings.json` stays a link: the merge
+/// lands in its target, which keeps its permissions.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_settings_file_stays_a_link_and_its_target_gets_the_merge() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let setup = Setup::new();
+    let target = setup.dir.path().join("dotfiles").join("settings.json");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, USER_SETTINGS).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::create_dir_all(setup.settings().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, setup.settings()).unwrap();
+
+    setup.install_ok();
+
+    let link = fs::symlink_metadata(setup.settings()).unwrap();
+    assert!(link.file_type().is_symlink(), "settings.json is still a link");
+    assert_eq!(fs::read_link(setup.settings()).unwrap(), target);
+    let merged: Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+    assert_eq!(traction_entries(&merged, "SessionStart").len(), 1);
+    assert_eq!(merged["model"], "opus");
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "the target keeps its permissions");
+    assert_eq!(fs::read_to_string(setup.backup()).unwrap(), USER_SETTINGS);
+}
+
 #[test]
 fn the_default_settings_path_is_in_claude_config_dir() {
     let setup = Setup::new();
