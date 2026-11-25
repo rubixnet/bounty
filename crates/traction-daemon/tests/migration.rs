@@ -20,10 +20,15 @@ use traction_daemon::PROJECT_EVENT_VIEW;
 
 const WAIT: Duration = Duration::from_secs(10);
 
+// The helpers below leave out `FILE_MUTATION` rows: the file watcher
+// records the fixture's own `git init` and commit as hand edits.
+
 /// Every column of every stored event, as text, ordered by `event_id`.
 fn full_rows(db: &Connection) -> Vec<Vec<String>> {
     let mut stmt = db
-        .prepare("SELECT * FROM traction_event ORDER BY event_id")
+        .prepare(
+            "SELECT * FROM traction_event WHERE event_type <> 'FILE_MUTATION' ORDER BY event_id",
+        )
         .expect("prepare");
     let columns = stmt.column_count();
     stmt.query_map([], |row| {
@@ -43,7 +48,7 @@ fn full_rows(db: &Connection) -> Vec<Vec<String>> {
 fn project_events(db: &Connection, project_id: &str) -> Vec<String> {
     let mut stmt = db
         .prepare(&format!(
-            "SELECT event_id FROM {PROJECT_EVENT_VIEW} WHERE project_id = ?1 ORDER BY event_id"
+            "SELECT event_id FROM {PROJECT_EVENT_VIEW} WHERE project_id = ?1 AND event_type <> 'FILE_MUTATION' ORDER BY event_id"
         ))
         .expect("prepare");
     stmt.query_map([project_id], |row| row.get(0))
@@ -73,7 +78,11 @@ fn merged_into(db: &Connection, project_id: &str) -> Option<String> {
 
 fn stored_count(data_dir: &Path) -> i64 {
     open_db_read_only(data_dir)
-        .query_row("SELECT COUNT(*) FROM traction_event", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM traction_event WHERE event_type <> 'FILE_MUTATION'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap_or(0)
 }
 

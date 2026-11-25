@@ -20,13 +20,14 @@ mod secret;
 mod socket;
 mod storage;
 mod token;
+mod watcher;
 mod writer;
 
 pub use bus::{EVENT_PATH, MAX_BODY_BYTES, PROJECT_PATH};
 pub use config::{
     ConfigError, DEFAULT_COMMIT_INTERVAL, DEFAULT_GIT_PROGRAM, DEFAULT_HTTP_PORT,
-    DEFAULT_MAX_BATCH, DEFAULT_WRITER_QUEUE_CAPACITY, DaemonConfig, GLOBAL_IGNORE_FILE,
-    WriterSettings,
+    DEFAULT_MAX_BATCH, DEFAULT_WATCHER_PENDING_CAP, DEFAULT_WRITER_QUEUE_CAPACITY, DaemonConfig,
+    GLOBAL_IGNORE_FILE, LOG_TAIL_HOLD, WatcherSettings, WriterSettings,
 };
 #[cfg(unix)]
 pub use config::{DATA_DIR_SOCKET_FILE, RUNTIME_SOCKET_FILE, default_socket_path};

@@ -22,6 +22,13 @@ pub const DEFAULT_GIT_PROGRAM: &str = "git";
 /// The global ignore file inside the data folder: one folder per line
 /// (absolute or `~/`), `#` comments. Events in a listed folder are dropped.
 pub const GLOBAL_IGNORE_FILE: &str = "ignored-folders";
+/// How long the file watcher holds each observed mutation before deciding
+/// it (`docs/protocol.md` section 2): a delivery-lag buffer, so late
+/// log-tailed events can still claim the edit. Not an attribution window.
+pub const LOG_TAIL_HOLD: Duration = Duration::from_secs(5);
+/// Files the watcher may hold per Project at once; past this, the oldest
+/// held mutation of that Project is decided early (bounded memory).
+pub const DEFAULT_WATCHER_PENDING_CAP: usize = 1024;
 /// The bus socket's file name inside `$XDG_RUNTIME_DIR`.
 #[cfg(unix)]
 pub const RUNTIME_SOCKET_FILE: &str = "traction.sock";
@@ -47,6 +54,8 @@ pub struct DaemonConfig {
     /// [`DEFAULT_GIT_PROGRAM`] from `PATH`; tests name a missing program to
     /// stand for "no `git` on `PATH`".
     pub git_program: PathBuf,
+    /// File watcher tuning.
+    pub watcher: WatcherSettings,
     /// The Local Ingestion Bus Unix socket (macOS/Linux only). Default from
     /// [`default_socket_path`].
     #[cfg(unix)]
@@ -67,6 +76,7 @@ impl DaemonConfig {
             writer: WriterSettings::default(),
             home_dir: std::env::home_dir().filter(|home| home.is_absolute()),
             git_program: PathBuf::from(DEFAULT_GIT_PROGRAM),
+            watcher: WatcherSettings::default(),
         }
     }
 
@@ -97,6 +107,26 @@ impl Default for WriterSettings {
             commit_interval: DEFAULT_COMMIT_INTERVAL,
             max_batch: DEFAULT_MAX_BATCH,
             queue_capacity: DEFAULT_WRITER_QUEUE_CAPACITY,
+        }
+    }
+}
+
+/// File watcher tuning. Production always uses the defaults; the fields are
+/// public only so tests can shorten the hold or shrink the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WatcherSettings {
+    /// Test-only override of [`LOG_TAIL_HOLD`].
+    pub hold: Duration,
+    /// Held files per Project before the oldest is decided early.
+    pub pending_cap: usize,
+}
+
+impl Default for WatcherSettings {
+    fn default() -> Self {
+        Self {
+            hold: LOG_TAIL_HOLD,
+            pending_cap: DEFAULT_WATCHER_PENDING_CAP,
         }
     }
 }

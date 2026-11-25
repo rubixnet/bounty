@@ -39,7 +39,7 @@ use std::time::SystemTime as Stamp;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
-use traction_core::{TractionEvent, dir_project_id, git_project_id};
+use traction_core::{NetworkClass, TractionEvent, dir_project_id, git_project_id};
 
 use crate::exclusions::{Exclusions, has_project_marker};
 use crate::git::Git;
@@ -196,14 +196,12 @@ impl Router {
     }
 
     /// Adds a hook told about every Project registered from now on.
-    #[allow(dead_code, reason = "attached by the file watcher (step 1b ticket 07)")]
     pub fn add_project_hook(&mut self, hook: ProjectHook) {
         self.hooks.push(hook);
     }
 
     /// Every registered (non-merged) Project, including those loaded at
     /// startup.
-    #[allow(dead_code, reason = "read by the file watcher (step 1b ticket 07)")]
     pub fn projects(&self) -> impl Iterator<Item = &RegisteredProject> {
         self.projects.values()
     }
@@ -579,6 +577,39 @@ impl Router {
         }
     }
 
+    /// Decides who a held `FILE_MUTATION` belongs to, at the end of its hold.
+    ///
+    /// The watcher builds every mutation as manual work (no Harness, no
+    /// session, `network_class: manual`). This is the single attribution
+    /// decision point: it runs on the Router thread, after every event the
+    /// bus accepted before the hold ended, so window state built from those
+    /// events (step 1b ticket 08) can claim the edit here by copying the
+    /// winning session's `harness_id`, `session_id` and `network_class`.
+    fn attribute(&self, mutation: &mut TractionEvent) {
+        debug_assert!(mutation.harness_id.is_none() && mutation.session_id.is_none());
+        mutation.network_class = NetworkClass::Manual;
+    }
+
+    /// Attributes a watcher `FILE_MUTATION`, re-checks it against the
+    /// Traction Event rules and queues it for the writer. Its `project_id`
+    /// and `cwd` (the Project Root) come from the watcher; the bus policy
+    /// does not apply to the daemon's own events.
+    fn handle_mutation(&mut self, mut mutation: TractionEvent) {
+        // Held across a migration: store it under the final (`git:`) ID.
+        mutation.project_id = mutation.project_id.map(|id| self.final_id(&id));
+        self.attribute(&mut mutation);
+        if mutation.validate().is_err() {
+            log::warn("dropped a file watcher mutation that is not a valid Traction Event");
+            return;
+        }
+        match EventRow::try_from(mutation) {
+            Ok(row) => self.write(WriteOp::Event(Box::new(row))),
+            Err(_) => {
+                log::warn("dropped a file watcher mutation that does not fit the events table")
+            }
+        }
+    }
+
     /// Routes `event` and queues it for the writer.
     fn handle_event(&mut self, event: TractionEvent) {
         let Some(event) = self.route(event) else {
@@ -613,6 +644,8 @@ pub type RegisterReply = Result<String, RegisterError>;
 
 enum RouterMessage {
     Event(Box<TractionEvent>),
+    /// A held watcher `FILE_MUTATION` whose hold just ended.
+    Mutation(Box<TractionEvent>),
     Register {
         path: PathBuf,
         reply: oneshot::Sender<RegisterReply>,
@@ -641,6 +674,14 @@ impl RouterSender {
         let (reply, answer) = oneshot::channel();
         self.try_send(RouterMessage::Register { path, reply })?;
         Ok(answer)
+    }
+
+    /// Queues a watcher `FILE_MUTATION` for attribution and storage,
+    /// waiting while the queue is full (only the watcher thread calls it).
+    pub fn send_mutation(&self, mutation: TractionEvent) -> Result<(), RouterBusy> {
+        self.0
+            .send(RouterMessage::Mutation(Box::new(mutation)))
+            .map_err(|_| RouterBusy)
     }
 
     fn try_send(&self, message: RouterMessage) -> Result<(), RouterBusy> {
@@ -673,6 +714,7 @@ fn run(mut router: Router, receiver: &Receiver<RouterMessage>) {
     for message in receiver {
         match message {
             RouterMessage::Event(event) => router.handle_event(*event),
+            RouterMessage::Mutation(mutation) => router.handle_mutation(*mutation),
             RouterMessage::Register { path, reply } => {
                 // The caller may have given up waiting; nothing to do then.
                 let _ = reply.send(router.register_path(&path));

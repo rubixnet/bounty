@@ -4,11 +4,11 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Hand edits in a Project registered via `/v1/project` produce rows with correct `mutation_kind` (created/modified/removed), no Harness/session, `manual`.
-- [ ] `.gitignore`d, `.tractionignore`d, `node_modules`, `.git` edits produce no rows; a burst of saves → one row; created-then-removed → no row.
-- [ ] Restart with 2 registered Projects (one via routed event, one via endpoint) → edits in both produce rows; a deleted root doesn't stop startup; edits during downtime produce no rows.
-- [ ] Sentinel scan: file name and contents with a sentinel never reach any table, DB or WAL file.
-- [ ] Graceful shutdown flushes pending mutations; no polling loop at idle; per-Project pending cap.
-- [ ] Hold is a single public constant with a test-only config override.
+- [x] Hand edits in a Project registered via `/v1/project` produce rows with correct `mutation_kind` (created/modified/removed), no Harness/session, `manual`.
+- [x] `.gitignore`d, `.tractionignore`d, `node_modules`, `.git` edits produce no rows; a burst of saves → one row; created-then-removed → no row.
+- [x] Restart with 2 registered Projects (one via routed event, one via endpoint) → edits in both produce rows; a deleted root doesn't stop startup; edits during downtime produce no rows.
+- [x] Sentinel scan: file name and contents with a sentinel never reach any table, DB or WAL file.
+- [x] Graceful shutdown flushes pending mutations; no polling loop at idle; per-Project pending cap.
+- [x] Hold is a single public constant with a test-only config override.

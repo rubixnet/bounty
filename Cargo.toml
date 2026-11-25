@@ -29,4 +29,10 @@ subtle = { version = "2.6.1", default-features = false }
 sha2 = { version = "0.11.1", default-features = false }
 # Windows-only: the single-instance named mutex (traction-daemon `lock.rs`).
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+# Daemon: the file watcher (OS backends only, no polling) and its
+# ignore-file matcher (gitignore semantics).
+notify = { version = "9.0.0", default-features = false, features = ["macos_fsevent"] }
+ignore = { version = "0.4.35", default-features = false }
+# macOS-only: raising the soft open-file limit for FSEvents (watcher.rs).
+libc = { version = "0.2.191", default-features = false }
 tempfile = { version = "3.27.0", default-features = false }

@@ -61,10 +61,16 @@ impl TestDaemon {
     }
 
     /// Starts a new daemon on the data folder of a previous, shut-down one.
-    pub fn restart(mut self) -> Self {
+    pub fn restart(self) -> Self {
+        self.restart_with(|_| {})
+    }
+
+    /// [`Self::restart`], letting the test adjust the new daemon's config.
+    pub fn restart_with(mut self, adjust: impl FnOnce(&mut DaemonConfig)) -> Self {
         self.shutdown();
         let mut config = test_config(self.data_dir.path());
         config.home_dir = Some(self.home());
+        adjust(&mut config);
         let handle = traction_daemon::start(config).expect("daemon restarts");
         self.addr = handle.local_addr();
         self.handle = Some(handle);
@@ -139,6 +145,84 @@ impl TestDaemon {
         self.shutdown();
         open_db_read_only(self.data_dir())
     }
+
+    /// A read-only connection to the running daemon's database (WAL readers
+    /// never block the writer). Sees only committed batches.
+    pub fn live_db(&self) -> Connection {
+        open_db_read_only(self.data_dir())
+    }
+
+    /// Polls the running daemon until exactly `count` `FILE_MUTATION` rows
+    /// are committed (panics on more, or after [`WATCH_DEADLINE`]).
+    pub fn wait_for_mutations(&self, count: usize) -> Vec<MutationRow> {
+        let db = self.live_db();
+        poll_until(WATCH_DEADLINE, "FILE_MUTATION rows", || {
+            let rows = stored_mutations(&db);
+            assert!(
+                rows.len() <= count,
+                "more mutations than expected: {rows:?}"
+            );
+            (rows.len() == count).then_some(rows)
+        })
+    }
+}
+
+/// How long a test waits for the watcher: generous, for loaded CI runners.
+pub const WATCH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Watcher test settings: a short hold (the test-only override of
+/// `LOG_TAIL_HOLD`) and frequent commits, so rows appear while the daemon
+/// runs.
+pub fn fast_watcher(config: &mut DaemonConfig) {
+    config.writer.commit_interval = Duration::from_millis(50);
+    config.watcher.hold = Duration::from_secs(1);
+}
+
+/// A stored `FILE_MUTATION`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationRow {
+    pub project_id: Option<String>,
+    pub cwd: Option<String>,
+    pub harness_id: Option<String>,
+    pub session_id: Option<String>,
+    pub network_class: String,
+    pub attribution_source: String,
+    pub mutation_kind: Option<String>,
+}
+
+/// Every stored `FILE_MUTATION`, oldest first.
+pub fn stored_mutations(db: &Connection) -> Vec<MutationRow> {
+    let mut stmt = db
+        .prepare(
+            "SELECT project_id, cwd, harness_id, session_id, network_class,
+                    attribution_source, mutation_kind
+             FROM traction_event WHERE event_type = 'FILE_MUTATION' ORDER BY timestamp_ms, event_id",
+        )
+        .expect("prepare");
+    stmt.query_map([], |row| {
+        Ok(MutationRow {
+            project_id: row.get(0)?,
+            cwd: row.get(1)?,
+            harness_id: row.get(2)?,
+            session_id: row.get(3)?,
+            network_class: row.get(4)?,
+            attribution_source: row.get(5)?,
+            mutation_kind: row.get(6)?,
+        })
+    })
+    .expect("query")
+    .map(|row| row.expect("row"))
+    .collect()
+}
+
+/// The sorted `mutation_kind`s of `rows`.
+pub fn kinds(rows: &[MutationRow]) -> Vec<String> {
+    let mut kinds: Vec<String> = rows
+        .iter()
+        .map(|row| row.mutation_kind.clone().expect("mutation_kind"))
+        .collect();
+    kinds.sort();
+    kinds
 }
 
 impl Drop for TestDaemon {
@@ -577,4 +661,58 @@ pub fn registered_projects(db: &Connection) -> Vec<ProjectRow> {
     .expect("query")
     .map(|row| row.expect("row"))
     .collect()
+}
+
+/// Counts copies of `needle` in every column of every table, read as text.
+pub fn sentinel_hits_in_tables(db: &Connection, needle: &str) -> usize {
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")
+        .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect())
+        .expect("list tables");
+    assert!(tables.iter().any(|t| t == "traction_event"));
+    let mut hits = 0;
+    for table in tables {
+        let columns: Vec<String> = db
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect())
+            .expect("list columns");
+        for column in columns {
+            let sql = format!(
+                "SELECT COUNT(*) FROM \"{table}\" WHERE instr(CAST(\"{column}\" AS TEXT), ?1) > 0"
+            );
+            let count: i64 = db
+                .query_row(&sql, [needle], |row| row.get(0))
+                .expect("scan column");
+            hits += usize::try_from(count).expect("non-negative");
+        }
+    }
+    hits
+}
+
+/// Asserts no file in `data_dir` (database, `-wal`/`-shm`, token, secret)
+/// holds `needle` as raw bytes. Call after shutdown. Returns the names
+/// scanned.
+pub fn assert_no_file_contains(data_dir: &Path, needle: &str) -> Vec<String> {
+    let mut scanned = Vec::new();
+    for entry in std::fs::read_dir(data_dir).expect("data folder") {
+        let path = entry.expect("entry").path();
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read file");
+        assert!(
+            !bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes()),
+            "sentinel found in {}",
+            path.display()
+        );
+        scanned.push(
+            path.file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    scanned
 }
