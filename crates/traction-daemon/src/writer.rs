@@ -5,9 +5,18 @@
 //! rows, whichever comes first. When every [`WriterSender`] has been dropped,
 //! the thread drains the channel, commits and exits; [`WriterThread::join`]
 //! waits for that, so a graceful shutdown loses nothing already accepted.
+//!
+//! A failed commit (SQLite busy past its timeout, disk full, I/O error) keeps
+//! the batch and retries it `commit_interval` later. Inserts ignore a repeated
+//! `event_id`, so a retry never double-stores. While a failed batch is full,
+//! the writer stops taking rows: the channel fills and the bus answers `503`,
+//! so memory stays bounded by `max_batch + queue_capacity`. Only the final
+//! commit at shutdown gives up, logging that the batch was dropped.
 
 use std::io;
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -40,12 +49,18 @@ impl WriterSender {
     }
 }
 
-pub struct WriterThread(JoinHandle<()>);
+pub struct WriterThread {
+    handle: JoinHandle<()>,
+    stopping: Arc<AtomicBool>,
+}
 
 impl WriterThread {
-    /// Waits until all senders are gone and the final batch is committed.
+    /// Waits until the final batch is committed. Call it after every sender
+    /// is gone; it also wakes a writer that is waiting to retry a full batch.
     pub fn join(self) -> thread::Result<()> {
-        self.0.join()
+        self.stopping.store(true, Ordering::Release);
+        self.handle.thread().unpark();
+        self.handle.join()
     }
 }
 
@@ -54,46 +69,107 @@ pub fn spawn(
     settings: WriterSettings,
 ) -> io::Result<(WriterSender, WriterThread)> {
     let (sender, receiver) = mpsc::sync_channel(settings.queue_capacity.max(1));
-    let thread = thread::Builder::new()
+    let stopping = Arc::new(AtomicBool::new(false));
+    let writer = Writer {
+        conn,
+        receiver,
+        commit_interval: settings.commit_interval,
+        max_batch: settings.max_batch.max(1),
+        stopping: Arc::clone(&stopping),
+        batch: Vec::new(),
+        deadline: None,
+    };
+    let handle = thread::Builder::new()
         .name("traction-sqlite-writer".to_owned())
-        .spawn(move || run(conn, receiver, settings))?;
-    Ok((WriterSender(sender), WriterThread(thread)))
+        .spawn(move || writer.run())?;
+    Ok((WriterSender(sender), WriterThread { handle, stopping }))
 }
 
-fn run(mut conn: Connection, receiver: mpsc::Receiver<Box<EventRow>>, settings: WriterSettings) {
-    let max_batch = settings.max_batch.max(1);
-    let mut batch: Vec<EventRow> = Vec::new();
-    let mut deadline: Option<Instant> = None;
-    loop {
-        let received = match deadline {
-            None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(at) => receiver.recv_timeout(at.saturating_duration_since(Instant::now())),
-        };
-        match received {
-            Ok(row) => {
-                if batch.is_empty() {
-                    deadline = Some(Instant::now() + settings.commit_interval);
+struct Writer {
+    conn: Connection,
+    receiver: Receiver<Box<EventRow>>,
+    commit_interval: Duration,
+    max_batch: usize,
+    stopping: Arc<AtomicBool>,
+    batch: Vec<EventRow>,
+    /// When the pending batch is committed (or a failed one retried).
+    deadline: Option<Instant>,
+}
+
+impl Writer {
+    fn run(mut self) {
+        loop {
+            if self.batch.len() >= self.max_batch {
+                // Only a failed batch stays full: wait for its retry without
+                // taking rows, so the bus sees a full queue.
+                if self.stopping.load(Ordering::Acquire) {
+                    return self.finish();
                 }
-                batch.push(*row);
-                if batch.len() >= max_batch {
-                    commit(&mut conn, &mut batch, &mut deadline);
+                if let Some(at) = self.deadline {
+                    thread::park_timeout(at.saturating_duration_since(Instant::now()));
                 }
+                if self.deadline.is_some_and(|at| Instant::now() >= at) {
+                    self.commit();
+                }
+                continue;
             }
-            Err(RecvTimeoutError::Timeout) => commit(&mut conn, &mut batch, &mut deadline),
-            Err(RecvTimeoutError::Disconnected) => {
-                commit(&mut conn, &mut batch, &mut deadline);
-                return;
+            let received = match self.deadline {
+                None => self
+                    .receiver
+                    .recv()
+                    .map_err(|_| RecvTimeoutError::Disconnected),
+                Some(at) => self
+                    .receiver
+                    .recv_timeout(at.saturating_duration_since(Instant::now())),
+            };
+            match received {
+                Ok(row) => {
+                    if self.batch.is_empty() {
+                        self.deadline = Some(Instant::now() + self.commit_interval);
+                    }
+                    self.batch.push(*row);
+                    if self.batch.len() >= self.max_batch {
+                        self.commit();
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => self.commit(),
+                Err(RecvTimeoutError::Disconnected) => return self.finish(),
             }
         }
     }
-}
 
-fn commit(conn: &mut Connection, batch: &mut Vec<EventRow>, deadline: &mut Option<Instant>) {
-    if !batch.is_empty()
-        && let Err(error) = storage::insert_batch(conn, batch)
-    {
-        log::error("failed to commit a batch of Traction Events", &error);
+    /// Commits the batch. On failure keeps it and schedules a retry.
+    fn commit(&mut self) {
+        if self.batch.is_empty() {
+            self.deadline = None;
+            return;
+        }
+        match storage::insert_batch(&mut self.conn, &self.batch) {
+            Ok(()) => {
+                self.batch.clear();
+                self.deadline = None;
+            }
+            Err(error) => {
+                log::error(
+                    "failed to commit a batch of Traction Events, will retry",
+                    &error,
+                );
+                self.deadline = Some(Instant::now() + self.commit_interval);
+            }
+        }
     }
-    batch.clear();
-    *deadline = None;
+
+    /// Shutdown: every sender is gone. Takes what is left in the channel and
+    /// makes one last commit attempt.
+    fn finish(mut self) {
+        self.batch.extend(self.receiver.try_iter().map(|row| *row));
+        if !self.batch.is_empty()
+            && let Err(error) = storage::insert_batch(&mut self.conn, &self.batch)
+        {
+            log::error(
+                "failed to commit Traction Events at shutdown, they were dropped",
+                &error,
+            );
+        }
+    }
 }

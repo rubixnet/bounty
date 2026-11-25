@@ -80,7 +80,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     )
     .map_err(StartError::Runtime)?;
 
-    let bus = Arc::new(Bus::new(token, writer_sender));
+    let bus = Arc::new(Bus::new(token, writer_sender, local_addr.port()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = thread::Builder::new()
         .name("traction-bus".to_owned())
