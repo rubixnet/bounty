@@ -41,7 +41,7 @@ fn every_accepted_event_is_stored_and_the_database_is_in_wal_mode() {
     let schema_version: i64 = db
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user_version");
-    assert_eq!(schema_version, 3);
+    assert_eq!(schema_version, 4);
 }
 
 #[test]

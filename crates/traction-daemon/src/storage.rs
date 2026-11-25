@@ -1,6 +1,6 @@
 //! SQLite persistence: bundled SQLite in WAL mode with `synchronous=NORMAL`,
 //! a versioned (`user_version`) migration list, the append-only events
-//! table and the Project registry tables.
+//! table, the Project registry tables and the Session Pause spans.
 //!
 //! Only validated, typed Traction Event fields are written. No column ever
 //! holds a request body. The single writer thread (`writer.rs`) owns the only
@@ -38,6 +38,7 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT, WITHOUT ROWID;",
     MIGRATION_2,
     MIGRATION_3,
+    MIGRATION_4,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -171,6 +172,24 @@ const MIGRATION_3: &str = "
         e.project_id AS stored_project_id
     FROM traction_event AS e
     LEFT JOIN resolved ON resolved.alias_id = e.project_id;
+";
+
+/// Step 1c: Session Pause spans (`/stop-track` .. `/resume-track`).
+///
+/// One row per span; `to_ms` is `NULL` while the span is open, and a
+/// session has at most one open span. Only the daemon's single writer
+/// inserts a span and closes it; the Router loads them at startup.
+const MIGRATION_4: &str = "
+    CREATE TABLE session_pause (
+        harness_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        from_ms    INTEGER NOT NULL,
+        to_ms      INTEGER,
+        PRIMARY KEY (harness_id, session_id, from_ms),
+        CHECK (to_ms IS NULL OR to_ms >= from_ms)
+    ) STRICT, WITHOUT ROWID;
+    CREATE UNIQUE INDEX session_pause_open
+        ON session_pause (harness_id, session_id) WHERE to_ms IS NULL;
 ";
 
 /// The alias-aware events view (see [`MIGRATION_3`]).
@@ -331,6 +350,16 @@ pub struct SessionRow {
     pub last_cwd: Option<String>,
 }
 
+/// A Session Pause span (`session_pause` table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PauseSpanRow {
+    pub harness_id: HarnessId,
+    pub session_id: String,
+    pub from_ms: i64,
+    /// `None` while the session is still paused.
+    pub to_ms: Option<i64>,
+}
+
 /// One write the single writer applies, in channel order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOp {
@@ -343,6 +372,11 @@ pub enum WriteOp {
     Session(SessionRow),
     /// Alias-only `dir:` -> `git:` migration, in the batch's transaction.
     Migration(MigrationRow),
+    /// Opens a pause span (`to_ms` unset). Ignored when the session
+    /// already has an open span.
+    PauseStart(PauseSpanRow),
+    /// Closes the session's open span starting at `from_ms` at `to_ms`.
+    PauseEnd(PauseSpanRow),
 }
 
 /// Migrates the `dir:` Project `alias_id` into `into`: registers `into`
@@ -378,6 +412,8 @@ pub struct StoredRegistry {
     /// `project_alias` rows: (`alias_id`, `project_id`).
     pub aliases: Vec<(String, String)>,
     pub sessions: Vec<SessionRow>,
+    /// Every Session Pause span, open and closed.
+    pub pauses: Vec<PauseSpanRow>,
 }
 
 /// Loads the [`StoredRegistry`].
@@ -386,6 +422,7 @@ pub fn load_registry(conn: &Connection) -> rusqlite::Result<StoredRegistry> {
         projects: load_projects(conn)?,
         aliases: load_aliases(conn)?,
         sessions: load_sessions(conn)?,
+        pauses: load_pauses(conn)?,
     })
 }
 
@@ -438,7 +475,7 @@ pub fn load_sessions(conn: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
     for row in rows {
         let (harness, session_id, start_folder, last_cwd) = row?;
         // Only daemon-written spellings are stored; skip anything else.
-        let Some(harness_id) = HarnessId::ALL.into_iter().find(|h| h.as_str() == harness) else {
+        let Some(harness_id) = harness_by_name(&harness) else {
             continue;
         };
         sessions.push(SessionRow {
@@ -451,6 +488,40 @@ pub fn load_sessions(conn: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
     Ok(sessions)
 }
 
+/// Every stored Session Pause span, oldest first.
+pub fn load_pauses(conn: &Connection) -> rusqlite::Result<Vec<PauseSpanRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT harness_id, session_id, from_ms, to_ms FROM session_pause ORDER BY from_ms",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get(2)?,
+            row.get(3)?,
+        ))
+    })?;
+    let mut pauses = Vec::new();
+    for row in rows {
+        let (harness, session_id, from_ms, to_ms) = row?;
+        let Some(harness_id) = harness_by_name(&harness) else {
+            continue;
+        };
+        pauses.push(PauseSpanRow {
+            harness_id,
+            session_id,
+            from_ms,
+            to_ms,
+        });
+    }
+    Ok(pauses)
+}
+
+/// The Harness stored as `name` (only daemon-written spellings exist).
+fn harness_by_name(name: &str) -> Option<HarnessId> {
+    HarnessId::ALL.into_iter().find(|h| h.as_str() == name)
+}
+
 /// Applies a batch of writes in order, in one transaction.
 pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
@@ -460,6 +531,8 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
             WriteOp::Project(project) => insert_project(&tx, project)?,
             WriteOp::Session(session) => upsert_session(&tx, session)?,
             WriteOp::Migration(migration) => migrate_project(&tx, migration)?,
+            WriteOp::PauseStart(span) => start_pause(&tx, span)?,
+            WriteOp::PauseEnd(span) => end_pause(&tx, span)?,
         }
     }
     tx.commit()
@@ -520,6 +593,33 @@ fn migrate_project(conn: &Connection, row: &MigrationRow) -> rusqlite::Result<()
         "UPDATE project SET merged_into = ?2 WHERE project_id = ?1 AND merged_into IS NULL",
     )?
     .execute(params![row.alias_id, target])?;
+    Ok(())
+}
+
+fn start_pause(conn: &Connection, row: &PauseSpanRow) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO session_pause (harness_id, session_id, from_ms, to_ms)
+         VALUES (?1, ?2, ?3, NULL)",
+    )?
+    .execute(params![
+        row.harness_id.as_str(),
+        row.session_id,
+        row.from_ms
+    ])?;
+    Ok(())
+}
+
+fn end_pause(conn: &Connection, row: &PauseSpanRow) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "UPDATE session_pause SET to_ms = ?4
+         WHERE harness_id = ?1 AND session_id = ?2 AND from_ms = ?3 AND to_ms IS NULL",
+    )?
+    .execute(params![
+        row.harness_id.as_str(),
+        row.session_id,
+        row.from_ms,
+        row.to_ms,
+    ])?;
     Ok(())
 }
 
