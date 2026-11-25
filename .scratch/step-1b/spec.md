@@ -1,14 +1,16 @@
 # Step 1b: Project Router (root resolution, Project IDs, hardened Git, file watcher, schema room)
 
-Status: ready-for-agent
+Status: resolved
 
 Source: `docs/roadmap.md` (Step 1b), `docs/steps.md` (Step 1, Build item 3 and the `.tractionignore` part of item 5), `docs/protocol.md` sections 2 and 2a, `docs/adr/0001-track-every-project-folder-with-full-paths.md`, and the AGENTS.md invariants "Untrusted-Repo Git Hardening", "Project Tracking Scope", "`FILE_MUTATION` Attribution" and "`TractionEvent` Schema Room".
 
 Gate items this sub-step owns (from the Step 1 Exit Gate):
 
-- [ ] Switching across 3 Git repos (including a Git worktree) and 2 non-Git Project folders routes all events to the correct Project IDs without touching `.git/index.lock`. System and dependency folders never become Projects. `git init` on a tracked folder migrates its history.
-- [ ] Hand-editing files in a known Project with no Harness running produces `FILE_MUTATION` events.
-- [ ] (AGENTS.md red-team requirement) A repo-local `core.fsmonitor` command never executes.
+- [x] Switching across 3 Git repos (including a Git worktree) and 2 non-Git Project folders routes all events to the correct Project IDs without touching `.git/index.lock`. System and dependency folders never become Projects. `git init` on a tracked folder migrates its history.
+- [x] Hand-editing files in a known Project with no Harness running produces `FILE_MUTATION` events.
+- [x] (AGENTS.md red-team requirement) A repo-local `core.fsmonitor` command never executes.
+
+Gate evidence: 3-OS CI green on `21deeb9` (https://github.com/rubixnet/bounty/actions/runs/45612520436).
 
 ## Problem Statement
 
