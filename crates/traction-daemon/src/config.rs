@@ -74,6 +74,11 @@ pub struct DaemonConfig {
     pub git_program: PathBuf,
     /// File watcher tuning.
     pub watcher: WatcherSettings,
+    /// Claude Code's config folder, whose `projects/` the transcript tailer
+    /// watches. Default: `$CLAUDE_CONFIG_DIR` when absolute, else
+    /// `<home>/.claude`. `None` turns the tailer off. Tests point it at a
+    /// folder under their fake home.
+    pub claude_config_dir: Option<PathBuf>,
     /// The Local Ingestion Bus Unix socket (macOS/Linux only). Default from
     /// [`default_socket_path`].
     #[cfg(unix)]
@@ -83,6 +88,7 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     /// Production defaults on the given data folder.
     pub fn new(data_dir: PathBuf) -> Self {
+        let home = std::env::home_dir().filter(|home| home.is_absolute());
         Self {
             #[cfg(unix)]
             socket_path: default_socket_path(
@@ -92,7 +98,11 @@ impl DaemonConfig {
             data_dir,
             http_port: DEFAULT_HTTP_PORT,
             writer: WriterSettings::default(),
-            home_dir: std::env::home_dir().filter(|home| home.is_absolute()),
+            claude_config_dir: default_claude_config_dir(
+                std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+                home.as_deref(),
+            ),
+            home_dir: home,
             git_program: PathBuf::from(DEFAULT_GIT_PROGRAM),
             watcher: WatcherSettings::default(),
         }
@@ -156,6 +166,19 @@ impl Default for WatcherSettings {
     }
 }
 
+/// Claude Code's config folder: `$CLAUDE_CONFIG_DIR` when set and
+/// absolute, else `<home>/.claude`. Takes the variable's value instead of
+/// reading the environment, so it is testable.
+pub fn default_claude_config_dir(
+    claude_config_dir: Option<&std::ffi::OsStr>,
+    home: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    match claude_config_dir.map(std::path::Path::new) {
+        Some(dir) if dir.is_absolute() => Some(dir.to_path_buf()),
+        _ => home.map(|home| home.join(".claude")),
+    }
+}
+
 /// The default bus socket: `$XDG_RUNTIME_DIR/traction.sock`, else
 /// `<data dir>/daemon.sock`. Takes the variable's value instead of reading the
 /// environment, so it is testable. An empty or relative value counts as
@@ -187,6 +210,23 @@ impl std::error::Error for ConfigError {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_claude_config_dir_is_claude_config_dir_else_home_dot_claude() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            default_claude_config_dir(Some(OsStr::new("/cfg/claude")), Some(home)),
+            Some(PathBuf::from("/cfg/claude"))
+        );
+        for value in [None, Some(OsStr::new("")), Some(OsStr::new("rel/dir"))] {
+            assert_eq!(
+                default_claude_config_dir(value, Some(home)),
+                Some(PathBuf::from("/home/u/.claude")),
+                "{value:?}"
+            );
+        }
+        assert_eq!(default_claude_config_dir(None, None), None);
+    }
 
     #[test]
     fn the_socket_lives_in_xdg_runtime_dir_when_it_is_set() {

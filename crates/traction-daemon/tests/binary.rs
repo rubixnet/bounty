@@ -43,6 +43,8 @@ fn command_without_socket_path(data_dir: &Path, port: u16) -> Command {
         .arg(data_dir)
         .arg("--port")
         .arg(port.to_string())
+        // Hermetic: the tailer never reads the developer's real transcripts.
+        .env("CLAUDE_CONFIG_DIR", data_dir.join("claude-config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

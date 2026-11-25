@@ -133,9 +133,7 @@ impl Writer {
                     if self.batch.is_empty() {
                         self.deadline = Some(Instant::now() + self.commit_interval);
                     }
-                    if matches!(op, WriteOp::Event(_)) {
-                        self.batch_events += 1;
-                    }
+                    self.batch_events += op.event_count();
                     self.batch.push(op);
                     if self.batch_events >= self.max_batch {
                         self.commit();
