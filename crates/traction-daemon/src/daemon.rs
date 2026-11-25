@@ -68,9 +68,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let device_secret =
         DeviceSecret::load_or_create(&config.data_dir).map_err(StartError::DeviceSecret)?;
     let conn = storage::open(&config.data_dir).map_err(StartError::Database)?;
-    let projects = storage::load_projects(&conn).map_err(StartError::Database)?;
-    let aliases = storage::load_aliases(&conn).map_err(StartError::Database)?;
-    let sessions = storage::load_sessions(&conn).map_err(StartError::Database)?;
+    let registry = storage::load_registry(&conn).map_err(StartError::Database)?;
 
     // Loopback IPv4 only: never `0.0.0.0` or `::`. No fallback port.
     let listener =
@@ -111,15 +109,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     );
     let git = Git::with_program(&config.git_program, exclusions.home());
     let (watches, notifications) = Watches::new(exclusions.clone());
-    let mut router = Router::new(
-        git,
-        exclusions,
-        device_secret,
-        writer_sender,
-        projects,
-        aliases,
-        sessions,
-    );
+    let mut router = Router::new(git, exclusions, device_secret, writer_sender, registry);
     router.set_attribution_timing(config.watcher.trailing_window, config.watcher.hold);
     // Re-attach every stored (non-merged) Project before anything can edit
     // unobserved; later registrations attach on the Router thread before
