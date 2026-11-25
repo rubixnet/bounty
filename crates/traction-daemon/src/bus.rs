@@ -9,7 +9,8 @@
 //! 4. route (`POST /v1/event`)            -> `404`, or `405` for another method
 //! 5. body size cap                       -> `413`
 //! 6. deserialize + validate              -> `400` with a reason code
-//! 7. enqueue to the writer               -> `503` when full, else `202`
+//! 7. bus policy (see [`check_policy`])   -> `400` with a reason code
+//! 8. enqueue to the writer               -> `503` when full, else `202`
 //!
 //! Responses never echo the request: every body is a fixed reason code.
 //!
@@ -26,7 +27,7 @@ use hyper::body::{Body, Bytes, Incoming};
 use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, EXPECT, HOST, HeaderValue, ORIGIN};
 use hyper::http::request::Parts;
 use hyper::{Method, Request, Response, StatusCode};
-use traction_core::TractionEvent;
+use traction_core::{AttributionSource, EventType, TractionEvent};
 
 use crate::storage::EventRow;
 use crate::token::BusToken;
@@ -158,6 +159,7 @@ impl Bus {
         let body = read_capped_body(body, read).await?;
         let event = TractionEvent::from_json(&body)
             .map_err(|error| Rejection::bad_request(error.code()))?;
+        check_policy(&event)?;
         let row =
             EventRow::try_from(event).map_err(|error| Rejection::bad_request(error.code()))?;
         self.writer.try_enqueue(row).map_err(|_| Rejection::BUSY)
@@ -222,6 +224,35 @@ impl Bus {
         match presented {
             Some(token) if self.token.matches(token) => Ok(()),
             _ => Err(Rejection::UNAUTHORIZED),
+        }
+    }
+}
+
+/// What an external caller may send, on top of `traction-core` validation.
+///
+/// - Every `FILE_MUTATION` is refused (`external_file_mutation`): in v1 only
+///   the daemon's own file watcher produces them, and it never uses the bus.
+/// - `file_watcher` is daemon-internal (`internal_attribution_source`). Core
+///   already allows it only on a `FILE_MUTATION`, so today this guards
+///   against core loosening that rule.
+/// - `browser_extension`, `editor_extension` and `manual_pick` are reserved
+///   until their sub-step turns them on (`reserved_attribution_source`).
+fn check_policy(event: &TractionEvent) -> Result<(), Rejection> {
+    if event.event_type == EventType::FileMutation {
+        return Err(Rejection::bad_request("external_file_mutation"));
+    }
+    match event.attribution_source {
+        AttributionSource::HarnessHook
+        | AttributionSource::HarnessPlugin
+        | AttributionSource::HarnessLog
+        | AttributionSource::HarnessDbPoll => Ok(()),
+        AttributionSource::FileWatcher => {
+            Err(Rejection::bad_request("internal_attribution_source"))
+        }
+        AttributionSource::BrowserExtension
+        | AttributionSource::EditorExtension
+        | AttributionSource::ManualPick => {
+            Err(Rejection::bad_request("reserved_attribution_source"))
         }
     }
 }

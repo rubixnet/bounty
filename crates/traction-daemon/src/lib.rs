@@ -7,9 +7,11 @@
 mod bus;
 mod config;
 mod daemon;
+mod fsutil;
 mod http;
 mod lock;
 mod log;
+mod secret;
 #[cfg(unix)]
 mod socket;
 mod storage;
@@ -25,5 +27,6 @@ pub use config::{
 pub use config::{DATA_DIR_SOCKET_FILE, RUNTIME_SOCKET_FILE, default_socket_path};
 pub use daemon::{DaemonHandle, ShutdownError, StartError, start};
 pub use lock::LOCK_FILE;
+pub use secret::DEVICE_SECRET_FILE;
 pub use storage::DB_FILE;
 pub use token::TOKEN_FILE;

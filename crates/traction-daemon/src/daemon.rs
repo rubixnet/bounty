@@ -4,11 +4,11 @@
 //!
 //! Threads: one runs a single-threaded tokio runtime serving the bus, one is
 //! the SQLite writer. Startup order matters: data folder, single-instance
-//! lock, token, database, listener, writer, server. Nothing in the data
-//! folder (token, database, later the socket) is touched before the lock is
-//! held, and the lock is released only after every thread has stopped. On
-//! macOS/Linux the bus socket is bound after the TCP listener and removed on
-//! shutdown, before the lock is released.
+//! lock, token, device secret, database, listener, writer, server. Nothing
+//! in the data folder (token, device secret, database, later the socket) is
+//! touched before the lock is held, and the lock is released only after
+//! every thread has stopped. On macOS/Linux the bus socket is bound after the
+//! TCP listener and removed on shutdown, before the lock is released.
 
 use std::fmt;
 use std::io;
@@ -25,6 +25,7 @@ use crate::bus::Bus;
 use crate::config::DaemonConfig;
 use crate::http::Listeners;
 use crate::lock::{InstanceLock, LockError};
+use crate::secret::DeviceSecret;
 #[cfg(unix)]
 use crate::socket::{self, SocketError, SocketFile};
 use crate::token::BusToken;
@@ -56,6 +57,9 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         LockError::Io(error) => StartError::Lock(error),
     })?;
     let token = BusToken::load_or_create(&config.data_dir).map_err(StartError::Token)?;
+    // Keys `dir:` Project IDs; the Project Router (ticket 05) takes it over.
+    let _device_secret =
+        DeviceSecret::load_or_create(&config.data_dir).map_err(StartError::DeviceSecret)?;
     let conn = storage::open(&config.data_dir).map_err(StartError::Database)?;
 
     // Loopback IPv4 only: never `0.0.0.0` or `::`. No fallback port.
@@ -220,6 +224,9 @@ pub enum StartError {
     /// The single-instance lock could not be created or checked.
     Lock(io::Error),
     Token(io::Error),
+    /// `device.secret` could not be read or created, or is malformed (it is
+    /// never replaced, since that would change every `dir:` Project ID).
+    DeviceSecret(io::Error),
     Database(rusqlite::Error),
     /// The configured port is taken. The daemon never falls back to another.
     PortInUse {
@@ -252,6 +259,7 @@ impl fmt::Display for StartError {
             }
             Self::Lock(e) => write!(f, "cannot take the single-instance lock: {e}"),
             Self::Token(e) => write!(f, "cannot read or create daemon.token: {e}"),
+            Self::DeviceSecret(e) => write!(f, "cannot read or create device.secret: {e}"),
             Self::Database(e) => write!(f, "cannot open the database: {e}"),
             Self::PortInUse { port } => write!(
                 f,
@@ -279,7 +287,11 @@ impl fmt::Display for StartError {
 impl std::error::Error for StartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::DataDir(e) | Self::Lock(e) | Self::Token(e) | Self::Runtime(e) => Some(e),
+            Self::DataDir(e)
+            | Self::Lock(e)
+            | Self::Token(e)
+            | Self::DeviceSecret(e)
+            | Self::Runtime(e) => Some(e),
             Self::AlreadyRunning | Self::PortInUse { .. } => None,
             Self::Bind { source, .. } => Some(source),
             #[cfg(unix)]
