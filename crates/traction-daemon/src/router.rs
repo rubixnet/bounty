@@ -18,7 +18,10 @@
 //!    event for a migrated `dir:` Project lands under the `git:` ID;
 //! 7. registers a Project seen for the first time (a [`WriteOp::Project`],
 //!    then every [`ProjectHook`] is told); and
-//! 8. replaces any Adapter-supplied `project_id` and queues the event.
+//! 8. replaces any Adapter-supplied `project_id` and queues the event,
+//!    unless its session was paused at the event's timestamp (Session
+//!    Pause): a paused event still feeds the attribution windows, but is
+//!    not stored.
 //!
 //! `git:` IDs are pinned per canonical common dir: the first ID stored for
 //! a repo is reused even after `origin` changes. A `.git` entry appearing
@@ -41,6 +44,7 @@ use tokio::sync::oneshot;
 use traction_core::{HarnessId, NetworkClass, TractionEvent, dir_project_id, git_project_id};
 
 use crate::attribution::Attribution;
+use crate::claude_code::pause::PauseAction;
 use crate::config::WatcherSettings;
 #[cfg(doc)]
 use crate::config::{LOG_TAIL_HOLD, LOG_TAIL_TRAILING_WINDOW, STALE_TURN_TIMEOUT};
@@ -48,6 +52,7 @@ use crate::exclusions::{Exclusions, has_project_marker};
 use crate::git::Git;
 use crate::log;
 use crate::paths::{self, is_within, same};
+use crate::pause::Pauses;
 use crate::secret::DeviceSecret;
 use crate::storage::{
     EventRow, MigrationRow, ProjectKind, ProjectRow, SessionRow, StoredRegistry, WriteOp,
@@ -154,6 +159,8 @@ pub struct Router {
     /// The `.git` entry last seen at each `dir:` Root.
     git_entries: HashMap<PathBuf, GitEntry>,
     sessions: HashMap<(HarnessId, String), SessionState>,
+    /// Session Pause spans, loaded at startup.
+    pauses: Pauses,
     hooks: Vec<ProjectHook>,
     /// In-memory attribution windows (never persisted).
     windows: Attribution,
@@ -173,6 +180,7 @@ impl Router {
             projects,
             aliases,
             sessions,
+            pauses,
         } = stored;
         let pinned = projects
             .iter()
@@ -215,6 +223,7 @@ impl Router {
             pinned,
             git_entries: HashMap::new(),
             sessions,
+            pauses: Pauses::new(pauses),
             hooks: Vec::new(),
             windows: Attribution::new(&WatcherSettings::default()),
             writer_gone_logged: false,
@@ -616,21 +625,32 @@ impl Router {
     /// bus accepted before the hold ended, so the window covering the
     /// mutation's timestamp on its own Project (if any) claims it by
     /// copying the winning session's `harness_id`, `session_id` and
-    /// `network_class`.
-    fn attribute(&self, mutation: &mut TractionEvent) {
+    /// `network_class`. Returns `false` when the claiming session was
+    /// paused at the mutation's timestamp: the mutation must be dropped.
+    fn attribute(&self, mutation: &mut TractionEvent) -> bool {
         debug_assert!(mutation.harness_id.is_none() && mutation.session_id.is_none());
         mutation.network_class = NetworkClass::Manual;
         let Some(project) = mutation.project_id.as_deref() else {
-            return;
+            return true;
         };
         let claim = self
             .windows
             .claim(mutation.timestamp_ms, |id| self.final_id(id) == project);
         if let Some(claim) = claim {
+            // Session Pause: the paused session's edit is dropped, never
+            // recorded as Manual Work.
+            let ts = i64::try_from(mutation.timestamp_ms).unwrap_or(i64::MAX);
+            if self
+                .pauses
+                .is_paused_at(claim.harness_id, &claim.session_id, ts)
+            {
+                return false;
+            }
             mutation.harness_id = Some(claim.harness_id);
             mutation.session_id = Some(claim.session_id);
             mutation.network_class = claim.network_class;
         }
+        true
     }
 
     /// Attributes a watcher `FILE_MUTATION`, re-checks it against the
@@ -640,7 +660,9 @@ impl Router {
     fn handle_mutation(&mut self, mut mutation: TractionEvent) {
         // Held across a migration: store it under the final (`git:`) ID.
         mutation.project_id = mutation.project_id.map(|id| self.final_id(&id));
-        self.attribute(&mut mutation);
+        if !self.attribute(&mut mutation) {
+            return;
+        }
         if mutation.validate().is_err() {
             log::warn("dropped a file watcher mutation that is not a valid Traction Event");
             return;
@@ -660,12 +682,48 @@ impl Router {
         };
         self.windows
             .observe(&event, u64::try_from(now_ms()).unwrap_or_default());
+        if self.is_paused(&event) {
+            return;
+        }
         match EventRow::try_from(event) {
             Ok(row) => self.write(WriteOp::Event(Box::new(row))),
             // The bus ran `EventRow::check` before accepting it.
             Err(_) => log::warn("dropped a routed event that does not fit the events table"),
         }
     }
+}
+
+impl Router {
+    /// Whether `event`'s session was paused at its timestamp.
+    fn is_paused(&self, event: &TractionEvent) -> bool {
+        let (Some(harness), Some(session_id)) = (event.harness_id, &event.session_id) else {
+            return false;
+        };
+        let ts = i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX);
+        self.pauses.is_paused_at(harness, session_id, ts)
+    }
+
+    /// `/stop-track` / `/resume-track`: pauses or resumes the session,
+    /// queueing the span write when its state changed (a repeat is a
+    /// no-op).
+    fn handle_pause(&mut self, pause: Pause) {
+        let at_ms = i64::try_from(pause.at_ms).unwrap_or(i64::MAX);
+        if let Some(op) = self
+            .pauses
+            .apply(pause.action, pause.harness, &pause.session_id, at_ms)
+        {
+            self.write(op);
+        }
+    }
+}
+
+/// A Session Pause command for one session, received at `at_ms`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pause {
+    pub action: PauseAction,
+    pub harness: HarnessId,
+    pub session_id: String,
+    pub at_ms: u64,
 }
 
 /// The pinning key of a canonical common dir (case-folded on Windows).
@@ -691,6 +749,7 @@ enum RouterMessage {
     Event(Box<TractionEvent>),
     /// A held watcher `FILE_MUTATION` whose hold just ended.
     Mutation(Box<TractionEvent>),
+    Pause(Pause),
     Register {
         path: PathBuf,
         reply: oneshot::Sender<RegisterReply>,
@@ -709,6 +768,11 @@ impl RouterSender {
     /// Queues an accepted event for routing and storage.
     pub fn try_route(&self, event: TractionEvent) -> Result<(), RouterBusy> {
         self.try_send(RouterMessage::Event(Box::new(event)))
+    }
+
+    /// Queues a Session Pause command, in order with the session's events.
+    pub fn try_pause(&self, pause: Pause) -> Result<(), RouterBusy> {
+        self.try_send(RouterMessage::Pause(pause))
     }
 
     /// Queues a registration; the receiver yields the Router's answer.
@@ -760,6 +824,7 @@ fn run(mut router: Router, receiver: &Receiver<RouterMessage>) {
         match message {
             RouterMessage::Event(event) => router.handle_event(*event),
             RouterMessage::Mutation(mutation) => router.handle_mutation(*mutation),
+            RouterMessage::Pause(pause) => router.handle_pause(pause),
             RouterMessage::Register { path, reply } => {
                 // The caller may have given up waiting; nothing to do then.
                 let _ = reply.send(router.register_path(&path));
