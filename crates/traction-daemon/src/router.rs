@@ -1,0 +1,537 @@
+//! The Project Router: the only place `project_id` is derived.
+//!
+//! Every accepted Traction Event (and every `/v1/project` registration)
+//! passes through one dedicated Router thread, in arrival order, before the
+//! single writer. The bus only queues ([`RouterSender`]), so Git calls
+//! never delay a bus response.
+//!
+//! For an event the Router:
+//! 1. updates the session's start folder (its first `cwd`) and last `cwd`;
+//! 2. takes the event's `cwd`, else the session's last `cwd`;
+//! 3. drops the event when that folder is user-excluded (still `202`);
+//! 4. resolves the folder ([`Router::resolve`]): the Git root (worktrees
+//!    collapsed through the common dir), else the nearest marker folder,
+//!    else, when the folder is inside it, the session's start folder;
+//! 5. registers a Project seen for the first time (a [`WriteOp::Project`],
+//!    then every [`ProjectHook`] is told); and
+//! 6. replaces any Adapter-supplied `project_id` and queues the event.
+//!
+//! Registry and session writes go through the single writer, in the same
+//! channel as the events they precede. The Router keeps its own in-memory
+//! copy of the registry and sessions, loaded from SQLite at startup and
+//! updated as it queues writes, and never reads SQLite afterwards.
+
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::oneshot;
+use traction_core::{TractionEvent, dir_project_id, git_project_id};
+
+use crate::exclusions::{Exclusions, has_project_marker};
+use crate::git::Git;
+use crate::log;
+use crate::paths::{self, is_within, same};
+use crate::secret::DeviceSecret;
+use crate::storage::{EventRow, ProjectKind, ProjectRow, SessionRow, WriteOp};
+use crate::writer::WriterSender;
+
+/// How long a folder's resolution is reused before Git is asked again.
+pub const RESOLUTION_TTL: Duration = Duration::from_secs(30);
+/// Cached folder resolutions kept at most (expired ones are pruned first).
+const CACHE_CAPACITY: usize = 4096;
+
+/// Where a folder routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    pub project_id: String,
+    pub kind: ProjectKind,
+    /// Canonical Project Root.
+    pub root: PathBuf,
+    /// Canonical common Git dir, for `git:` Projects (ID pinning).
+    pub git_common_dir: Option<PathBuf>,
+}
+
+/// A Project in the registry, as announced to [`ProjectHook`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredProject {
+    pub project_id: String,
+    pub kind: ProjectKind,
+    /// Canonical Project Root.
+    pub root: PathBuf,
+}
+
+/// Called on the Router thread, after the registration write is queued,
+/// for every newly registered Project (the file watcher attaches here).
+pub type ProjectHook = Box<dyn FnMut(&RegisteredProject) + Send>;
+
+/// Why `/v1/project` refused a path (answered as `422`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterError {
+    NotFound,
+    NotAFolder,
+    /// `$HOME`, a filesystem root, an OS/cache folder or a dependency folder.
+    Excluded,
+    /// Inside a folder listed in the global ignore file.
+    UserExcluded,
+}
+
+impl RegisterError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotFound => "path_not_found",
+            Self::NotAFolder => "not_a_folder",
+            Self::Excluded => "excluded_path",
+            Self::UserExcluded => "user_excluded_path",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SessionState {
+    start_folder: Option<String>,
+    last_cwd: Option<String>,
+}
+
+struct CacheEntry {
+    at: Instant,
+    resolution: Option<Resolution>,
+}
+
+pub struct Router {
+    git: Git,
+    exclusions: Exclusions,
+    secret: DeviceSecret,
+    writer: WriterSender,
+    ttl: Duration,
+    cache: HashMap<PathBuf, CacheEntry>,
+    projects: HashMap<String, RegisteredProject>,
+    sessions: HashMap<(&'static str, String), SessionState>,
+    hooks: Vec<ProjectHook>,
+    writer_gone_logged: bool,
+}
+
+impl Router {
+    /// A Router seeded with the registry and sessions stored in SQLite.
+    pub fn new(
+        git: Git,
+        exclusions: Exclusions,
+        secret: DeviceSecret,
+        writer: WriterSender,
+        projects: Vec<ProjectRow>,
+        sessions: Vec<SessionRow>,
+    ) -> Self {
+        let projects = projects
+            .into_iter()
+            .map(|row| {
+                let project = RegisteredProject {
+                    root: PathBuf::from(&row.root_path),
+                    project_id: row.project_id,
+                    kind: row.kind,
+                };
+                (project.project_id.clone(), project)
+            })
+            .collect();
+        let sessions = sessions
+            .into_iter()
+            .map(|row| {
+                let state = SessionState {
+                    start_folder: row.start_folder,
+                    last_cwd: row.last_cwd,
+                };
+                ((row.harness_id, row.session_id), state)
+            })
+            .collect();
+        Self {
+            git,
+            exclusions,
+            secret,
+            writer,
+            ttl: RESOLUTION_TTL,
+            cache: HashMap::new(),
+            projects,
+            sessions,
+            hooks: Vec::new(),
+            writer_gone_logged: false,
+        }
+    }
+
+    /// Adds a hook told about every Project registered from now on.
+    #[allow(dead_code, reason = "attached by the file watcher (step 1b ticket 07)")]
+    pub fn add_project_hook(&mut self, hook: ProjectHook) {
+        self.hooks.push(hook);
+    }
+
+    /// Every registered (non-merged) Project, including those loaded at
+    /// startup.
+    #[allow(dead_code, reason = "read by the file watcher (step 1b ticket 07)")]
+    pub fn projects(&self) -> impl Iterator<Item = &RegisteredProject> {
+        self.projects.values()
+    }
+
+    /// Forgets every cached resolution of a folder at or below `root`, or
+    /// resolving to `root`, so the next event asks Git again.
+    #[allow(dead_code, reason = "used by dir-to-git migration (step 1b ticket 06)")]
+    pub fn invalidate(&mut self, root: &Path) {
+        self.cache.retain(|folder, entry| {
+            let resolves_there = entry
+                .resolution
+                .as_ref()
+                .is_some_and(|r| same(&r.root, root));
+            !is_within(folder, root) && !resolves_there
+        });
+    }
+
+    /// Routes one event. Returns it with the Router's `project_id`, or
+    /// `None` when it falls under a user exclusion and must be dropped.
+    pub fn route(&mut self, mut event: TractionEvent) -> Option<TractionEvent> {
+        let (cwd, start_folder) = self.track_session(&event);
+        let canonical_cwd = cwd
+            .as_deref()
+            .and_then(|c| paths::canonicalize(Path::new(c)));
+        let excluded_by_user = match (&canonical_cwd, &cwd) {
+            (Some(canon), _) => self.exclusions.is_user_excluded(canon),
+            (None, Some(raw)) => self
+                .exclusions
+                .is_user_excluded(&paths::canonical_or_lexical(Path::new(raw))),
+            (None, None) => false,
+        };
+        if excluded_by_user {
+            return None;
+        }
+        let resolution = match &canonical_cwd {
+            Some(folder) => self.resolve(folder),
+            None => None,
+        }
+        .or_else(|| self.resolve_start_folder(canonical_cwd.as_deref(), start_folder.as_deref()));
+        if let Some(resolution) = &resolution {
+            self.register(resolution);
+        }
+        event.project_id = resolution.map(|r| r.project_id);
+        Some(event)
+    }
+
+    /// Registers the Project Root `path` resolves to (`/v1/project`).
+    pub fn register_path(&mut self, path: &Path) -> Result<String, RegisterError> {
+        if self
+            .exclusions
+            .is_user_excluded(&paths::canonical_or_lexical(path))
+        {
+            return Err(RegisterError::UserExcluded);
+        }
+        let folder = paths::canonicalize(path).ok_or(RegisterError::NotFound)?;
+        if !folder.is_dir() {
+            return Err(RegisterError::NotAFolder);
+        }
+        if self.exclusions.is_user_excluded(&folder) {
+            return Err(RegisterError::UserExcluded);
+        }
+        if self.exclusions.is_excluded(&folder) {
+            return Err(RegisterError::Excluded);
+        }
+        let resolution = self
+            .resolve(&folder)
+            .unwrap_or_else(|| self.dir_resolution(folder));
+        self.register(&resolution);
+        Ok(resolution.project_id)
+    }
+
+    /// Resolves a canonical folder through the Git root and nearest-marker
+    /// steps, reusing a cached answer younger than [`RESOLUTION_TTL`].
+    pub fn resolve(&mut self, folder: &Path) -> Option<Resolution> {
+        if let Some(entry) = self.cache.get(folder)
+            && entry.at.elapsed() < self.ttl
+        {
+            return entry.resolution.clone();
+        }
+        let resolution = self.resolve_uncached(folder);
+        if self.cache.len() >= CACHE_CAPACITY {
+            let ttl = self.ttl;
+            self.cache.retain(|_, entry| entry.at.elapsed() < ttl);
+            if self.cache.len() >= CACHE_CAPACITY {
+                self.cache.clear();
+            }
+        }
+        self.cache.insert(
+            folder.to_path_buf(),
+            CacheEntry {
+                at: Instant::now(),
+                resolution: resolution.clone(),
+            },
+        );
+        resolution
+    }
+
+    fn resolve_uncached(&self, folder: &Path) -> Option<Resolution> {
+        self.git_step(folder).or_else(|| self.marker_step(folder))
+    }
+
+    /// The folders a walk from `folder` may consider, nearest first. It
+    /// never reaches `$HOME` or above it (when `folder` is inside `$HOME`).
+    fn walk<'a>(&'a self, folder: &'a Path) -> impl Iterator<Item = &'a Path> + 'a {
+        let home = self
+            .exclusions
+            .home()
+            .filter(|home| is_within(folder, home));
+        folder
+            .ancestors()
+            .take_while(move |dir| home.is_none_or(|home| !same(dir, home)))
+    }
+
+    /// Step 1: the nearest non-excluded ancestor with a `.git` entry, asked
+    /// through the hardened wrapper. A `$HOME`-rooted repo never matches
+    /// (the walk stops below `$HOME`), and any Git failure falls through.
+    fn git_step(&self, folder: &Path) -> Option<Resolution> {
+        let candidate = self
+            .walk(folder)
+            .filter(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+            .find(|dir| !self.exclusions.is_excluded(dir))?;
+        let common_dir = paths::canonicalize(&self.git.common_dir(candidate).ok()?)?;
+        let root = if common_dir
+            .file_name()
+            .is_some_and(|name| paths::name_matches(&name.to_string_lossy(), ".git"))
+        {
+            // A normal repo: the main worktree, so linked worktrees collapse.
+            common_dir.parent()?.to_path_buf()
+        } else {
+            // A bare repo reached through a linked worktree.
+            common_dir.clone()
+        };
+        if self.exclusions.is_excluded(&root) {
+            return None;
+        }
+        match self.git.root_commit(candidate).ok()? {
+            Some(commit) => {
+                let origin = self.git.origin_url(candidate).ok().flatten();
+                Some(Resolution {
+                    project_id: git_project_id(&commit, origin.as_deref()),
+                    kind: ProjectKind::Git,
+                    root,
+                    git_common_dir: Some(common_dir),
+                })
+            }
+            // No commit yet: a `dir:` Project on the repo root.
+            None => Some(self.dir_resolution(root)),
+        }
+    }
+
+    /// Step 2: the nearest non-excluded ancestor holding a project marker.
+    fn marker_step(&self, folder: &Path) -> Option<Resolution> {
+        let root = self
+            .walk(folder)
+            .filter(|dir| !self.exclusions.is_excluded(dir))
+            .find(|dir| has_project_marker(dir))?;
+        Some(self.dir_resolution(root.to_path_buf()))
+    }
+
+    /// Step 3: the session's start folder, when the event's folder is
+    /// inside it (or the event has no usable folder at all). The start
+    /// folder itself is resolved first, so a start inside a repo routes to
+    /// the repo.
+    fn resolve_start_folder(
+        &mut self,
+        folder: Option<&Path>,
+        start_folder: Option<&str>,
+    ) -> Option<Resolution> {
+        let start = paths::canonicalize(Path::new(start_folder?))?;
+        if folder.is_some_and(|folder| !is_within(folder, &start))
+            || !start.is_dir()
+            || self.exclusions.is_excluded(&start)
+        {
+            return None;
+        }
+        self.resolve(&start)
+            .or_else(|| Some(self.dir_resolution(start)))
+    }
+
+    fn dir_resolution(&self, root: PathBuf) -> Resolution {
+        let root_text = root.to_str().unwrap_or_default();
+        Resolution {
+            project_id: dir_project_id(self.secret.bytes(), root_text),
+            kind: ProjectKind::Dir,
+            root,
+            git_common_dir: None,
+        }
+    }
+
+    /// Records the session's start folder (its first `cwd`) and last `cwd`,
+    /// queueing a session write when either changed. Returns the event's
+    /// effective `cwd` and the session's start folder.
+    fn track_session(&mut self, event: &TractionEvent) -> (Option<String>, Option<String>) {
+        let (Some(harness), Some(session_id)) = (event.harness_id, &event.session_id) else {
+            return (event.cwd.clone(), None);
+        };
+        let key = (harness.as_str(), session_id.clone());
+        let state = self.sessions.entry(key).or_default();
+        let mut changed = false;
+        if let Some(cwd) = &event.cwd {
+            if state.start_folder.is_none() {
+                state.start_folder = Some(cwd.clone());
+                changed = true;
+            }
+            if state.last_cwd.as_ref() != Some(cwd) {
+                state.last_cwd = Some(cwd.clone());
+                changed = true;
+            }
+        }
+        let effective = event.cwd.clone().or_else(|| state.last_cwd.clone());
+        let start_folder = state.start_folder.clone();
+        if changed {
+            let row = SessionRow {
+                harness_id: harness.as_str(),
+                session_id: session_id.clone(),
+                start_folder: state.start_folder.clone(),
+                last_cwd: state.last_cwd.clone(),
+            };
+            self.write(WriteOp::Session(row));
+        }
+        (effective, start_folder)
+    }
+
+    /// Registers `resolution`'s Project the first time it is seen.
+    fn register(&mut self, resolution: &Resolution) {
+        if self.projects.contains_key(&resolution.project_id) {
+            return;
+        }
+        let root_path = resolution.root.to_str().unwrap_or_default().to_owned();
+        let name = resolution
+            .root
+            .file_name()
+            .map_or_else(|| root_path.clone(), |n| n.to_string_lossy().into_owned());
+        let row = ProjectRow {
+            project_id: resolution.project_id.clone(),
+            kind: resolution.kind,
+            home_relative_path: self.home_relative(&resolution.root),
+            root_path,
+            name,
+            first_seen_ms: now_ms(),
+            git_common_dir: resolution
+                .git_common_dir
+                .as_ref()
+                .map(|dir| dir.to_str().unwrap_or_default().to_owned()),
+        };
+        self.write(WriteOp::Project(row));
+        let project = RegisteredProject {
+            project_id: resolution.project_id.clone(),
+            kind: resolution.kind,
+            root: resolution.root.clone(),
+        };
+        for hook in &mut self.hooks {
+            hook(&project);
+        }
+        self.projects.insert(project.project_id.clone(), project);
+    }
+
+    /// `~/a/b` for a root inside `$HOME` (always `/`-separated).
+    fn home_relative(&self, root: &Path) -> Option<String> {
+        let home = self
+            .exclusions
+            .home()
+            .filter(|home| is_within(root, home))?;
+        let parts: Vec<String> = paths::components_below(root, home)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        Some(format!("~/{}", parts.join("/")))
+    }
+
+    fn write(&mut self, op: WriteOp) {
+        if self.writer.send(op).is_err() && !self.writer_gone_logged {
+            self.writer_gone_logged = true;
+            log::warn("the SQLite writer has stopped; routed writes are being dropped");
+        }
+    }
+
+    /// Routes `event` and queues it for the writer.
+    fn handle_event(&mut self, event: TractionEvent) {
+        let Some(event) = self.route(event) else {
+            return;
+        };
+        match EventRow::try_from(event) {
+            Ok(row) => self.write(WriteOp::Event(Box::new(row))),
+            // The bus ran `EventRow::check` before accepting it.
+            Err(_) => log::warn("dropped a routed event that does not fit the events table"),
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// The answer to a registration, sent back to the waiting bus request.
+pub type RegisterReply = Result<String, RegisterError>;
+
+enum RouterMessage {
+    Event(Box<TractionEvent>),
+    Register {
+        path: PathBuf,
+        reply: oneshot::Sender<RegisterReply>,
+    },
+}
+
+/// The bus side of the Router's queue. Cheap to clone; never blocks.
+#[derive(Clone)]
+pub struct RouterSender(SyncSender<RouterMessage>);
+
+/// The Router's queue is full or it is shutting down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterBusy;
+
+impl RouterSender {
+    /// Queues an accepted event for routing and storage.
+    pub fn try_route(&self, event: TractionEvent) -> Result<(), RouterBusy> {
+        self.try_send(RouterMessage::Event(Box::new(event)))
+    }
+
+    /// Queues a registration; the receiver yields the Router's answer.
+    pub fn try_register(
+        &self,
+        path: PathBuf,
+    ) -> Result<oneshot::Receiver<RegisterReply>, RouterBusy> {
+        let (reply, answer) = oneshot::channel();
+        self.try_send(RouterMessage::Register { path, reply })?;
+        Ok(answer)
+    }
+
+    fn try_send(&self, message: RouterMessage) -> Result<(), RouterBusy> {
+        self.0.try_send(message).map_err(|error| match error {
+            TrySendError::Full(_) | TrySendError::Disconnected(_) => RouterBusy,
+        })
+    }
+}
+
+/// The Router thread. It exits once every [`RouterSender`] is gone and
+/// the queue is drained, dropping its writer sender.
+pub struct RouterThread(JoinHandle<()>);
+
+impl RouterThread {
+    pub fn join(self) -> thread::Result<()> {
+        self.0.join()
+    }
+}
+
+/// Starts the Router thread with a queue of `capacity` messages.
+pub fn spawn(router: Router, capacity: usize) -> io::Result<(RouterSender, RouterThread)> {
+    let (sender, receiver) = mpsc::sync_channel(capacity.max(1));
+    let handle = thread::Builder::new()
+        .name("traction-router".to_owned())
+        .spawn(move || run(router, &receiver))?;
+    Ok((RouterSender(sender), RouterThread(handle)))
+}
+
+fn run(mut router: Router, receiver: &Receiver<RouterMessage>) {
+    for message in receiver {
+        match message {
+            RouterMessage::Event(event) => router.handle_event(*event),
+            RouterMessage::Register { path, reply } => {
+                // The caller may have given up waiting; nothing to do then.
+                let _ = reply.send(router.register_path(&path));
+            }
+        }
+    }
+}

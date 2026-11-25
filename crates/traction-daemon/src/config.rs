@@ -17,6 +17,11 @@ pub const DEFAULT_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_BATCH: usize = 256;
 /// Events the bus may queue for the writer before it answers "busy".
 pub const DEFAULT_WRITER_QUEUE_CAPACITY: usize = 1024;
+/// The `git` program the Project Router runs (looked up on `PATH`).
+pub const DEFAULT_GIT_PROGRAM: &str = "git";
+/// The global ignore file inside the data folder: one folder per line
+/// (absolute or `~/`), `#` comments. Events in a listed folder are dropped.
+pub const GLOBAL_IGNORE_FILE: &str = "ignored-folders";
 /// The bus socket's file name inside `$XDG_RUNTIME_DIR`.
 #[cfg(unix)]
 pub const RUNTIME_SOCKET_FILE: &str = "traction.sock";
@@ -34,6 +39,14 @@ pub struct DaemonConfig {
     pub http_port: u16,
     /// SQLite writer tuning.
     pub writer: WriterSettings,
+    /// The user's home folder: never a Project Root, the base of
+    /// `home_relative_path`, and where OS/cache exclusions stop applying.
+    /// Default: the OS home. Tests inject a temp folder.
+    pub home_dir: Option<PathBuf>,
+    /// The `git` binary the hardened wrapper runs. Default
+    /// [`DEFAULT_GIT_PROGRAM`] from `PATH`; tests name a missing program to
+    /// stand for "no `git` on `PATH`".
+    pub git_program: PathBuf,
     /// The Local Ingestion Bus Unix socket (macOS/Linux only). Default from
     /// [`default_socket_path`].
     #[cfg(unix)]
@@ -52,6 +65,8 @@ impl DaemonConfig {
             data_dir,
             http_port: DEFAULT_HTTP_PORT,
             writer: WriterSettings::default(),
+            home_dir: std::env::home_dir().filter(|home| home.is_absolute()),
+            git_program: PathBuf::from(DEFAULT_GIT_PROGRAM),
         }
     }
 

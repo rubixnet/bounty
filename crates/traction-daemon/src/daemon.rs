@@ -3,8 +3,9 @@
 //! the writer and returns once everything accepted is committed.
 //!
 //! Threads: one runs a single-threaded tokio runtime serving the bus, one is
-//! the SQLite writer. Startup order matters: data folder, single-instance
-//! lock, token, device secret, database, listener, writer, server. Nothing
+//! the Project Router, one is the SQLite writer. Startup order matters: data
+//! folder, single-instance lock, token, device secret, database (and the
+//! stored registry), listener, writer, Router, server. Nothing
 //! in the data folder (token, device secret, database, later the socket) is
 //! touched before the lock is held, and the lock is released only after
 //! every thread has stopped. On macOS/Linux the bus socket is bound after the
@@ -22,9 +23,12 @@ use std::thread::{self, JoinHandle};
 use tokio::sync::oneshot;
 
 use crate::bus::Bus;
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, GLOBAL_IGNORE_FILE};
+use crate::exclusions::Exclusions;
+use crate::git::Git;
 use crate::http::Listeners;
 use crate::lock::{InstanceLock, LockError};
+use crate::router::{self, Router, RouterThread};
 use crate::secret::DeviceSecret;
 #[cfg(unix)]
 use crate::socket::{self, SocketError, SocketFile};
@@ -37,6 +41,7 @@ pub struct DaemonHandle {
     local_addr: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
+    router: Option<RouterThread>,
     writer: Option<WriterThread>,
     #[cfg(unix)]
     socket_path: PathBuf,
@@ -57,10 +62,11 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         LockError::Io(error) => StartError::Lock(error),
     })?;
     let token = BusToken::load_or_create(&config.data_dir).map_err(StartError::Token)?;
-    // Keys `dir:` Project IDs; the Project Router (ticket 05) takes it over.
-    let _device_secret =
+    let device_secret =
         DeviceSecret::load_or_create(&config.data_dir).map_err(StartError::DeviceSecret)?;
     let conn = storage::open(&config.data_dir).map_err(StartError::Database)?;
+    let projects = storage::load_projects(&conn).map_err(StartError::Database)?;
+    let sessions = storage::load_sessions(&conn).map_err(StartError::Database)?;
 
     // Loopback IPv4 only: never `0.0.0.0` or `::`. No fallback port.
     let listener =
@@ -94,7 +100,30 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let (writer_sender, writer_thread) =
         writer::spawn(conn, config.writer).map_err(StartError::Runtime)?;
 
-    let bus = Arc::new(Bus::new(token, writer_sender, local_addr.port()));
+    let exclusions = Exclusions::load(
+        config.home_dir.as_deref(),
+        &config.data_dir,
+        &config.data_dir.join(GLOBAL_IGNORE_FILE),
+    );
+    let git = Git::with_program(&config.git_program, exclusions.home());
+    let router = Router::new(
+        git,
+        exclusions,
+        device_secret,
+        writer_sender,
+        projects,
+        sessions,
+    );
+    let (router_sender, router_thread) = match router::spawn(router, config.writer.queue_capacity) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            // The Router (and its writer sender) was dropped.
+            let _ = writer_thread.join();
+            return Err(StartError::Runtime(error));
+        }
+    };
+
+    let bus = Arc::new(Bus::new(token, router_sender, local_addr.port()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = thread::Builder::new()
         .name("traction-bus".to_owned())
@@ -116,7 +145,9 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let server = match server {
         Ok(server) => server,
         Err(error) => {
-            // The closure (and its writer sender) was dropped; let the writer exit.
+            // The closure (and its Router sender) was dropped; let the
+            // Router, then the writer, exit.
+            let _ = router_thread.join();
             let _ = writer_thread.join();
             return Err(StartError::Runtime(error));
         }
@@ -126,6 +157,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         local_addr,
         shutdown: Some(shutdown_tx),
         server: Some(server),
+        router: Some(router_thread),
         writer: Some(writer_thread),
         #[cfg(unix)]
         socket_path: config.socket_path,
@@ -187,9 +219,19 @@ impl DaemonHandle {
             let _ = shutdown.send(());
         }
         let server = self.server.take().map(JoinHandle::join);
+        // The bus is gone, so the Router drains its queue and exits. A writer
+        // stuck retrying a full failed batch is told to give up first, so a
+        // Router blocked on it is released.
+        if let Some(writer) = &self.writer {
+            writer.request_stop();
+        }
+        let router = self.router.take().map(RouterThread::join);
         let writer = self.writer.take().map(WriterThread::join);
         if matches!(server, Some(Err(_))) {
             return Err(ShutdownError::ServerPanicked);
+        }
+        if matches!(router, Some(Err(_))) {
+            return Err(ShutdownError::RouterPanicked);
         }
         if matches!(writer, Some(Err(_))) {
             return Err(ShutdownError::WriterPanicked);
@@ -306,6 +348,7 @@ impl std::error::Error for StartError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownError {
     ServerPanicked,
+    RouterPanicked,
     WriterPanicked,
 }
 
@@ -313,6 +356,7 @@ impl fmt::Display for ShutdownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ServerPanicked => f.write_str("the bus thread panicked"),
+            Self::RouterPanicked => f.write_str("the Project Router thread panicked"),
             Self::WriterPanicked => f.write_str("the SQLite writer thread panicked"),
         }
     }

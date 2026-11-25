@@ -253,7 +253,7 @@ fn stored_events_cannot_be_updated_or_deleted() {
     // A separate read-write connection, as any other code path would open.
     let db = Connection::open(daemon.data_dir().join(DB_FILE)).expect("read-write connection");
     let update = db.execute(
-        "UPDATE traction_event SET project_id = NULL WHERE event_id = ?1",
+        "UPDATE traction_event SET model_id = NULL WHERE event_id = ?1",
         [event_id(1)],
     );
     let delete = db.execute("DELETE FROM traction_event", []);
@@ -265,13 +265,13 @@ fn stored_events_cannot_be_updated_or_deleted() {
             "{what} aborted by the trigger: {error}"
         );
     }
-    let project_id: String = db
+    let model_id: String = db
         .query_row(
-            "SELECT project_id FROM traction_event WHERE event_id = ?1",
+            "SELECT model_id FROM traction_event WHERE event_id = ?1",
             [event_id(1)],
             |row| row.get(0),
         )
         .expect("event still stored");
-    assert_eq!(project_id, PROJECT_ID);
+    assert_eq!(model_id, "optional-model-string");
     assert_eq!(stored_event_count(&db), 1);
 }

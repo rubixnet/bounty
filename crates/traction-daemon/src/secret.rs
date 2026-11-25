@@ -46,7 +46,6 @@ impl DeviceSecret {
     }
 
     /// The raw bytes, for `traction_core::dir_project_id`.
-    #[allow(dead_code)] // First used by the Project Router (step-1b ticket 05).
     pub fn bytes(&self) -> &[u8; DEVICE_SECRET_LEN] {
         &self.0
     }
