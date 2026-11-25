@@ -4,9 +4,9 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Migration 2 appended (migration 1 untouched); existing rows backfilled `harness_hook`; a 1a-era database upgrades cleanly.
-- [ ] `UPDATE`/`DELETE` on `traction_event` via a separate RW connection after shutdown is aborted.
-- [ ] Device secret: 32 CSPRNG bytes in the data folder, atomic `0600` on Unix, reused across restarts, never logged.
-- [ ] Bus policy 400s with reason codes for the 4 sources and external `FILE_MUTATION`; 1a tests still green.
+- [x] Migration 2 appended (migration 1 untouched); existing rows backfilled `harness_hook`; a 1a-era database upgrades cleanly.
+- [x] `UPDATE`/`DELETE` on `traction_event` via a separate RW connection after shutdown is aborted.
+- [x] Device secret: 32 CSPRNG bytes in the data folder, atomic `0600` on Unix, reused across restarts, never logged.
+- [x] Bus policy 400s with reason codes for the 4 sources and external `FILE_MUTATION`; 1a tests still green.
