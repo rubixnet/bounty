@@ -85,6 +85,10 @@ pub struct DaemonConfig {
     pub watcher: WatcherSettings,
     /// Presence sensor tuning.
     pub presence: crate::presence::PresenceSettings,
+    /// Commit observer tuning.
+    pub commits: crate::commits::CommitSettings,
+    /// Finalizer tuning.
+    pub finalizer: crate::finalizer::FinalizerSettings,
     /// Claude Code's config folder, whose `projects/` the transcript tailer
     /// watches. Default: [`crate::claude_code::config_dir::claude_config_dir`]
     /// (the installer's rule). `None` turns the tailer off. Tests point it at a
@@ -114,6 +118,8 @@ impl DaemonConfig {
             git_program: PathBuf::from(DEFAULT_GIT_PROGRAM),
             watcher: WatcherSettings::default(),
             presence: crate::presence::PresenceSettings::default(),
+            commits: crate::commits::CommitSettings::default(),
+            finalizer: crate::finalizer::FinalizerSettings::default(),
         }
     }
 

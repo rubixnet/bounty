@@ -25,8 +25,10 @@ use tokio::sync::oneshot;
 
 use crate::bus::Bus;
 use crate::claude_code::tailer::{self, TailerThread};
+use crate::commits::{self, CommitObserver};
 use crate::config::{DaemonConfig, GLOBAL_IGNORE_FILE};
 use crate::exclusions::Exclusions;
+use crate::finalizer::{self, FinalizerThread};
 use crate::git::Git;
 use crate::http::Listeners;
 use crate::lock::{InstanceLock, LockError};
@@ -50,6 +52,10 @@ pub struct DaemonHandle {
     watcher: Option<WatcherThread>,
     /// The Presence Sensor (device-wide; unaffected by pause).
     presence: Option<PresenceSensor>,
+    /// The commit observer (stat-only watch of each worktree's reflog).
+    commits: Option<CommitObserver>,
+    /// The Work Bucket finalizer.
+    finalizer: Option<FinalizerThread>,
     router: Option<RouterThread>,
     writer: Option<WriterThread>,
     #[cfg(unix)]
@@ -115,8 +121,11 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         &config.data_dir.join(GLOBAL_IGNORE_FILE),
     );
     let git = Git::with_program(&config.git_program, exclusions.home());
+    let observer_git = Arc::new(Git::with_program(&config.git_program, exclusions.home()));
     let (watches, notifications) = Watches::new(exclusions.clone());
     let presence_writer = writer_sender.clone();
+    let commits_writer = writer_sender.clone();
+    let finalizer_writer = writer_sender.clone();
     let mut router = Router::new(git, exclusions, device_secret, writer_sender, registry);
     router.set_attribution_timing(&config.watcher);
     // Re-attach every stored (non-merged) Project before anything can edit
@@ -124,6 +133,36 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     // they are answered.
     for project in router.projects() {
         watches.attach(project);
+    }
+    // Commit Observations: Git Projects (and every folder resolved in one,
+    // which is how linked worktrees are found) go to the observer.
+    let commit_observer = if config.commits.enabled {
+        match commits::spawn(observer_git, commits_writer, config.commits) {
+            Ok(observer) => Some(observer),
+            Err(error) => {
+                log::error("failed to start the commit observer", &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(observer) = &commit_observer {
+        let watch = observer.watch_handle();
+        for project in router.projects() {
+            if project.kind == storage::ProjectKind::Git {
+                watch.watch(&project.project_id, &project.root);
+            }
+        }
+        let hook_watch = watch.clone();
+        router.add_project_hook(Box::new(move |project| {
+            if project.merged_into.is_none() && project.kind == storage::ProjectKind::Git {
+                hook_watch.watch(&project.project_id, &project.root);
+            }
+        }));
+        router.set_folder_hook(Box::new(move |project_id, folder| {
+            watch.watch(project_id, folder);
+        }));
     }
     let hook_watches = watches.clone();
     router.add_project_hook(Box::new(move |project| match &project.merged_into {
@@ -216,6 +255,18 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         None
     };
 
+    let finalizer = if config.finalizer.enabled {
+        match finalizer::spawn(&config.data_dir, finalizer_writer, config.finalizer) {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                log::error("failed to start the finalizer", &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(DaemonHandle {
         local_addr,
         shutdown: Some(shutdown_tx),
@@ -223,6 +274,8 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         tailer: tailer_thread,
         watcher: Some(watcher_thread),
         presence,
+        commits: commit_observer,
+        finalizer,
         router: Some(router_thread),
         writer: Some(writer_thread),
         #[cfg(unix)]
@@ -293,6 +346,12 @@ impl DaemonHandle {
         // Drops the sensor's writer sender before the writer drains.
         if let Some(Err(_)) = self.presence.take().map(PresenceSensor::stop) {
             log::warn("the presence sensor thread panicked");
+        }
+        if let Some(Err(_)) = self.finalizer.take().map(FinalizerThread::stop) {
+            log::warn("the finalizer thread panicked");
+        }
+        if let Some(Err(_)) = self.commits.take().map(CommitObserver::stop) {
+            log::warn("the commit observer thread panicked");
         }
         // The bus is gone, so the Router drains its queue and exits. A writer
         // stuck retrying a full failed batch is told to give up first, so a
