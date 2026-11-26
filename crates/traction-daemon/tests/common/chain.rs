@@ -24,20 +24,40 @@ pub const OID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 pub struct Device {
     daemon: TestDaemon,
     next_window: u64,
+    /// The first window's start (`T0` unless built with `sealed_from`).
+    t0: u64,
 }
 
 impl Device {
     /// `windows` sealed windows: Alpha works in every window, Beta in the odd
     /// ones; Alpha has a commit in window 1, Beta in window 3.
     pub fn sealed(windows: u64) -> Self {
+        Self::sealed_from(T0, windows)
+    }
+
+    /// [`Self::sealed`] with the first window at `t0` (window aligned), so a
+    /// test can place the chain in the recent or the distant past.
+    pub fn sealed_from(t0: u64, windows: u64) -> Self {
+        assert_eq!(t0 % WINDOW, 0);
         let mut daemon = TestDaemon::start();
         daemon.shutdown();
         let mut device = Self {
             daemon,
             next_window: 0,
+            t0,
         };
         device.seal_windows(windows);
         device
+    }
+
+    /// Starts a daemon on this data folder (the chain is already sealed).
+    pub fn start_daemon(&mut self, adjust: impl FnOnce(&mut traction_daemon::DaemonConfig)) {
+        self.daemon.restart_in_place(adjust);
+    }
+
+    /// Gracefully stops the daemon started by [`Self::start_daemon`].
+    pub fn stop_daemon(&mut self) {
+        self.daemon.shutdown();
     }
 
     pub fn dir(&self) -> &Path {
@@ -47,11 +67,11 @@ impl Device {
     /// Seeds and seals `count` more windows after the ones already there.
     pub fn seal_windows(&mut self, count: u64) {
         let first = self.next_window;
-        seed(self.dir(), first, count);
+        seed(self.dir(), self.t0, first, count);
         self.next_window += count;
         // Just enough clock for these windows to settle, so a later batch is
         // never behind the finalizer's cursor.
-        let now = T0
+        let now = self.t0
             + self.next_window * WINDOW
             + TRACTION_RULES_1.bucket_settle_ms
             + TRACTION_RULES_1.context_fwd_ms();
@@ -115,7 +135,7 @@ fn event(db: &Connection, n: u64, project: &str, timestamp_ms: u64) {
     .unwrap();
 }
 
-fn seed(dir: &Path, first_window: u64, count: u64) {
+fn seed(dir: &Path, t0: u64, first_window: u64, count: u64) {
     let db = Connection::open(dir.join(traction_daemon::DB_FILE)).unwrap();
     let category = serde_json::to_string(&CategorySec {
         ide: 30,
@@ -124,7 +144,7 @@ fn seed(dir: &Path, first_window: u64, count: u64) {
     })
     .unwrap();
     for window in first_window..first_window + count {
-        let start = T0 + window * WINDOW;
+        let start = t0 + window * WINDOW;
         for minute in 0..2 {
             db.execute(
                 "INSERT INTO presence_minute

@@ -16,6 +16,7 @@
 
 pub mod chain;
 pub mod fixtures;
+pub mod http_server;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -78,6 +79,18 @@ impl TestDaemon {
         self.addr = handle.local_addr();
         self.handle = Some(handle);
         self
+    }
+
+    /// [`Self::restart_with`] on a daemon that is borrowed, not consumed.
+    pub fn restart_in_place(&mut self, adjust: impl FnOnce(&mut DaemonConfig)) {
+        self.shutdown();
+        let mut config = test_config(self.data_dir.path());
+        config.home_dir = Some(self.home());
+        config.claude_config_dir = Some(self.home().join(".claude"));
+        adjust(&mut config);
+        let handle = start_after_shutdown(config);
+        self.addr = handle.local_addr();
+        self.handle = Some(handle);
     }
 
     pub fn addr(&self) -> SocketAddr {

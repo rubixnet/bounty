@@ -58,6 +58,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_8,
     MIGRATION_9,
     MIGRATION_10,
+    MIGRATION_11,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -426,6 +427,21 @@ const MIGRATION_10: &str = "
     BEGIN SELECT RAISE(ABORT, 'chain_link is append-only'); END;
 ";
 
+/// Step 4 (S1): the server sync cursor. One row (`id = 1`): the newest
+/// Chain Link window the server acknowledged (or that a terminal rejection
+/// moved the cursor past), and a running count of terminal rejections. The
+/// only mutable sync state; written through the single writer.
+const MIGRATION_11: &str = "
+    CREATE TABLE sync_cursor (
+        id                  INTEGER PRIMARY KEY CHECK (id = 1),
+        window_start_ms     INTEGER NOT NULL,
+        key_id              TEXT NOT NULL,
+        seq                 INTEGER NOT NULL,
+        terminal_rejections INTEGER NOT NULL,
+        updated_at_ms       INTEGER NOT NULL
+    ) STRICT;
+";
+
 /// The alias-aware events view (see [`MIGRATION_3`]).
 pub const PROJECT_EVENT_VIEW: &str = "project_event";
 
@@ -630,6 +646,18 @@ pub enum WriteOp {
     /// Appends one finalized range of Work Buckets and Activity Rollups and
     /// advances the finalizer's cursor, in one transaction.
     Rollup(Box<RollupBatch>),
+    /// Moves the server sync cursor (`sync_cursor`).
+    SyncCursor(SyncCursorRow),
+}
+
+/// The `sync_cursor` row. `terminal_rejections` is the running total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncCursorRow {
+    pub window_start_ms: u64,
+    pub key_id: String,
+    pub seq: u64,
+    pub terminal_rejections: u64,
+    pub updated_at_ms: u64,
 }
 
 /// See [`WriteOp::Rollup`].
@@ -667,7 +695,8 @@ impl WriteOp {
             | Self::HookRun(_)
             | Self::Presence(_)
             | Self::Commit(_)
-            | Self::Rollup(_) => 0,
+            | Self::Rollup(_)
+            | Self::SyncCursor(_) => 0,
         }
     }
 }
@@ -1025,6 +1054,24 @@ pub fn apply_batch_with(
             WriteOp::Presence(minute) => insert_presence(&tx, minute)?,
             WriteOp::Commit(commit) => insert_commit(&tx, commit)?,
             WriteOp::Rollup(batch) => insert_rollup(&tx, batch, sealer)?,
+            WriteOp::SyncCursor(cursor) => {
+                tx.prepare_cached(
+                    "INSERT INTO sync_cursor
+                         (id, window_start_ms, key_id, seq, terminal_rejections, updated_at_ms)
+                     VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (id) DO UPDATE SET
+                         window_start_ms = excluded.window_start_ms, key_id = excluded.key_id,
+                         seq = excluded.seq, terminal_rejections = excluded.terminal_rejections,
+                         updated_at_ms = excluded.updated_at_ms",
+                )?
+                .execute(params![
+                    to_i64(cursor.window_start_ms),
+                    cursor.key_id,
+                    to_i64(cursor.seq),
+                    to_i64(cursor.terminal_rejections),
+                    to_i64(cursor.updated_at_ms),
+                ])?;
+            }
             WriteOp::HookRun(hook) => {
                 tx.prepare_cached(
                     "INSERT OR IGNORE INTO session_hook_run

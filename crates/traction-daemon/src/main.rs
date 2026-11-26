@@ -19,6 +19,9 @@
 //!   or `verify --data-dir <path> ...` checks a bundle or the local database
 //!   offline. Exit 0 = verified (one chain), 2 = verified with more than one
 //!   chain (key discontinuity), 1 = failed or unreadable.
+//! - `login --server <url> [--data-dir <path>] [--no-browser]` pairs this
+//!   device with the server (opens the approval page, then stores the device
+//!   token in `<data dir>/server.token`, owner-only).
 //! - `install claude-code [--settings <path>] [--claude-program <path>]
 //!   [--port <n>] [--profile <path>]...` merges Traction's hooks into Claude
 //!   Code's `settings.json` (default `$CLAUDE_CONFIG_DIR/settings.json`, else
@@ -58,6 +61,10 @@ fn run() -> Result<(), String> {
         Some("install") => {
             args.next();
             return install(args);
+        }
+        Some("login") => {
+            args.next();
+            return traction_daemon::run_login(args);
         }
         Some("export-bundle") => {
             args.next();
