@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::rollup::WorkBucket;
-use crate::{AppCategory, EventType, PresenceMinute, Ruleset, TractionEvent};
+use crate::{AppCategory, EventType, PresenceMinute, Ruleset, TelemetryTier, TractionEvent};
 
 const MINUTE_MS: u64 = 60_000;
 const DAY_MS: u64 = 86_400_000;
@@ -171,23 +171,31 @@ pub(crate) fn score(rules: &Ruleset, input: &ScoreInput<'_>, buckets: &mut [Work
         }
     }
 
-    let mut anchors: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut anchors: BTreeMap<String, Vec<(u64, u32)>> = BTreeMap::new();
     let mut loops: BTreeMap<String, Vec<Loop>> = BTreeMap::new();
     let mut spans: BTreeMap<String, Vec<(u64, u64, u32)>> = BTreeMap::new();
-    let mut anchor =
-        |project: &str, ts: u64| anchors.entry(project.to_owned()).or_default().push(ts);
+    let mut anchor = |project: &str, ts: u64, strength: u32| {
+        anchors
+            .entry(project.to_owned())
+            .or_default()
+            .push((ts, strength));
+    };
 
     for e in mutations.values().flatten() {
         // Manual Work: a mutation no Harness session owns.
         if e.session_id.is_none() {
-            anchor(e.project_id.as_deref().unwrap_or_default(), e.timestamp_ms);
+            anchor(
+                e.project_id.as_deref().unwrap_or_default(),
+                e.timestamp_ms,
+                1000,
+            );
         }
     }
     for (ts, p) in input.permission_anchors {
-        anchor(p, *ts);
+        anchor(p, *ts, 1000);
     }
     for b in buckets.iter().filter(|b| b.commits_human > 0) {
-        anchor(&b.project_id, b.minute_start_ms);
+        anchor(&b.project_id, b.minute_start_ms, 1000);
     }
 
     for (session, events) in &by_session {
@@ -201,9 +209,19 @@ pub(crate) fn score(rules: &Ruleset, input: &ScoreInput<'_>, buckets: &mut [Work
             &mut spans,
         );
     }
-    for list in anchors.values_mut() {
+    // Per Project: the anchor times (for steering) and the strongest
+    // strength per timestamp (for credit).
+    let mut times: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for (project, list) in &mut anchors {
         list.sort_unstable();
-        list.dedup();
+        list.dedup_by(|b, a| {
+            let same = a.0 == b.0;
+            if same {
+                a.1 = a.1.max(b.1);
+            }
+            same
+        });
+        times.insert(project.clone(), list.iter().map(|(t, _)| *t).collect());
     }
 
     // Manual Work right after Harness churn reverts it (the watcher sees
@@ -236,7 +254,8 @@ pub(crate) fn score(rules: &Ruleset, input: &ScoreInput<'_>, buckets: &mut [Work
     for b in buckets.iter_mut() {
         let project = b.project_id.as_str();
         let m = b.minute_start_ms;
-        let list: &[u64] = anchors.get(project).map_or(&[], Vec::as_slice);
+        let list: &[u64] = times.get(project).map_or(&[], Vec::as_slice);
+        let strong: &[(u64, u32)] = anchors.get(project).map_or(&[], Vec::as_slice);
 
         let friction = {
             let in_loop = loops.get(project).is_some_and(|ls| {
@@ -275,8 +294,14 @@ pub(crate) fn score(rules: &Ruleset, input: &ScoreInput<'_>, buckets: &mut [Work
         b.struggle_axes = axes;
         b.verified_struggle = u32::try_from(weighted / 1000).unwrap_or(1000).min(1000);
 
-        let anchor_weight = anchor_weight(rules, input.presence.get(&m).copied(), list, m);
-        let weight = u64::from(anchor_weight) * u64::from(comfort_weight) / 1000;
+        let anchor_weight = anchor_weight(rules, input.presence.get(&m).copied(), strong, m);
+        let mut weight = u64::from(anchor_weight) * u64::from(comfort_weight) / 1000;
+        if matches!(
+            b.telemetry_tier,
+            TelemetryTier::Reduced | TelemetryTier::IdleOnly | TelemetryTier::None
+        ) {
+            weight = weight * u64::from(rules.degraded_tier_credit_milli) / 1000;
+        }
         b.struggle_credit_sec = u32::try_from(u64::from(b.human_active_sec) * weight / 1000)
             .unwrap_or(0)
             .min(b.human_active_sec);
@@ -295,25 +320,38 @@ fn nearest(list: &[u64], m: u64) -> Option<u64> {
     }
 }
 
-/// The anchor weight (per mille) of a present minute: full inside
-/// `anchor_window_ms` of an anchor, 0 outside it; a `browser`/`other` minute
-/// holding no anchor of its own decays linearly to 0 over `drift_decay_ms`.
-fn anchor_weight(rules: &Ruleset, presence: Option<&PresenceMinute>, list: &[u64], m: u64) -> u32 {
-    let Some(d) = nearest(list, m) else {
-        return 0;
-    };
-    if d > rules.anchor_window_ms {
-        return 0;
-    }
+/// The anchor weight (per mille) of a present minute: the strongest anchor
+/// within `anchor_window_ms`, each scaled by its own strength. A `browser` /
+/// `other` minute holding no anchor of its own decays linearly to 0 over
+/// `drift_decay_ms`.
+fn anchor_weight(
+    rules: &Ruleset,
+    presence: Option<&PresenceMinute>,
+    anchors: &[(u64, u32)],
+    m: u64,
+) -> u32 {
     let drifting = presence.and_then(|p| p.category_sec).is_some_and(|c| {
         let drift = u64::from(c.get(AppCategory::Browser)) + u64::from(c.get(AppCategory::Other));
         drift > u64::from(c.total()) - drift
     });
-    if drifting && d > 0 {
-        let left = rules.drift_decay_ms.saturating_sub(d);
-        return u32::try_from(left * 1000 / rules.drift_decay_ms.max(1)).unwrap_or(0);
+    let mut best = 0u32;
+    for (ts, strength) in anchors {
+        let d = if *ts < m {
+            m - ts
+        } else {
+            ts.saturating_sub(m + MINUTE_MS - 1)
+        };
+        if d > rules.anchor_window_ms {
+            continue;
+        }
+        let mut w = *strength;
+        if drifting && d > 0 {
+            let left = rules.drift_decay_ms.saturating_sub(d);
+            w = u32::try_from(u64::from(w) * left / rules.drift_decay_ms.max(1)).unwrap_or(0);
+        }
+        best = best.max(w);
     }
-    1000
+    best
 }
 
 /// The share of present minutes within two minutes of `m` that switch
@@ -354,7 +392,7 @@ fn session_signals(
     session: &str,
     events: &[&TractionEvent],
     mutations: &BTreeMap<&str, Vec<&TractionEvent>>,
-    anchor: &mut impl FnMut(&str, u64),
+    anchor: &mut impl FnMut(&str, u64, u32),
     loops: &mut BTreeMap<String, Vec<Loop>>,
     spans: &mut BTreeMap<String, Vec<(u64, u64, u32)>>,
 ) {
@@ -362,6 +400,7 @@ fn session_signals(
     let mut open = false;
     let mut last = 0u64;
     let mut fail: Option<(&str, u64)> = None;
+    let mut prompt_strength = 0u32;
     for (i, e) in events.iter().enumerate() {
         let project = e.project_id.as_deref().unwrap_or_default();
         if open && e.timestamp_ms.saturating_sub(last) > stale {
@@ -373,13 +412,16 @@ fn session_signals(
                 open = true;
                 let (end, diff) = turn_extent(events, i, stale);
                 let value = prompt_specificity(rules, e, diff);
+                prompt_strength = value;
                 spans
                     .entry(project.to_owned())
                     .or_default()
                     .push((e.timestamp_ms, end, value));
             }
             t if is_closer(t) => open = false,
-            EventType::FileMutation if open => anchor(project, e.timestamp_ms),
+            // An agent edit is only as strong an anchor as the prompt that
+            // asked for it: a terse "continue" proves nothing.
+            EventType::FileMutation if open => anchor(project, e.timestamp_ms, prompt_strength),
             EventType::ToolFail => {
                 if let Some(name) = e.metrics_only.tool_name.as_deref() {
                     match fail {
@@ -408,7 +450,7 @@ fn session_signals(
                             start,
                             end: e.timestamp_ms,
                         });
-                        anchor(project, e.timestamp_ms);
+                        anchor(project, e.timestamp_ms, 1000);
                     }
                 }
             }
