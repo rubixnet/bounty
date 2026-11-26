@@ -81,7 +81,13 @@ fn unknown_fields_and_unknown_enum_values_are_rejected() {
 fn app_categories_are_a_closed_snake_case_set() {
     let names: Vec<String> = AppCategory::ALL
         .iter()
-        .map(|c| serde_json::to_value(c).unwrap().as_str().unwrap().to_owned())
+        .map(|c| {
+            serde_json::to_value(c)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
         .collect();
     assert_eq!(names, ["ide", "terminal", "browser", "ai_desktop", "other"]);
     assert!(serde_json::from_value::<AppCategory>(json!("games")).is_err());

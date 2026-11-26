@@ -21,6 +21,7 @@ mod lock;
 mod log;
 mod paths;
 mod pause;
+mod presence;
 mod router;
 mod secret;
 #[cfg(unix)]
@@ -47,6 +48,7 @@ pub use exclusions::{DEPENDENCY_FOLDERS, PROJECT_MARKER_EXTENSION, PROJECT_MARKE
 pub use install::claude_code::{ClaudeCodeInstall, InstallError, InstallReport};
 pub use install::{BACKUP_SUFFIX, MIN_ON_FAILURE_VERSION, VERSION_TIMEOUT, Version};
 pub use lock::LOCK_FILE;
+pub use presence::{DEFAULT_SUBSLOT, PresenceSettings};
 pub use router::RESOLUTION_TTL;
 pub use secret::DEVICE_SECRET_FILE;
 pub use storage::{DB_FILE, PROJECT_EVENT_VIEW};

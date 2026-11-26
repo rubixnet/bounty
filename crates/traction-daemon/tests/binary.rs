@@ -180,6 +180,22 @@ fn sigint_flushes_accepted_events_and_exits_cleanly() {
     assert_signal_flushes_accepted_events("INT");
 }
 
+/// Presence degrades to tier `none` on a headless host (no X11, no Wayland):
+/// the daemon still starts, serves the bus and exits cleanly.
+#[cfg(unix)]
+#[test]
+fn the_daemon_starts_with_no_display_and_no_wayland_display() {
+    let data_dir = tempfile::tempdir().expect("temp data folder");
+    let mut command = command(data_dir.path(), 0);
+    command.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY");
+    let mut daemon = RunningDaemon::spawn_command(&mut command);
+    let caller = daemon.caller(data_dir.path());
+    assert_eq!(caller.post_event(&valid_event(1)).status, 202);
+    daemon.signal("TERM");
+    let status = daemon.wait(Duration::from_secs(10));
+    assert!(status.success(), "clean exit: {status:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn the_lock_is_released_when_the_daemon_is_killed() {
