@@ -71,7 +71,11 @@ pub fn detect() -> Box<dyn Backend> {
 pub fn detect_with(display: Option<&OsStr>, wayland_display: Option<&OsStr>) -> Box<dyn Backend> {
     match choose(display, wayland_display) {
         Session::NoX11 => Box::new(Unavailable),
-        Session::X11 => match X11Backend::connect() {
+        Session::X11 => match display
+            .and_then(OsStr::to_str)
+            .ok_or(())
+            .and_then(X11Backend::connect)
+        {
             Ok(backend) => Box::new(backend),
             Err(()) => {
                 log::warn("presence: cannot use the X11 display, presence is off");
@@ -82,6 +86,8 @@ pub fn detect_with(display: Option<&OsStr>, wayland_display: Option<&OsStr>) -> 
 }
 
 struct X11Backend {
+    /// The display both connections open.
+    display: String,
     conn: RustConnection,
     root: xproto::Window,
     active_window: xproto::Atom,
@@ -92,8 +98,8 @@ struct X11Backend {
 }
 
 impl X11Backend {
-    fn connect() -> Result<Self, ()> {
-        let (conn, screen) = RustConnection::connect(None).map_err(|_| ())?;
+    fn connect(display: &str) -> Result<Self, ()> {
+        let (conn, screen) = RustConnection::connect(Some(display)).map_err(|_| ())?;
         let root = conn.setup().roots.get(screen).ok_or(())?.root;
         let active_window =
             x11rb::protocol::xproto::intern_atom(&conn, true, b"_NET_ACTIVE_WINDOW")
@@ -106,6 +112,7 @@ impl X11Backend {
             .and_then(|c| c.reply().ok())
             .is_some();
         Ok(Self {
+            display: display.to_owned(),
             conn,
             root,
             active_window,
@@ -221,6 +228,7 @@ impl Backend for X11Backend {
 
     fn start_input(&mut self, tx: Sender<Msg>) {
         let input_ok = Arc::clone(&self.input_ok);
+        let display = self.display.clone();
         // The thread blocks in `wait_for_event` (an OS notification: no
         // polling) and ends when the sensor is gone (a failed send) or the
         // connection closes.
@@ -229,7 +237,7 @@ impl Backend for X11Backend {
             .spawn({
                 let input_ok = Arc::clone(&input_ok);
                 move || {
-                    if run_input(&tx).is_err() {
+                    if run_input(&display, &tx).is_err() {
                         input_ok.store(false, Ordering::Relaxed);
                     }
                 }
@@ -260,8 +268,8 @@ fn is_xtest_name(name: &[u8]) -> bool {
 
 /// Selects raw key/button/motion events on the root window and forwards
 /// one `Msg::Input` per event (kind and injected flag only).
-fn run_input(tx: &Sender<Msg>) -> Result<(), ()> {
-    let (conn, screen) = RustConnection::connect(None).map_err(|_| ())?;
+fn run_input(display: &str, tx: &Sender<Msg>) -> Result<(), ()> {
+    let (conn, screen) = RustConnection::connect(Some(display)).map_err(|_| ())?;
     let root = conn.setup().roots.get(screen).ok_or(())?.root;
     xinput::xi_query_version(&conn, 2, 0)
         .map_err(|_| ())?
