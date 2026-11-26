@@ -10,8 +10,8 @@ use std::path::Path;
 
 use rusqlite::{Connection, params};
 use traction_core::{
-    ActivityRollup, CommitObservation, EndReason, HarnessId, MutationKind, PresenceMinute,
-    TractionEvent, WorkBucket,
+    ActivityRollup, BaselineDay, CommitObservation, EndReason, HarnessId, MutationKind,
+    PresenceMinute, TractionEvent, WorkBucket,
 };
 
 pub const DB_FILE: &str = "traction.db";
@@ -46,6 +46,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_6,
     MIGRATION_7,
     MIGRATION_8,
+    MIGRATION_9,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -343,6 +344,36 @@ const MIGRATION_8: &str = "
     BEGIN SELECT RAISE(ABORT, 'activity_rollup is append-only'); END;
 ";
 
+/// Step 2d: struggle signals on every Work Bucket and the local comfort
+/// baseline.
+///
+/// `work_bucket` keeps its append-only triggers; the new columns are written
+/// with the rest of the row. `struggle_baseline` is the one table exempt from
+/// append-only (`docs/protocol.md` section 2c): one row per UTC day of
+/// histogram counts for the last `baseline_window_days`, upserted as days are
+/// finalized and pruned past the window. It holds counts, never events or
+/// timestamps.
+const MIGRATION_9: &str = "
+    ALTER TABLE work_bucket ADD COLUMN axis_steering INTEGER NOT NULL DEFAULT 0
+        CHECK (axis_steering BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN axis_specificity INTEGER NOT NULL DEFAULT 0
+        CHECK (axis_specificity BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN axis_friction INTEGER NOT NULL DEFAULT 0
+        CHECK (axis_friction BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN axis_comfort_delta INTEGER NOT NULL DEFAULT 0
+        CHECK (axis_comfort_delta BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN verified_struggle INTEGER NOT NULL DEFAULT 0
+        CHECK (verified_struggle BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN struggle_credit_sec INTEGER NOT NULL DEFAULT 0
+        CHECK (struggle_credit_sec BETWEEN 0 AND 60);
+
+    CREATE TABLE struggle_baseline (
+        day              INTEGER PRIMARY KEY NOT NULL,
+        friction_hist    TEXT NOT NULL,
+        specificity_hist TEXT NOT NULL
+    ) STRICT;
+";
+
 /// The alias-aware events view (see [`MIGRATION_3`]).
 pub const PROJECT_EVENT_VIEW: &str = "project_event";
 
@@ -557,6 +588,9 @@ pub struct RollupBatch {
     pub through_ms: u64,
     pub buckets: Vec<WorkBucket>,
     pub rollups: Vec<ActivityRollup>,
+    /// The comfort baseline after this batch: stored as is (days not listed
+    /// here are pruned).
+    pub baseline: Vec<BaselineDay>,
 }
 
 impl WriteOp {
@@ -1007,8 +1041,11 @@ fn insert_rollup(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()>
                  (project_id, minute_start_ms, ruleset_id, agent_compute_sec,
                   idle_autonomous_sec, human_active_sec, permission_wait_ms,
                   commits_human, commits_agent, injected_hid_detected,
-                  auto_approver_suspected, telemetry_tier, tier_limited)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  auto_approver_suspected, telemetry_tier, tier_limited,
+                  axis_steering, axis_specificity, axis_friction, axis_comfort_delta,
+                  verified_struggle, struggle_credit_sec)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19)",
         )?
         .execute(params![
             b.project_id,
@@ -1024,8 +1061,15 @@ fn insert_rollup(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()>
             b.auto_approver_suspected,
             tier_str(b.telemetry_tier),
             b.tier_limited,
+            b.struggle_axes.steering,
+            b.struggle_axes.specificity,
+            b.struggle_axes.friction,
+            b.struggle_axes.comfort_delta,
+            b.verified_struggle,
+            b.struggle_credit_sec,
         ])?;
     }
+    replace_baseline(conn, &batch.baseline)?;
     for r in &batch.rollups {
         let share = serde_json::to_string(&r.category_share_milli).unwrap_or_default();
         conn.prepare_cached(
@@ -1053,6 +1097,58 @@ fn insert_rollup(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()>
     )?
     .execute(params![batch.ruleset_id, to_i64(batch.through_ms)])?;
     Ok(())
+}
+
+/// Stores `days` as the whole baseline (upserting each, pruning the rest).
+fn replace_baseline(conn: &Connection, days: &[BaselineDay]) -> rusqlite::Result<()> {
+    let oldest = days.iter().map(|d| d.day).min();
+    for d in days {
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO struggle_baseline (day, friction_hist, specificity_hist)
+             VALUES (?1, ?2, ?3)",
+        )?
+        .execute(params![
+            to_i64(d.day),
+            serde_json::to_string(&d.friction_hist).unwrap_or_default(),
+            serde_json::to_string(&d.specificity_hist).unwrap_or_default(),
+        ])?;
+    }
+    if let Some(oldest) = oldest {
+        conn.prepare_cached("DELETE FROM struggle_baseline WHERE day < ?1")?
+            .execute([to_i64(oldest)])?;
+    }
+    Ok(())
+}
+
+/// The stored comfort baseline, oldest day first.
+pub fn load_baseline(conn: &Connection) -> rusqlite::Result<Vec<BaselineDay>> {
+    let mut stmt = conn.prepare(
+        "SELECT day, friction_hist, specificity_hist FROM struggle_baseline ORDER BY day",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (day, friction, specificity) = row?;
+        let (Ok(day), Ok(friction_hist), Ok(specificity_hist)) = (
+            u64::try_from(day),
+            serde_json::from_str(&friction),
+            serde_json::from_str(&specificity),
+        ) else {
+            continue;
+        };
+        out.push(BaselineDay {
+            day,
+            friction_hist,
+            specificity_hist,
+        });
+    }
+    Ok(out)
 }
 
 fn now_ms() -> i64 {

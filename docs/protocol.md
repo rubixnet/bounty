@@ -188,11 +188,20 @@ One `Ruleset` struct, one `const TRACTION_RULES_1` (`ruleset_id = "traction-rule
 | `stale_turn_timeout_ms` | 600000 | A silent open turn closes at its last event |
 | `activity_rollup_ms` | 120000 | Activity Rollup window (the Anchor cadence) |
 | `idle_threshold_sec` / `min_cadence_samples` | 30 / 8 | Presence Sensor constants (section 2b) |
-| `anchor_window_ms`, `drift_decay_ms`, `baseline_min_days`, `comfort_floor_milli` | 300000, 600000, 3, 500 | Slots Slice 3 (struggle credit) fills |
+| `anchor_window_ms` / `drift_decay_ms` | 300000 / 600000 | Outcome Anchor window; `browser`/`other` decay span |
+| `baseline_min_days` / `baseline_window_days` | 3 / 30 | History needed before comfort may reduce a weight; baseline length |
+| `comfort_floor_milli` / `comfort_low_specificity_milli` | 500 / 300 | Lowest comfort weight; specificity below this is "low" |
+| `steering_window_ms` | 120000 | Steering looks this close to an anchor |
+| `weight_steering_milli` / `_specificity_` / `_friction_` / `_comfort_` | 150 / 250 / 400 / 200 | `verified_struggle` axis weights (sum 1000) |
+| `verified_struggle_bar_milli` | 600 | A `verified_struggle` at or above this is "high" (Gate simulation) |
+| `friction_revert_milli` / `churn_revert_window_ms` | 500 / 120000 | Friction of Manual Work right after Harness churn |
+| `specificity_symbol_milli` / `specificity_stacktrace_milli` | 250 / 400 | Specificity per distinct repo symbol; added by a pasted trace |
+| `terse_prompt_chars` / `large_turn_diff_lines` / `terse_big_turn_keep_milli` | 40 / 30 / 250 | A terse prompt launching a large turn keeps this share of its specificity |
+| `index_max_entries` / `index_max_projects` / `index_max_name_bytes` / `index_max_prompt_candidates` | 4096 / 16 / 64 / 512 | File-name index caps (below) |
 
 ### Work Bucket (Project x minute)
 
-`project_id`, `minute_start_ms`, `ruleset_id`, `agent_compute_sec`, `idle_autonomous_sec`, `human_active_sec`, `permission_wait_ms`, `commits_human`, `commits_agent`, `injected_hid_detected`, `auto_approver_suspected`, `telemetry_tier`, `tier_limited`.
+`project_id`, `minute_start_ms`, `ruleset_id`, `agent_compute_sec`, `idle_autonomous_sec`, `human_active_sec`, `permission_wait_ms`, `commits_human`, `commits_agent`, `injected_hid_detected`, `auto_approver_suspected`, `telemetry_tier`, `tier_limited`, `struggle_axes` (`steering`, `specificity`, `friction`, `comfort_delta`, each 0 to 1000), `verified_struggle` (0 to 1000), `struggle_credit_sec`.
 
 - **`agent_compute_sec`**: union of open turn intervals per Project per minute. A turn opens at `PROMPT_SUBMIT` and closes at `TURN_END`, `STOP_FAILURE` or `SESSION_END` (the last two close every open interval of their session at their timestamp), or at its last event once `stale_turn_timeout_ms` passes. Subagents and parallel sessions never add time. A second belongs to an interval when its start lies inside it, so a minute-aligned 10 minute turn is exactly 600 s. Device-wide, a second with `k` active Projects is split `1/k` each (rounded down), so the sum over Projects never exceeds 60 s per minute.
 - **Verified human presence** (a minute): `active_subslots >= min_active_subslots`, not `injected_hid_detected`, and some foreground time in `ide`/`terminal`/`browser`/`ai_desktop`. The category clause is skipped when the tier is `idle_only`/`none` or `category_sec` is `null`, and the bucket sets `tier_limited`. A verified minute assigned to a Project is 60 `human_active_sec`.
@@ -216,9 +225,31 @@ One `Ruleset` struct, one `const TRACTION_RULES_1` (`ruleset_id = "traction-rule
 - `commit_observation (project_id, commit_oid, observed_ms)`, key `(project_id, commit_oid, observed_ms)`.
 - `work_bucket`, key `(project_id, minute_start_ms, ruleset_id)`, one column per Work Bucket field.
 - `activity_rollup`, key `(window_start_ms, ruleset_id)`.
+- `struggle_baseline (day, friction_hist, specificity_hist)`: the local comfort baseline (see "Struggle signals and credit"). The one table exempt from append-only: a day's row is upserted as days are finalized and days past `baseline_window_days` are pruned. It holds 10-bin histogram counts only, never events or timestamps.
 - `rollup_cursor (ruleset_id, finalized_through_ms)`: the finalizer's bookmark, the only mutable table of the three-clock output, written in the same transaction as the rows it covers.
 
 The finalizer computes each minute once it is older than `bucket_settle_ms` (aligned down to a whole rollup window), writes buckets with `INSERT OR IGNORE`, and resumes after a restart from `rollup_cursor`. Later events never rewrite a finalized minute (attribution is live-only). Its first pass waits one settle period after daemon start, so a restarting tailer can add the down-time events first.
+
+### Struggle signals and credit
+
+Scored per Work Bucket by `traction-core` (pure, integer-only, no I/O). Every constant is a Ruleset field.
+
+**Outcome Anchors** (a timestamp per Project): Manual Work (a `FILE_MUTATION` no Harness session owns); a Harness `FILE_MUTATION` inside an open turn that a human `PROMPT_SUBMIT` started; a human commit (`commits_human`, anchored at its minute); the `TOOL_POST` that closes a friction loop; an approved permission that earned real-input credit.
+
+**Credit.** `struggle_credit_sec = human_active_sec x weight`, `weight = anchor x comfort`, so it never exceeds `human_active_sec`, which is kept unchanged for audit. A present minute with an anchor inside it, or within `anchor_window_ms` of it, has anchor weight 1; with none in the window, 0. A minute whose foreground is mostly `browser`/`other` and holds no anchor of its own decays linearly from 1 to 0 over `drift_decay_ms` of distance to the nearest anchor (`traction-rules/1`: a 5-minute-old anchor leaves weight 0.5, and past `anchor_window_ms` it is 0 like any other category).
+
+**Axes** (0 to 1000):
+
+- `steering`: of the Project's present minutes within 2 minutes of the bucket, the share that switch between at least two of `ide`/`terminal`/`browser`/`ai_desktop` (`category_switches >= 1`) within `steering_window_ms` of an anchor.
+- `specificity`: for the turn each `PROMPT_SUBMIT` starts, `min(1000, repo_symbol_hits x specificity_symbol_milli + (has_stacktrace ? specificity_stacktrace_milli : 0))`, multiplied by `terse_big_turn_keep_milli` when the prompt is shorter than `terse_prompt_chars` and the turn's summed `|diff_lines_delta|` is at least `large_turn_diff_lines`. A minute takes the maximum over the turns covering it. `"continue"`/`"fix all"` therefore score 0.
+- `friction`: 1000 for each minute a verification loop spans, in event order within a session: `TOOL_FAIL`, then a `FILE_MUTATION` (Harness in that session, or Manual Work in the Project), then a `TOOL_POST` of the same `tool_name` within `stale_turn_timeout_ms`. Code size is never read. A Manual Work minute within `churn_revert_window_ms` after a Harness `FILE_MUTATION` scores `friction_revert_milli` (the watcher sees no contents, so rework right after agent churn is the observable shape of a revert).
+- `comfort_delta`: `1000 - familiarity`, where familiarity is the share of the baseline's present minutes that had no friction (bin 0) and specificity below `comfort_low_specificity_milli` (the smaller of the two shares). A minute with friction or real specificity, or any minute with fewer than `baseline_min_days` days of history, is 1000 and its comfort weight is 1. Otherwise the comfort weight is `1 - (1 - comfort_floor) x familiarity`: it falls smoothly toward `comfort_floor_milli` and never reaches 0.
+
+`verified_struggle` is the weighted mean of the four axes (`weight_*_milli`).
+
+**Baseline.** One `BaselineDay` per UTC day: two 10-bin (100 per mille wide) histograms of the present minutes' friction and specificity. The finalizer scores a batch against the stored baseline, then folds the batch's present minutes in and prunes to the newest `baseline_window_days` days, in the transaction that writes the batch.
+
+**`repo_symbol_hits`.** The daemon keeps, per watched Project, an in-memory set of 64-bit hashes of lower-cased file names, file stems and folder names (never contents): a bounded breadth-first names-only walk when the Project is attached (honoring the watcher's exclusions, `.gitignore` and `.tractionignore`), then every mutation the watcher reports. Common words (`main`, `index`, `test`, ...) and stems under 4 characters never match alone. A Claude Code prompt (hook or transcript) is reduced in memory to at most `index_max_prompt_candidates` hashed words, counted against the index of the Project holding its `cwd`, and dropped with the text; the count is stored. `null` means no index covers the `cwd` (for example the Project's first prompt, which can arrive before registration), not zero.
 
 ## 3. Server Sync Heartbeat (Every 2 Minutes — No PII)
 
