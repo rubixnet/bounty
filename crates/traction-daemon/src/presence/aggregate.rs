@@ -6,8 +6,7 @@
 //! intervals are never stored, so nothing about them survives the minute.
 
 use traction_core::{
-    AppCategory, CategorySec, IDLE_THRESHOLD_SEC, MIN_CADENCE_SAMPLES, PresenceMinute,
-    SUBSLOTS_PER_MINUTE, TelemetryTier,
+    AppCategory, CategorySec, PresenceMinute, SUBSLOTS_PER_MINUTE, TRACTION_RULES_1, TelemetryTier,
 };
 
 const SLOTS: usize = SUBSLOTS_PER_MINUTE as usize;
@@ -128,7 +127,7 @@ impl Aggregator {
         }
         if let Some(idle_ms) = sample.idle_ms {
             self.idle_seen = true;
-            if idle_ms >= u64::from(IDLE_THRESHOLD_SEC) * 1000 {
+            if idle_ms >= u64::from(TRACTION_RULES_1.idle_threshold_sec) * 1000 {
                 self.idle_sec = self.idle_sec.saturating_add(secs);
             }
             // The timer reset inside this sub-slot, so some input happened.
@@ -167,9 +166,9 @@ impl Aggregator {
 }
 
 /// Shannon entropy in bits, times 1000, of the interval histogram; `None`
-/// below `MIN_CADENCE_SAMPLES`.
+/// below `min_cadence_samples`.
 fn entropy_milli(bins: &[u32; BINS], total: u32) -> Option<u32> {
-    if total < MIN_CADENCE_SAMPLES {
+    if total < TRACTION_RULES_1.min_cadence_samples {
         return None;
     }
     let total = f64::from(total);
@@ -256,14 +255,14 @@ mod tests {
     #[test]
     fn cadence_is_null_below_the_sample_floor_and_zero_for_a_metronome() {
         let mut agg = full();
-        for i in 0..MIN_CADENCE_SAMPLES {
+        for i in 0..TRACTION_RULES_1.min_cadence_samples {
             agg.input(START + u64::from(i) * 100, InputKind::Key, false);
         }
         // 8 events make 7 intervals: still below the floor.
         assert_eq!(agg.finish().0.cadence_entropy_milli, None);
 
         let mut agg = full();
-        for i in 0..=MIN_CADENCE_SAMPLES {
+        for i in 0..=TRACTION_RULES_1.min_cadence_samples {
             agg.input(START + u64::from(i) * 100, InputKind::Key, false);
         }
         assert_eq!(agg.finish().0.cadence_entropy_milli, Some(0));

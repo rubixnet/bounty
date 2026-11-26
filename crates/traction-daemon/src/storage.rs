@@ -9,7 +9,10 @@
 use std::path::Path;
 
 use rusqlite::{Connection, params};
-use traction_core::{EndReason, HarnessId, MutationKind, PresenceMinute, TractionEvent};
+use traction_core::{
+    ActivityRollup, CommitObservation, EndReason, HarnessId, MutationKind, PresenceMinute,
+    TractionEvent, WorkBucket,
+};
 
 pub const DB_FILE: &str = "traction.db";
 
@@ -42,6 +45,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_5,
     MIGRATION_6,
     MIGRATION_7,
+    MIGRATION_8,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -273,6 +277,72 @@ const MIGRATION_7: &str = "
     END;
 ";
 
+/// Step 2b: Commit Observations and the finalized Three-Clock output.
+///
+/// `commit_observation`, `work_bucket` and `activity_rollup` are append-only
+/// like `traction_event`; a new Ruleset writes new rows under its own ID.
+/// `rollup_cursor` is the finalizer's bookmark (one row per Ruleset, written
+/// in the same transaction as the rows it covers), so a restart resumes
+/// without recomputing quiet minutes and without duplicates. Nothing here
+/// has a slot for a commit message, author, diff or any raw text.
+const MIGRATION_8: &str = "
+    CREATE TABLE commit_observation (
+        project_id  TEXT NOT NULL,
+        commit_oid  TEXT NOT NULL,
+        observed_ms INTEGER NOT NULL,
+        PRIMARY KEY (project_id, commit_oid, observed_ms)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE work_bucket (
+        project_id              TEXT NOT NULL,
+        minute_start_ms         INTEGER NOT NULL,
+        ruleset_id              TEXT NOT NULL,
+        agent_compute_sec       INTEGER NOT NULL CHECK (agent_compute_sec BETWEEN 0 AND 60),
+        idle_autonomous_sec     INTEGER NOT NULL CHECK (idle_autonomous_sec BETWEEN 0 AND 60),
+        human_active_sec        INTEGER NOT NULL CHECK (human_active_sec BETWEEN 0 AND 60),
+        permission_wait_ms      INTEGER NOT NULL,
+        commits_human           INTEGER NOT NULL,
+        commits_agent           INTEGER NOT NULL,
+        injected_hid_detected   INTEGER NOT NULL,
+        auto_approver_suspected INTEGER NOT NULL,
+        telemetry_tier          TEXT NOT NULL
+            CHECK (telemetry_tier IN ('full', 'reduced', 'idle_only', 'none')),
+        tier_limited            INTEGER NOT NULL,
+        PRIMARY KEY (project_id, minute_start_ms, ruleset_id)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE activity_rollup (
+        window_start_ms            INTEGER NOT NULL,
+        ruleset_id                 TEXT NOT NULL,
+        minutes_observed           INTEGER NOT NULL,
+        category_share_milli       TEXT NOT NULL,
+        switch_rate_milli          INTEGER NOT NULL,
+        mean_cadence_entropy_milli INTEGER,
+        injected_ratio_milli       INTEGER,
+        telemetry_tier             TEXT NOT NULL
+            CHECK (telemetry_tier IN ('full', 'reduced', 'idle_only', 'none')),
+        PRIMARY KEY (window_start_ms, ruleset_id)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE rollup_cursor (
+        ruleset_id          TEXT PRIMARY KEY NOT NULL,
+        finalized_through_ms INTEGER NOT NULL
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TRIGGER commit_observation_no_update BEFORE UPDATE ON commit_observation
+    BEGIN SELECT RAISE(ABORT, 'commit_observation is append-only'); END;
+    CREATE TRIGGER commit_observation_no_delete BEFORE DELETE ON commit_observation
+    BEGIN SELECT RAISE(ABORT, 'commit_observation is append-only'); END;
+    CREATE TRIGGER work_bucket_no_update BEFORE UPDATE ON work_bucket
+    BEGIN SELECT RAISE(ABORT, 'work_bucket is append-only'); END;
+    CREATE TRIGGER work_bucket_no_delete BEFORE DELETE ON work_bucket
+    BEGIN SELECT RAISE(ABORT, 'work_bucket is append-only'); END;
+    CREATE TRIGGER activity_rollup_no_update BEFORE UPDATE ON activity_rollup
+    BEGIN SELECT RAISE(ABORT, 'activity_rollup is append-only'); END;
+    CREATE TRIGGER activity_rollup_no_delete BEFORE DELETE ON activity_rollup
+    BEGIN SELECT RAISE(ABORT, 'activity_rollup is append-only'); END;
+";
+
 /// The alias-aware events view (see [`MIGRATION_3`]).
 pub const PROJECT_EVENT_VIEW: &str = "project_event";
 
@@ -472,6 +542,21 @@ pub enum WriteOp {
     /// Appends one Presence Minute. A repeated `minute_start_ms` (a restart
     /// inside the same minute) is ignored.
     Presence(PresenceMinute),
+    /// Appends one observed commit (`commit_observation`).
+    Commit(CommitObservation),
+    /// Appends one finalized range of Work Buckets and Activity Rollups and
+    /// advances the finalizer's cursor, in one transaction.
+    Rollup(Box<RollupBatch>),
+}
+
+/// See [`WriteOp::Rollup`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollupBatch {
+    pub ruleset_id: String,
+    /// Every minute before this is finalized once the batch commits.
+    pub through_ms: u64,
+    pub buckets: Vec<WorkBucket>,
+    pub rollups: Vec<ActivityRollup>,
 }
 
 impl WriteOp {
@@ -489,7 +574,9 @@ impl WriteOp {
             | Self::TailerStart(_)
             | Self::RunStart(_)
             | Self::HookRun(_)
-            | Self::Presence(_) => 0,
+            | Self::Presence(_)
+            | Self::Commit(_)
+            | Self::Rollup(_) => 0,
         }
     }
 }
@@ -830,6 +917,8 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
                 .execute(params![run.run_id, run.started_ms])?;
             }
             WriteOp::Presence(minute) => insert_presence(&tx, minute)?,
+            WriteOp::Commit(commit) => insert_commit(&tx, commit)?,
+            WriteOp::Rollup(batch) => insert_rollup(&tx, batch)?,
             WriteOp::HookRun(hook) => {
                 tx.prepare_cached(
                     "INSERT OR IGNORE INTO session_hook_run
@@ -882,6 +971,87 @@ fn insert_presence(conn: &Connection, minute: &PresenceMinute) -> rusqlite::Resu
         minute.idle_sec,
         tier,
     ])?;
+    Ok(())
+}
+
+fn insert_commit(conn: &Connection, commit: &CommitObservation) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO commit_observation (project_id, commit_oid, observed_ms)
+         VALUES (?1, ?2, ?3)",
+    )?
+    .execute(params![
+        commit.project_id,
+        commit.commit_oid,
+        i64::try_from(commit.observed_ms).unwrap_or(i64::MAX),
+    ])?;
+    Ok(())
+}
+
+fn tier_str(tier: traction_core::TelemetryTier) -> String {
+    serde_json::to_value(tier)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn to_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Rows are `INSERT OR IGNORE`: a finalized minute is never rewritten, so a
+/// replay after a crash between the write and the cursor is a no-op.
+fn insert_rollup(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()> {
+    for b in &batch.buckets {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO work_bucket
+                 (project_id, minute_start_ms, ruleset_id, agent_compute_sec,
+                  idle_autonomous_sec, human_active_sec, permission_wait_ms,
+                  commits_human, commits_agent, injected_hid_detected,
+                  auto_approver_suspected, telemetry_tier, tier_limited)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )?
+        .execute(params![
+            b.project_id,
+            to_i64(b.minute_start_ms),
+            b.ruleset_id,
+            b.agent_compute_sec,
+            b.idle_autonomous_sec,
+            b.human_active_sec,
+            to_i64(b.permission_wait_ms),
+            b.commits_human,
+            b.commits_agent,
+            b.injected_hid_detected,
+            b.auto_approver_suspected,
+            tier_str(b.telemetry_tier),
+            b.tier_limited,
+        ])?;
+    }
+    for r in &batch.rollups {
+        let share = serde_json::to_string(&r.category_share_milli).unwrap_or_default();
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO activity_rollup
+                 (window_start_ms, ruleset_id, minutes_observed, category_share_milli,
+                  switch_rate_milli, mean_cadence_entropy_milli, injected_ratio_milli,
+                  telemetry_tier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?
+        .execute(params![
+            to_i64(r.window_start_ms),
+            r.ruleset_id,
+            r.minutes_observed,
+            share,
+            r.switch_rate_milli,
+            r.mean_cadence_entropy_milli,
+            r.injected_ratio_milli,
+            tier_str(r.telemetry_tier),
+        ])?;
+    }
+    conn.prepare_cached(
+        "INSERT INTO rollup_cursor (ruleset_id, finalized_through_ms) VALUES (?1, ?2)
+         ON CONFLICT (ruleset_id) DO UPDATE SET
+            finalized_through_ms = max(finalized_through_ms, excluded.finalized_through_ms)",
+    )?
+    .execute(params![batch.ruleset_id, to_i64(batch.through_ms)])?;
     Ok(())
 }
 

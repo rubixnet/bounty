@@ -146,8 +146,8 @@ One device-wide record per wall-clock minute, written by the daemon through the 
 - `telemetry_tier`: `full` (idle, category, real-vs-injected input counts), `reduced` (idle and category; `key_events`, `pointer_events`, `injected_events` and `cadence_entropy_milli` are `null`), `idle_only` (idle only; `category_sec` and `category_switches` are `null`), `none` (everything `null`). A `reduced`/`idle_only` minute is weaker evidence *for* the user and never evidence *against* them.
 - Sampling is per 10 s sub-slot (six per minute): the OS idle timer and the foreground category are read once per sub-slot, so `category_sec` has 10 s resolution and `category_switches` counts changes between sub-slot reads. Input events arrive by OS notification (X11 only) and the sensor sleeps otherwise: with no input it wakes once per sub-slot.
 - `active_subslots` (0 to 6): `full` counts sub-slots with real (non-injected) input. `reduced` and `idle_only` derive it from the idle timer (the timer reset inside the sub-slot), so injected input cannot be told apart there.
-- `idle_sec`: seconds in sub-slots whose idle timer was at or above `IDLE_THRESHOLD_SEC` (30). Constants (`SUBSLOT_SEC` 10, `IDLE_THRESHOLD_SEC` 30, `MIN_CADENCE_SAMPLES` 8) live in `traction-core` and move into the Slice 2 `Ruleset`.
-- `cadence_entropy_milli`: Shannon entropy (bits x 1000) of log2-binned intervals between consecutive real events inside the minute, `null` below `MIN_CADENCE_SAMPLES` intervals. Only a 16-counter histogram is kept; individual intervals are never stored.
+- `idle_sec`: seconds in sub-slots whose idle timer was at or above `IDLE_THRESHOLD_SEC` (30). `SUBSLOT_SEC` (10) lives in `traction-core`; `IDLE_THRESHOLD_SEC` (30) and `MIN_CADENCE_SAMPLES` (8) are `idle_threshold_sec` and `min_cadence_samples` in the `traction-rules/1` Ruleset (section 3).
+- `cadence_entropy_milli`: Shannon entropy (bits x 1000) of log2-binned intervals between consecutive real events inside the minute, `null` below `min_cadence_samples` intervals. Only a 16-counter histogram is kept; individual intervals are never stored.
 - A minute the sensor joined more than a sub-slot late, or slept through (the clock jumped more than a sub-slot), is dropped. Nothing is written for time the daemon was down. A restart inside one minute keeps the first row. Tray and session pause do not stop presence.
 - Category mapping is one compiled-in table per OS (macOS bundle IDs, Windows executable names, X11 `WM_CLASS`) resolving to `ide | terminal | browser | ai_desktop | other`, in memory. Unknown is `other`. The raw identifier is never stored or logged.
 
@@ -165,11 +165,66 @@ One device-wide record per wall-clock minute, written by the daemon through the 
 - **Linux Wayland idle (`ext-idle-notify-v1`, `org.freedesktop.ScreenSaver`) is not built yet**, so Wayland reports `none`. Open follow-up; the tier model already carries `idle_only`.
 - Wayland wins over an XWayland `DISPLAY`: XWayland only sees X clients.
 
+## 2c. Work Buckets, Activity Rollups and Commit Observations (Three-Clock rollup)
+
+A pure, deterministic function in `traction-core` (`rollup`, `work_buckets`, `activity_rollups`): Ruleset + Traction Events + Presence Minutes + Commit Observations in, 60 s Work Buckets and 120 s Activity Rollups out. No I/O, no clock, no floats; inputs are sorted by `(timestamp_ms, event_id)` first, so any input order gives byte-identical canonical JSON. The daemon collects inputs and finalizes; the Step 4 server recomputes with the same code.
+
+### Ruleset
+
+One `Ruleset` struct, one `const TRACTION_RULES_1` (`ruleset_id = "traction-rules/1"`). Nothing else in the workspace defines these numbers; changing any means a new ID. Every Work Bucket and Activity Rollup records its `ruleset_id`.
+
+| Field | Value | Meaning |
+|---|---|---|
+| `unverified_after_sec` | 90 | Agent time this far past the last verified presence is Unverified Autonomous Time |
+| `min_active_subslots` | 3 | Real-input sub-slots (of 6) for verified presence |
+| `injected_ratio_flag_milli` | 500 | Injected share of input events (per mille) that flags a minute |
+| `robotic_entropy_max_milli` | 500 | Cadence entropy below this is robotic (the sensor already reports `null` below `min_cadence_samples`) |
+| `permission_latency_cap_ms` / `_floor_ms` | 120000 / 300 | Clamp and machine-speed floor for approvals |
+| `auto_approver_min_fast` | 2 | Floor-fast approvals in one minute bucket that set `auto_approver_suspected` |
+| `presence_project_lookback_ms` | 300000 | Window for assigning a present minute to a Project |
+| `agent_quiet_ms` | 60000 | Quiet period before a commit counts as human |
+| `commit_freshness_ms` | 60000 | Max committer-time distance from the observation |
+| `bucket_settle_ms` | 120000 | A minute is finalized once this much older than now |
+| `stale_turn_timeout_ms` | 600000 | A silent open turn closes at its last event |
+| `activity_rollup_ms` | 120000 | Activity Rollup window (the Anchor cadence) |
+| `idle_threshold_sec` / `min_cadence_samples` | 30 / 8 | Presence Sensor constants (section 2b) |
+| `anchor_window_ms`, `drift_decay_ms`, `baseline_min_days`, `comfort_floor_milli` | 300000, 600000, 3, 500 | Slots Slice 3 (struggle credit) fills |
+
+### Work Bucket (Project x minute)
+
+`project_id`, `minute_start_ms`, `ruleset_id`, `agent_compute_sec`, `idle_autonomous_sec`, `human_active_sec`, `permission_wait_ms`, `commits_human`, `commits_agent`, `injected_hid_detected`, `auto_approver_suspected`, `telemetry_tier`, `tier_limited`.
+
+- **`agent_compute_sec`**: union of open turn intervals per Project per minute. A turn opens at `PROMPT_SUBMIT` and closes at `TURN_END`, `STOP_FAILURE` or `SESSION_END` (the last two close every open interval of their session at their timestamp), or at its last event once `stale_turn_timeout_ms` passes. Subagents and parallel sessions never add time. A second belongs to an interval when its start lies inside it, so a minute-aligned 10 minute turn is exactly 600 s. Device-wide, a second with `k` active Projects is split `1/k` each (rounded down), so the sum over Projects never exceeds 60 s per minute.
+- **Verified human presence** (a minute): `active_subslots >= min_active_subslots`, not `injected_hid_detected`, and some foreground time in `ide`/`terminal`/`browser`/`ai_desktop`. The category clause is skipped when the tier is `idle_only`/`none` or `category_sec` is `null`, and the bucket sets `tier_limited`. A verified minute assigned to a Project is 60 `human_active_sec`.
+- **`idle_autonomous_sec`**: agent seconds that are not within `unverified_after_sec` after a verified minute's end (a verified minute keeps its own 60 s plus 90 s fresh) or after an unflagged `PROMPT_SUBMIT`. Always `<= agent_compute_sec`.
+- **`injected_hid_detected`**: injected ratio `injected / (key + pointer + injected)` at or above `injected_ratio_flag_milli`, or `cadence_entropy_milli` below `robotic_entropy_max_milli`. A flagged minute gives no verified presence, no anchor and 0 `human_active_sec`.
+- **Presence to Project**: each present minute goes to exactly one Project, the one with the most recent Traction Event or Commit Observation in `[minute end - lookback, minute end)`; the later timestamp wins, equal timestamps go to the smaller `project_id`; otherwise none. So the sum of `human_active_sec` over Projects is at most 60 per minute.
+- **`permission_wait_ms`**: `PERMISSION_REQUEST` to the session's next `TOOL_POST` / `TOOL_FAIL` / `PROMPT_SUBMIT` / turn close, clamped to `[0, cap]`. It adds to `human_active_sec` (never past the minute's 60 s) only when the span holds real input (`key + pointer > 0`; on `reduced`/`idle_only`, `active_subslots > 0`) and the minute is not flagged. An approval with known zero real input, or `auto_approver_min_fast` approvals under the floor in one bucket, sets `auto_approver_suspected` and earns nothing. Unknown input (no Presence Minute, tier `none`) earns nothing and flags nothing.
+- **`commits_human` / `commits_agent`**: a Commit Observation is human when its Project had no open turn and no Harness event (`harness_id` set) in the prior `agent_quiet_ms`; otherwise agent.
+- A minute with no Presence Minute (daemon down, filled in by a tailer) is `telemetry_tier: none`, with 0 Human Active Time.
+
+### Activity Rollup (device x 120 s window, aligned)
+
+`window_start_ms`, `ruleset_id`, `minutes_observed`, `category_share_milli` (per category, per mille of category seconds), `switch_rate_milli` (switches per observed minute x 1000), `mean_cadence_entropy_milli`, `injected_ratio_milli`, `telemetry_tier` (the weakest tier among observed minutes). Only whole aligned windows holding at least one Presence Minute are produced.
+
+### Commit Observation (daemon-local, not a Traction Event)
+
+`(project_id, commit_oid, observed_ms)`. For each tracked Git worktree the daemon watches the `mtime` of `<per-worktree git dir>/logs/HEAD` (never opening it: the reflog holds messages) and records a commit only when all three hold: `COMMIT_EDITMSG` `mtime` moved forward (stat only); `HEAD`'s first parent equals the previous `HEAD` (a root commit with no previous `HEAD` also passes); and `HEAD`'s committer time (`rev-list -1 --no-commit-header --format=%ct HEAD`, the only `--format` the hardened wrapper allows) is within `commit_freshness_ms` of the observation. Any failure or timeout means no commit. A linked worktree is tracked under its own git dir. Message, author and diff are never read.
+
+### Tables (all append-only: no-update/no-delete triggers)
+
+- `commit_observation (project_id, commit_oid, observed_ms)`, key `(project_id, commit_oid, observed_ms)`.
+- `work_bucket`, key `(project_id, minute_start_ms, ruleset_id)`, one column per Work Bucket field.
+- `activity_rollup`, key `(window_start_ms, ruleset_id)`.
+- `rollup_cursor (ruleset_id, finalized_through_ms)`: the finalizer's bookmark, the only mutable table of the three-clock output, written in the same transaction as the rows it covers.
+
+The finalizer computes each minute once it is older than `bucket_settle_ms` (aligned down to a whole rollup window), writes buckets with `INSERT OR IGNORE`, and resumes after a restart from `rollup_cursor`. Later events never rewrite a finalized minute (attribution is live-only). Its first pass waits one settle period after daemon start, so a restarting tailer can add the down-time events first.
+
 ## 3. Server Sync Heartbeat (Every 2 Minutes — No PII)
 
 Sent to `POST /v1/anchors` per `project_id`, containing aggregated 60-second `WorkBucket` records plus the rolling chain tip:
 
-- `human_active_sec`, `agent_compute_sec`, `idle_autonomous_sec`
+- `human_active_sec`, `agent_compute_sec`, `idle_autonomous_sec` (the Work Bucket, Activity Rollup, Ruleset and their tables are defined in section 2c)
 - `injected_hid_detected`, `window_category_counts`, `struggle_axes` (`steering`, `specificity`, `friction`, `comfort_delta`)
 - `sync_mode`: `"realtime" | "offline_buffered"`
 - `chain_tip_hex`: 32-byte SHA-256 hex digest

@@ -25,6 +25,15 @@ pub enum GitQuery {
     TopLevel,
     RootCommits,
     OriginUrl,
+    /// This worktree's own git dir (`HEAD`, `logs/HEAD`, `COMMIT_EDITMSG`).
+    GitDir,
+    /// The object id `HEAD` names.
+    Head,
+    /// The object id of `HEAD`'s first parent.
+    HeadParent,
+    /// `HEAD`'s committer time (Unix seconds) and nothing else: no message,
+    /// author or diff can reach the daemon through this query.
+    HeadCommitterTime,
 }
 
 /// `core.hooksPath` pointed at the OS null device, chosen at compile time so
@@ -54,6 +63,16 @@ impl GitQuery {
             Self::TopLevel => &["rev-parse", "--show-toplevel"],
             Self::RootCommits => &["rev-list", "--max-parents=0", "HEAD"],
             Self::OriginUrl => &["config", "--get", "remote.origin.url"],
+            Self::GitDir => &["rev-parse", "--path-format=absolute", "--git-dir"],
+            Self::Head => &["rev-parse", "--verify", "--quiet", "HEAD"],
+            Self::HeadParent => &["rev-parse", "--verify", "--quiet", "HEAD^"],
+            Self::HeadCommitterTime => &[
+                "rev-list",
+                "-1",
+                "--no-commit-header",
+                "--format=%ct",
+                "HEAD",
+            ],
         }
     }
 }
@@ -139,6 +158,52 @@ impl Git {
             Ok(url) if url.is_empty() => Ok(None),
             Ok(url) => Ok(Some(url)),
             Err(GitError::NotARepo) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The absolute per-worktree git dir containing `folder` (not the common
+    /// dir: `HEAD`, `logs/HEAD` and `COMMIT_EDITMSG` are per worktree).
+    /// Refuses a `$HOME`-rooted repo like every other query.
+    pub fn git_dir(&self, folder: &Path) -> Result<PathBuf, GitError> {
+        self.checked_top_level(folder)?;
+        self.run(GitQuery::GitDir, folder).map(PathBuf::from)
+    }
+
+    /// The object id `HEAD` names, or `None` on an unborn branch (or any
+    /// failure: callers treat both as "no answer"). Skips the `$HOME` check:
+    /// [`Git::git_dir`] already ran it for this folder.
+    pub fn head(&self, folder: &Path) -> Result<Option<String>, GitError> {
+        self.object_id(GitQuery::Head, folder)
+    }
+
+    /// The object id of `HEAD`'s first parent, or `None` for a root commit.
+    pub fn head_parent(&self, folder: &Path) -> Result<Option<String>, GitError> {
+        self.object_id(GitQuery::HeadParent, folder)
+    }
+
+    /// Whether `HEAD` is a root commit (it is one of the repo's parentless
+    /// commits reachable from itself).
+    pub fn head_is_root(&self, folder: &Path) -> Result<bool, GitError> {
+        let Some(head) = self.head(folder)? else {
+            return Ok(false);
+        };
+        let roots = self.run(GitQuery::RootCommits, folder)?;
+        Ok(roots.lines().any(|line| line.trim() == head))
+    }
+
+    /// `HEAD`'s committer time in Unix seconds.
+    pub fn head_committer_time(&self, folder: &Path) -> Result<u64, GitError> {
+        self.run(GitQuery::HeadCommitterTime, folder)?
+            .trim()
+            .parse()
+            .map_err(|_| GitError::NotARepo)
+    }
+
+    fn object_id(&self, query: GitQuery, folder: &Path) -> Result<Option<String>, GitError> {
+        match self.run(query, folder) {
+            Ok(out) if is_object_id(out.trim()) => Ok(Some(out.trim().to_owned())),
+            Ok(_) | Err(GitError::NotARepo) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -305,11 +370,15 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::process::Child;
 
-    const ALL_QUERIES: [GitQuery; 4] = [
+    const ALL_QUERIES: [GitQuery; 8] = [
         GitQuery::CommonDir,
         GitQuery::TopLevel,
         GitQuery::RootCommits,
         GitQuery::OriginUrl,
+        GitQuery::GitDir,
+        GitQuery::Head,
+        GitQuery::HeadParent,
+        GitQuery::HeadCommitterTime,
     ];
 
     #[cfg(not(windows))]
@@ -326,7 +395,7 @@ mod tests {
     #[test]
     fn every_query_runs_the_exact_hardened_argv() {
         let folder = Path::new("some/project");
-        let cases: [(GitQuery, &[&str]); 4] = [
+        let cases: [(GitQuery, &[&str]); 8] = [
             (
                 GitQuery::CommonDir,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -339,6 +408,28 @@ mod tests {
             (
                 GitQuery::OriginUrl,
                 &["config", "--get", "remote.origin.url"],
+            ),
+            (
+                GitQuery::GitDir,
+                &["rev-parse", "--path-format=absolute", "--git-dir"],
+            ),
+            (
+                GitQuery::Head,
+                &["rev-parse", "--verify", "--quiet", "HEAD"],
+            ),
+            (
+                GitQuery::HeadParent,
+                &["rev-parse", "--verify", "--quiet", "HEAD^"],
+            ),
+            (
+                GitQuery::HeadCommitterTime,
+                &[
+                    "rev-list",
+                    "-1",
+                    "--no-commit-header",
+                    "--format=%ct",
+                    "HEAD",
+                ],
             ),
         ];
         for (query, tail) in cases {
@@ -358,6 +449,17 @@ mod tests {
             ];
             expected.extend_from_slice(tail);
             assert_eq!(args_of(&cmd), expected, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_bare_committer_time_format_is_ever_allowed() {
+        for query in ALL_QUERIES {
+            for arg in query.subcommand() {
+                if arg.starts_with("--format") || arg.starts_with("--pretty") {
+                    assert_eq!(*arg, "--format=%ct", "{query:?}");
+                }
+            }
         }
     }
 
