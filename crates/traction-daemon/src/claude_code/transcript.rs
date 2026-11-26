@@ -45,6 +45,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::path::Path;
 
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -59,6 +60,7 @@ use super::pause::Command;
 use crate::content_metrics::{self, TextMetrics};
 use crate::event_id::derived_event_id;
 use crate::router::Pause;
+use crate::symbol_index::SymbolIndexes;
 
 /// `tool_use` IDs remembered per transcript (for the `tool_name` of their
 /// results) before the table is cleared: bounded memory.
@@ -124,7 +126,11 @@ pub enum Line {
 
 /// Maps one transcript line (without its `\n`). `Ok(None)` for a record
 /// that maps to nothing.
-pub fn map_line(line: &[u8], tools: &mut ToolNames) -> Result<Option<Line>, LineError> {
+pub fn map_line(
+    line: &[u8],
+    tools: &mut ToolNames,
+    symbols: &SymbolIndexes,
+) -> Result<Option<Line>, LineError> {
     let record: Record = serde_json::from_slice(line).map_err(|error| {
         if error.is_data() {
             LineError::UnexpectedShape
@@ -132,7 +138,7 @@ pub fn map_line(line: &[u8], tools: &mut ToolNames) -> Result<Option<Line>, Line
             LineError::InvalidJson
         }
     })?;
-    map_record(record, tools)
+    map_record(record, tools, symbols)
 }
 
 /// The `SESSION_START` synthesized before `first`, the first event of a
@@ -209,7 +215,7 @@ enum Content {
 }
 
 /// What prompt text is reduced to.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PromptText {
     metrics: TextMetrics,
     /// Starts with a slash-command wrapper tag.
@@ -355,7 +361,11 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Lenient<T> {
     }
 }
 
-fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Line>, LineError> {
+fn map_record(
+    record: Record,
+    tools: &mut ToolNames,
+    symbols: &SymbolIndexes,
+) -> Result<Option<Line>, LineError> {
     let is_user = match record.kind.as_deref() {
         Some("user") => true,
         Some("assistant") => false,
@@ -393,7 +403,11 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Line>, Lin
                 if let Some(command) = text.pause {
                     pause = Some(command);
                 } else if text.is_typed(has_origin) {
-                    planned.push((0, EventType::PromptSubmit, prompt_metrics(&[text])));
+                    planned.push((
+                        0,
+                        EventType::PromptSubmit,
+                        prompt_metrics(&[text], record.cwd.as_deref(), symbols),
+                    ));
                 }
             }
             Content::Blocks(blocks) => {
@@ -421,7 +435,7 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Line>, Lin
                             };
                             planned.push((index, event_type, metrics));
                         }
-                        Some("text") => texts.extend(block.text),
+                        Some("text") => texts.extend(block.text.clone()),
                         Some("image") => has_image = true,
                         _ => {}
                     }
@@ -432,7 +446,11 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Line>, Lin
                     pause = texts.iter().find_map(|t| t.pause);
                     let typed = texts.iter().any(|t| t.is_typed(has_origin));
                     if typed || (has_image && texts.is_empty()) {
-                        planned.push((0, EventType::PromptSubmit, prompt_metrics(&texts)));
+                        planned.push((
+                            0,
+                            EventType::PromptSubmit,
+                            prompt_metrics(&texts, record.cwd.as_deref(), symbols),
+                        ));
                     }
                 }
             }
@@ -505,13 +523,28 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Line>, Lin
 }
 
 /// `PROMPT_SUBMIT` metrics of one prompt made of `texts`.
-fn prompt_metrics(texts: &[PromptText]) -> MetricsOnly {
+///
+/// `repo_symbol_hits` counts the distinct words of every text found in the
+/// file-name index of the Project holding `cwd`; the words are dropped here.
+fn prompt_metrics(texts: &[PromptText], cwd: Option<&str>, symbols: &SymbolIndexes) -> MetricsOnly {
+    let hits = cwd.and_then(|cwd| {
+        let mut total = 0u64;
+        let mut known = false;
+        for t in texts {
+            if let Some(n) = symbols.hits(Path::new(cwd), &t.metrics.candidates) {
+                known = true;
+                total = total.saturating_add(n);
+            }
+        }
+        known.then_some(total)
+    });
     let len = texts
         .iter()
         .map(|t| t.metrics.prompt_char_len)
         .fold(0u64, u64::saturating_add);
     MetricsOnly {
         prompt_char_len: Some(len),
+        repo_symbol_hits: hits,
         has_stacktrace: Some(texts.iter().any(|t| t.metrics.has_stacktrace)),
         ..MetricsOnly::default()
     }
@@ -690,11 +723,35 @@ mod tests {
 
     /// The event types `line` maps to.
     fn types_of(line: &str, tools: &mut ToolNames) -> Vec<EventType> {
-        match map_line(line.as_bytes(), tools).expect("a readable line") {
+        match map_line(line.as_bytes(), tools, &SymbolIndexes::default()).expect("a readable line")
+        {
             Some(Line::Events(mapped)) => mapped.events.iter().map(|e| e.event_type).collect(),
             Some(Line::Pause(pause)) => panic!("unexpected pause: {pause:?}"),
             None => vec![],
         }
+    }
+
+    #[test]
+    fn a_transcript_prompt_counts_the_repo_files_it_names() {
+        let symbols = SymbolIndexes::default();
+        let root = std::path::Path::new("/code/app");
+        symbols.note(root, &root.join("src/quasarfoxtrot_widget.rs"));
+        let hits_of = |text: &str| {
+            let line = user_record(json!(text), json!({}));
+            match map_line(line.as_bytes(), &mut ToolNames::default(), &symbols) {
+                Ok(Some(Line::Events(mapped))) => mapped.events[0].metrics_only.repo_symbol_hits,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(hits_of("the panic is in quasarfoxtrot_widget.rs"), Some(1));
+        assert_eq!(hits_of("continue"), Some(0));
+        // A prompt from outside every indexed Project is unknown, not zero.
+        let line = user_record(json!("fix it"), json!({"cwd": "/elsewhere"}));
+        let out = map_line(line.as_bytes(), &mut ToolNames::default(), &symbols);
+        let Ok(Some(Line::Events(mapped))) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(mapped.events[0].metrics_only.repo_symbol_hits, None);
     }
 
     // No events means no turn window: windows open only on events.
@@ -787,7 +844,13 @@ mod tests {
     fn only_an_exact_command_wrapper_is_a_pause() {
         let pause_of = |text: &str| {
             let line = user_record(json!(text), json!({}));
-            match map_line(line.as_bytes(), &mut ToolNames::default()).expect("readable") {
+            match map_line(
+                line.as_bytes(),
+                &mut ToolNames::default(),
+                &SymbolIndexes::default(),
+            )
+            .expect("readable")
+            {
                 Some(Line::Pause(pause)) => Some((pause.action, pause.session_id, pause.at_ms)),
                 Some(Line::Events(mapped)) => panic!("stored as events: {mapped:?}"),
                 None => None,
@@ -833,7 +896,7 @@ mod tests {
             for line in text.lines() {
                 lines += 1;
                 assert!(
-                    map_line(line.as_bytes(), &mut tools).is_ok(),
+                    map_line(line.as_bytes(), &mut tools, &SymbolIndexes::default()).is_ok(),
                     "{}: {line:.120}",
                     path.display()
                 );

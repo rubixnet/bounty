@@ -29,6 +29,7 @@ mod secret;
 #[cfg(unix)]
 mod socket;
 mod storage;
+mod symbol_index;
 mod token;
 mod watcher;
 mod writer;

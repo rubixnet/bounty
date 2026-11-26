@@ -215,10 +215,13 @@ fn assert_hook_event(row: &Row, session: &str, sent_from_ms: u64, sent_to_ms: u6
     assert_eq!(row.attribution_source, "harness_hook", "{row:?}");
     assert_eq!(row.network_class, "cloud_api", "{row:?}");
     assert_eq!(row.parent_orchestrator_id, None, "{row:?}");
-    assert_eq!(row.repo_symbol_hits, None, "Step 2 field: {row:?}");
+    let prompt = row.event_type == "PROMPT_SUBMIT";
+    assert!(
+        prompt || row.repo_symbol_hits.is_none(),
+        "only a prompt carries repo_symbol_hits: {row:?}"
+    );
     assert_eq!(row.exit_code, None, "Step 2 field: {row:?}");
     assert_eq!(row.diff_lines_delta, None, "Step 2 field: {row:?}");
-    let prompt = row.event_type == "PROMPT_SUBMIT";
     assert_eq!(row.prompt_char_len.is_some(), prompt, "{row:?}");
     assert_eq!(row.has_stacktrace.is_some(), prompt, "{row:?}");
     assert_eq!(row.end_reason.is_some(), row.event_type == "TURN_END");

@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::struggle::{self, BaselineDay, ScoreInput, StruggleAxes};
 use crate::{AppCategory, EventType, PresenceMinute, Ruleset, TelemetryTier, TractionEvent};
 
 const MINUTE_MS: u64 = 60_000;
@@ -42,6 +43,9 @@ pub struct RollupInput<'a> {
     pub events: &'a [TractionEvent],
     pub presence: &'a [PresenceMinute],
     pub commits: &'a [CommitObservation],
+    /// The local comfort baseline (`struggle::BaselineDay`s, oldest first);
+    /// empty for a user with no history.
+    pub baseline: &'a [BaselineDay],
     pub from_ms: u64,
     pub to_ms: u64,
 }
@@ -66,6 +70,12 @@ pub struct WorkBucket {
     /// The category clause could not be checked (`idle_only`/`none` tier or
     /// no category data), so verified presence rests on input alone.
     pub tier_limited: bool,
+    pub struggle_axes: StruggleAxes,
+    /// Weighted mean of the four axes, 0 to 1000.
+    pub verified_struggle: u32,
+    /// `human_active_sec` x the anchor and comfort weight; never above
+    /// `human_active_sec`.
+    pub struggle_credit_sec: u32,
 }
 
 /// Per-category share of foreground time, per mille.
@@ -380,6 +390,7 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
             .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
             .map(|(_, p)| *p)
     };
+    let mut permission_anchors: Vec<(u64, String)> = Vec::new();
     let mut human_used: BTreeMap<u64, u32> = BTreeMap::new();
     let mut flagged_keys: BTreeSet<(u64, String)> = BTreeSet::new();
     for minute in (from..to).step_by(MINUTE_MS as usize) {
@@ -466,6 +477,7 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
             }
             let suspected = a.no_input_approval || a.fast_approvals >= rules.auto_approver_min_fast;
             if state == Input::Real && !suspected && !fast && !facts_at(minute).flagged {
+                permission_anchors.push((e.timestamp_ms, project.to_owned()));
                 let used = human_used.entry(minute).or_insert(0);
                 let credit = u32::try_from(wait_ms / 1000).unwrap_or(60).min(60 - *used);
                 *used += credit;
@@ -534,8 +546,21 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
             auto_approver_suspected: suspected,
             telemetry_tier: f.tier,
             tier_limited: f.tier_limited,
+            struggle_axes: StruggleAxes::default(),
+            verified_struggle: 0,
+            struggle_credit_sec: 0,
         });
     }
+    struggle::score(
+        rules,
+        &ScoreInput {
+            sorted: &sorted,
+            presence: &presence,
+            permission_anchors: &permission_anchors,
+            baseline: input.baseline,
+        },
+        &mut out,
+    );
     out
 }
 

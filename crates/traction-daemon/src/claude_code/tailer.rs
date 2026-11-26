@@ -50,6 +50,7 @@ use crate::log;
 use crate::paths;
 use crate::router::{RouterSender, TailedItem};
 use crate::storage::{TailerStartRow, TailerState, TranscriptOffset};
+use crate::symbol_index::SymbolIndexes;
 use notify::event::EventKind;
 use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher as _};
 
@@ -148,6 +149,7 @@ pub fn start(
     claude_dir: &Path,
     state: TailerState,
     router: RouterSender,
+    symbols: SymbolIndexes,
 ) -> io::Result<TailerThread> {
     let (tx, rx) = mpsc::channel();
     let queued = Arc::new(AtomicUsize::new(0));
@@ -161,6 +163,7 @@ pub fn start(
         projects_watched: false,
         ancestor_watched: None,
         router,
+        symbols,
         files: HashMap::new(),
         announced: HashSet::new(),
         queued,
@@ -225,6 +228,8 @@ fn start_backend(
 }
 
 struct Worker {
+    /// File-name indexes, for `repo_symbol_hits`.
+    symbols: SymbolIndexes,
     /// Canonical Claude config folder.
     claude_dir: PathBuf,
     /// `<claude_dir>/projects`.
@@ -500,7 +505,7 @@ impl Worker {
         if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
-        match transcript::map_line(line, tools) {
+        match transcript::map_line(line, tools, &self.symbols) {
             Ok(None) => {}
             Ok(Some(Line::Pause(pause))) => pending.push(TailedItem::Pause(pause)),
             Ok(Some(Line::Events(mapped))) => {

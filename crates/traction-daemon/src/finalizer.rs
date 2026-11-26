@@ -22,12 +22,12 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, params};
 use traction_core::{
     CommitObservation, PresenceMinute, RollupInput, Ruleset, TRACTION_RULES_1, TractionEvent,
-    rollup,
+    fold_baseline, rollup,
 };
 
 use crate::log;
 use crate::presence::now_ms;
-use crate::storage::{DB_FILE, RollupBatch, WriteOp};
+use crate::storage::{self, DB_FILE, RollupBatch, WriteOp};
 use crate::writer::WriterSender;
 
 const MINUTE_MS: u64 = 60_000;
@@ -191,21 +191,27 @@ pub fn finalize_range(
     let events = load_events(conn, rules, from, to)?;
     let presence = load_presence(conn, from, to + MINUTE_MS * 3)?;
     let commits = load_commits(conn, from, to)?;
+    let mut baseline = storage::load_baseline(conn)?;
     let out = rollup(
         rules,
         &RollupInput {
             events: &events,
             presence: &presence,
             commits: &commits,
+            baseline: &baseline,
             from_ms: from,
             to_ms: to,
         },
     );
+    // The batch's present minutes join the baseline after it was scored
+    // against the history that came before.
+    fold_baseline(rules, &mut baseline, &out.work_buckets);
     Ok(Some(RollupBatch {
         ruleset_id: rules.ruleset_id.to_owned(),
         through_ms: to,
         buckets: out.work_buckets,
         rollups: out.activity_rollups,
+        baseline,
     }))
 }
 
@@ -242,7 +248,9 @@ fn load_events(
     let ext = to + rules.permission_latency_cap_ms + 1;
     let mut stmt = conn.prepare(
         "SELECT event_id, timestamp_ms, harness_id, session_id, parent_orchestrator_id,
-                event_type, end_reason, project_id, network_class, attribution_source
+                event_type, end_reason, project_id, network_class, attribution_source,
+                prompt_char_len, repo_symbol_hits, has_stacktrace, tool_name,
+                diff_lines_delta, mutation_kind
          FROM project_event
          WHERE project_id IS NOT NULL AND (
              (timestamp_ms >= :base AND timestamp_ms < :ext)
@@ -279,7 +287,15 @@ fn load_events(
                 "model_id": null,
                 "network_class": row.get::<_, String>(8)?,
                 "attribution_source": row.get::<_, String>(9)?,
-                "metrics_only": {},
+                "metrics_only": {
+                    "prompt_char_len": row.get::<_, Option<i64>>(10)?,
+                    "repo_symbol_hits": row.get::<_, Option<i64>>(11)?,
+                    "has_stacktrace": row.get::<_, Option<bool>>(12)?,
+                    "tool_name": row.get::<_, Option<String>>(13)?,
+                    "exit_code": null,
+                    "diff_lines_delta": row.get::<_, Option<i64>>(14)?,
+                    "mutation_kind": row.get::<_, Option<String>>(15)?,
+                },
             }))
         },
     )?;
@@ -534,6 +550,135 @@ mod tests {
         assert!(
             tiers.iter().all(|(t, h)| t == "none" && *h == 0),
             "{tiers:?}"
+        );
+    }
+
+    fn event_with(
+        n: u32,
+        ts: u64,
+        kind: &str,
+        session: Option<&str>,
+        metrics: serde_json::Value,
+    ) -> WriteOp {
+        let manual = session.is_none();
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "event_id": format!("019a7c2e-8b4d-7000-8000-{n:012x}"),
+            "timestamp_ms": ts,
+            "harness_id": if manual { None } else { Some("claude-code") },
+            "session_id": session,
+            "parent_orchestrator_id": null,
+            "event_type": kind,
+            "end_reason": null,
+            "cwd": "/code/p",
+            "project_id": "p",
+            "model_id": null,
+            "network_class": if manual { "manual" } else { "cloud_api" },
+            "attribution_source": if manual { "file_watcher" } else { "harness_hook" },
+            "metrics_only": metrics,
+        });
+        let event: TractionEvent = serde_json::from_value(value).expect("event");
+        WriteOp::Event(Box::new(EventRow::try_from(event).expect("row")))
+    }
+
+    fn working_minute(ts: u64) -> WriteOp {
+        WriteOp::Presence(PresenceMinute {
+            minute_start_ms: ts,
+            key_events: Some(30),
+            pointer_events: Some(30),
+            injected_events: Some(0),
+            active_subslots: Some(4),
+            cadence_entropy_milli: Some(2500),
+            category_sec: Some(traction_core::CategorySec {
+                ide: 30,
+                terminal: 30,
+                ..traction_core::CategorySec::default()
+            }),
+            category_switches: Some(2),
+            idle_sec: Some(0),
+            telemetry_tier: traction_core::TelemetryTier::Full,
+        })
+    }
+
+    #[test]
+    fn struggle_scores_are_finalized_with_the_bucket_and_the_baseline_is_a_compact_aggregate() {
+        let (_dir, mut conn) = open();
+        let tool = |name: &str| serde_json::json!({ "tool_name": name });
+        let mut ops = vec![
+            event_with(
+                1,
+                T0 + 5_000,
+                "PROMPT_SUBMIT",
+                Some("s"),
+                serde_json::json!({"prompt_char_len": 220, "repo_symbol_hits": 3, "has_stacktrace": true}),
+            ),
+            event_with(2, T0 + 20_000, "TOOL_FAIL", Some("s"), tool("Bash")),
+            event_with(
+                3,
+                T0 + 40_000,
+                "FILE_MUTATION",
+                Some("s"),
+                serde_json::json!({"mutation_kind": "modified", "diff_lines_delta": 3}),
+            ),
+            event_with(4, T0 + 90_000, "TOOL_FAIL", Some("s"), tool("Bash")),
+            event_with(
+                5,
+                T0 + 110_000,
+                "FILE_MUTATION",
+                Some("s"),
+                serde_json::json!({"mutation_kind": "modified", "diff_lines_delta": 3}),
+            ),
+            event_with(6, T0 + 150_000, "TOOL_POST", Some("s"), tool("Bash")),
+            event_with(
+                7,
+                T0 + 170_000,
+                "TURN_END",
+                Some("s"),
+                serde_json::json!({}),
+            ),
+        ];
+        ops.extend((0..4).map(|i| working_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+        finalize(&mut conn, None, T0 + 10 * MIN).unwrap();
+
+        let rows: Vec<(i64, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT human_active_sec, struggle_credit_sec, verified_struggle, axis_friction
+                 FROM work_bucket ORDER BY minute_start_ms",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(rows.iter().all(|r| r.1 <= r.0), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.1 > 0 && r.2 >= 600 && r.3 == 1000),
+            "{rows:?}"
+        );
+
+        // The baseline holds only counts for the finalized day.
+        let (days, friction): (i64, String) = conn
+            .query_row(
+                "SELECT count(*), group_concat(friction_hist) FROM struggle_baseline",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(days, 1);
+        assert!(friction.starts_with('['), "{friction}");
+        // It is the one table exempt from append-only.
+        conn.execute(
+            "UPDATE struggle_baseline SET friction_hist = friction_hist",
+            [],
+        )
+        .unwrap();
+        // The loaded baseline matches what was stored.
+        let loaded = storage::load_baseline(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].friction_hist.iter().sum::<u32>(),
+            rows.iter().filter(|r| r.0 > 0).count() as u32
         );
     }
 
