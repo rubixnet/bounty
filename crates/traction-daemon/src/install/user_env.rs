@@ -24,6 +24,8 @@ const BROADCAST_TIMEOUT_MS: u32 = 2_000;
 /// (creating the token file first if the daemon has never run), then tells
 /// running programs the environment changed so new terminals see it.
 pub fn set_token(data_dir: &Path, key: &str) -> io::Result<()> {
+    // The installer may run before the daemon ever has.
+    std::fs::create_dir_all(data_dir)?;
     let token = BusToken::load_or_create(data_dir)?;
     let value: Vec<u16> = token
         .reveal()

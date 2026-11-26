@@ -8,7 +8,7 @@
 //! (`docs/protocol.md` section 1, "Claude Code hooks"), except a
 //! `UserPromptSubmit` whose prompt is exactly a Session Pause command
 //! ([`pause::Command::matching`]), which maps to [`HookAction::Pause`] and no
-//! event.
+//! event. A `UserPromptSubmit` that is a task notification maps to nothing.
 
 use std::path::PathBuf;
 
@@ -123,12 +123,19 @@ pub enum HookAction {
     },
 }
 
-/// A prompt as the daemon keeps it: its metrics, and the Session Pause
-/// command it is exactly, if any. The text itself is dropped in parsing.
+/// Whether prompt text is Claude Code's own report that a background task
+/// finished, which the user did not type.
+pub(crate) fn is_task_notification(text: &str) -> bool {
+    text.trim_start().starts_with("<task-notification>")
+}
+
+/// A prompt as the daemon keeps it: its metrics, the Session Pause command
+/// it is exactly, if any, and whether it is a task notification. The text itself is dropped in parsing.
 #[derive(Debug, Clone, Copy)]
 struct Prompt {
     metrics: TextMetrics,
     command: Option<Command>,
+    is_task_notification: bool,
 }
 
 /// What one raw hook body yields: the action, and the transcript path the
@@ -175,6 +182,7 @@ fn measured<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Prompt>
     Ok(text.map(|text| Prompt {
         metrics: content_metrics::measure(&text),
         command: Command::matching(&text),
+        is_task_notification: is_task_notification(&text),
     }))
 }
 
@@ -226,6 +234,9 @@ fn map_payload(payload: Payload, received_ms: u64) -> HookAction {
         _ => payload.cwd,
     };
     let prompt = payload.prompt.filter(|_| hook == Hook::UserPromptSubmit);
+    if prompt.is_some_and(|prompt| prompt.is_task_notification) {
+        return HookAction::Nothing;
+    }
     let command = prompt.and_then(|prompt| prompt.command);
     let prompt = prompt.map(|prompt| prompt.metrics);
     let tool_name = payload
@@ -286,6 +297,20 @@ pub(crate) fn capped_identifier(mut value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_task_notification_prompt_hook_is_nothing() {
+        for (prompt, ignored) in [
+            ("<task-notification>\\n<task-id>a</task-id>", true),
+            ("what is a <task-notification>?", false),
+        ] {
+            let body = format!(
+                r#"{{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"{prompt}"}}"#
+            );
+            let action = map_hook(body.as_bytes(), 1).action;
+            assert_eq!(action == HookAction::Nothing, ignored, "{prompt}");
+        }
+    }
 
     #[test]
     fn the_hook_set_never_contains_worktree_create_and_names_round_trip() {

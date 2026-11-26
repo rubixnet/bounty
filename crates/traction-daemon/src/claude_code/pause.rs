@@ -1,6 +1,7 @@
 //! `/stop-track` and `/resume-track`: the Session Pause commands.
 //!
-//! The hook endpoint and the installer share these definitions: the
+//! The hook endpoint, the transcript tailer and the installer share these
+//! definitions: the tailer matches [`Command::matching_wrapper`], the
 //! endpoint matches a `UserPromptSubmit` prompt against [`Command::literal`]
 //! and [`Command::body`], the installer writes [`Command::file_name`] with
 //! [`Command::description`] and that same body. The body names the Traction
@@ -64,6 +65,30 @@ impl Command {
         Command::ALL
             .into_iter()
             .find(|command| prompt == command.literal || prompt == command.body)
+    }
+
+    /// The command whose transcript wrapper `text` is: nothing but a
+    /// `<command-name>` that, trimmed, equals the command's literal, with
+    /// an optional `<command-message>` and empty `<command-args>`, in any
+    /// order. Text outside the tags, or arguments, make it `None`.
+    pub fn matching_wrapper(text: &str) -> Option<Command> {
+        let mut rest = text.trim();
+        let mut name = None;
+        while !rest.is_empty() {
+            let (tag, inner) = rest.strip_prefix('<')?.split_once('>')?;
+            let (value, after) = inner.split_once("</")?;
+            rest = after.strip_prefix(tag)?.strip_prefix('>')?.trim_start();
+            match tag {
+                "command-name" if name.is_none() => name = Some(value.trim()),
+                "command-message" => {}
+                "command-args" if value.trim().is_empty() => {}
+                _ => return None,
+            }
+        }
+        let name = name?;
+        Command::ALL
+            .into_iter()
+            .find(|command| name == command.literal)
     }
 }
 

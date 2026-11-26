@@ -767,17 +767,36 @@ impl Router {
         !self.coverage.covers(harness, session, ts)
     }
 
-    /// Routes the events the transcript tailer read from one file and
-    /// queues them with the file's new offset as one write, so the offset
+    /// Routes what the transcript tailer read from one file, in record
+    /// order, and queues the events with the file's new offset as one write, so the offset
     /// commits in the same transaction as its events. Dropped events still
     /// advance the offset.
-    fn handle_tailed(&mut self, events: Vec<TractionEvent>, offset: TranscriptOffset) {
-        let mut rows = Vec::with_capacity(events.len());
-        for event in events {
-            if self.keeps_tailed(&event)
-                && let Some(row) = self.routed_row(event)
-            {
-                rows.push(row);
+    ///
+    /// A recorded pause command is applied even inside a hook-covered span
+    /// (Claude Code records one only when no hook handled it), and its
+    /// write is queued before the offset that passes it.
+    fn handle_tailed(&mut self, items: Vec<TailedItem>, offset: TranscriptOffset) {
+        let mut rows = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                TailedItem::Event(event) => {
+                    if self.keeps_tailed(&event)
+                        && let Some(row) = self.routed_row(*event)
+                    {
+                        rows.push(row);
+                    }
+                }
+                TailedItem::Pause(pause) => {
+                    let at_ms = i64::try_from(pause.at_ms).unwrap_or(i64::MAX);
+                    if let Some(op) = self.pauses.apply_recorded(
+                        pause.action,
+                        pause.harness,
+                        &pause.session_id,
+                        at_ms,
+                    ) {
+                        self.write(op);
+                    }
+                }
             }
         }
         self.write(WriteOp::Tailed(TailedBatch {
@@ -811,7 +830,15 @@ impl Router {
     }
 }
 
-/// A Session Pause command for one session, received at `at_ms`.
+/// One thing the transcript tailer read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailedItem {
+    Event(Box<TractionEvent>),
+    Pause(Pause),
+}
+
+/// A Session Pause command for one session, received (or, from a
+/// transcript, recorded) at `at_ms`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pause {
     pub action: PauseAction,
@@ -848,10 +875,10 @@ enum RouterMessage {
         path: PathBuf,
         reply: oneshot::Sender<RegisterReply>,
     },
-    /// Events the transcript tailer read from one file, with the offset
-    /// just past them.
+    /// What the transcript tailer read from one file, with the offset
+    /// just past it.
     Tailed {
-        events: Vec<TractionEvent>,
+        items: Vec<TailedItem>,
         offset: TranscriptOffset,
     },
     /// The transcript tailer's first-ever start.
@@ -900,11 +927,11 @@ impl RouterSender {
     /// it).
     pub fn send_tailed(
         &self,
-        events: Vec<TractionEvent>,
+        items: Vec<TailedItem>,
         offset: TranscriptOffset,
     ) -> Result<(), RouterBusy> {
         self.0
-            .send(RouterMessage::Tailed { events, offset })
+            .send(RouterMessage::Tailed { items, offset })
             .map_err(|_| RouterBusy)
     }
 
@@ -951,7 +978,7 @@ fn run(mut router: Router, receiver: &Receiver<RouterMessage>) {
                 // The caller may have given up waiting; nothing to do then.
                 let _ = reply.send(router.register_path(&path));
             }
-            RouterMessage::Tailed { events, offset } => router.handle_tailed(events, offset),
+            RouterMessage::Tailed { items, offset } => router.handle_tailed(items, offset),
             RouterMessage::TailerStart(start) => router.write(WriteOp::TailerStart(start)),
         }
     }

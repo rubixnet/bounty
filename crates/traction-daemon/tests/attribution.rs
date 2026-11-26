@@ -153,6 +153,59 @@ fn a_hook_window_attributes_and_edits_after_tool_post_or_turn_end_are_manual() {
 }
 
 #[test]
+fn a_permission_prompt_closes_the_tool_window_even_without_a_stop() {
+    let daemon = TestDaemon::start_with(fast_watcher);
+    let root = fixtures::folder(&daemon.home().join("prompted"), &[]);
+    let project = register(&daemon, &root);
+
+    let t0 = now_ms();
+    send(&daemon, 1, HOOK, "PROMPT_SUBMIT", &root, t0);
+    send(&daemon, 2, HOOK, "TOOL_PRE", &root, t0);
+    let asked = now_ms();
+    send(&daemon, 3, HOOK, "PERMISSION_REQUEST", &root, asked);
+    // The user edits while the prompt waits (or after rejecting it): no
+    // PostToolUse and no Stop ever arrive.
+    wait_past(asked);
+    fs::write(root.join("mine.txt"), "by hand").unwrap();
+    let rows = daemon.wait_for_mutations(1);
+    assert_manual(&rows[0], &project);
+}
+
+#[test]
+fn an_approved_tool_still_owns_its_write_but_not_edits_made_while_the_prompt_waited() {
+    let daemon = TestDaemon::start_with(fast_watcher);
+    let root = fixtures::folder(&daemon.home().join("approved"), &[]);
+    let project = register(&daemon, &root);
+
+    let t0 = now_ms();
+    send(&daemon, 1, HOOK, "PROMPT_SUBMIT", &root, t0);
+    send(&daemon, 2, HOOK, "TOOL_PRE", &root, t0);
+    let asked = now_ms();
+    send(&daemon, 3, HOOK, "PERMISSION_REQUEST", &root, asked);
+    // The user edits by hand while the prompt waits; it is decided (after
+    // its hold) before the approval comes.
+    wait_past(asked);
+    fs::write(root.join("mine.txt"), "by hand").unwrap();
+    let rows = daemon.wait_for_mutations(1);
+    assert_manual(&rows[0], &project);
+
+    // Approved: the tool writes, then PostToolUse arrives, well after the
+    // request.
+    wait_past(now_ms());
+    fs::write(root.join("agent.txt"), "by the agent").unwrap();
+    let post = now_ms();
+    send(&daemon, 4, HOOK, "TOOL_POST", &root, post);
+    let rows = daemon.wait_for_mutations(2);
+    assert_attributed(&rows[1], HOOK, &project);
+
+    // After the result, edits are the user's again.
+    wait_past(post);
+    fs::write(root.join("later.txt"), "by hand").unwrap();
+    let rows = daemon.wait_for_mutations(3);
+    assert_manual(&rows[2], &project);
+}
+
+#[test]
 fn a_log_tailed_turn_attributes_until_turn_end() {
     let daemon = TestDaemon::start_with(fast_watcher);
     let root = fixtures::folder(&daemon.home().join("cli"), &[]);
@@ -378,8 +431,9 @@ fn a_quiet_open_hook_window_stops_claiming_edits_until_its_session_is_active_aga
     let rows = daemon.wait_for_mutations(1);
     assert_manual(&rows[0], &project);
 
-    // A permission prompt inside the same tool call keeps it alive.
-    send(&daemon, 3, HOOK, "PERMISSION_REQUEST", &root, now_ms());
+    // Any other event of the session inside the same tool call keeps it
+    // alive.
+    send(&daemon, 3, HOOK, "SUBAGENT_START", &root, now_ms());
     fs::write(root.join("b.txt"), "by the agent").unwrap();
     let rows = daemon.wait_for_mutations(2);
     assert_attributed(&rows[1], HOOK, &project);

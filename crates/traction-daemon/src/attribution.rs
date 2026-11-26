@@ -4,8 +4,15 @@
 //!
 //! - A **hook window** (`harness_hook` / `harness_plugin`) opens on a
 //!   `TOOL_PRE` while the session's turn is open, and closes on the next
-//!   `TOOL_POST` / `TOOL_FAIL` / `TOOL_PRE` or on turn end (`TURN_END`,
-//!   `STOP_FAILURE`, `SESSION_END`).
+//!   `TOOL_POST` / `TOOL_FAIL` / `TOOL_PRE` / `PERMISSION_REQUEST` or on
+//!   turn end (`TURN_END`, `STOP_FAILURE`, `SESSION_END`).
+//!   A `PERMISSION_REQUEST` closes the window at once, so edits made while
+//!   the prompt waits, or after a refusal (which sends no further hook),
+//!   are the user's. No hook reports an approval, so when the approved
+//!   tool's `TOOL_POST` / `TOOL_FAIL` arrives it adds a closed window from
+//!   the hold before it (never earlier than the request) to the result: the
+//!   approved tool's own writes, still undecided in their hold, go to the
+//!   Harness.
 //! - A **log-tailed turn window** (`harness_log` / `harness_db_poll`) opens
 //!   on a `PROMPT_SUBMIT` and closes on the next turn end or prompt.
 //! - A **trailing fallback window** covers a log-tailed session that has
@@ -98,6 +105,9 @@ struct SessionWindows {
     marks: VecDeque<(u64, Option<String>)>,
     /// Latest event timestamp seen.
     last_ms: u64,
+    /// When the open tool call's `PERMISSION_REQUEST` closed its window;
+    /// cleared by its result, the next `TOOL_PRE` or the turn's end.
+    asked_ms: Option<u64>,
 }
 
 type SessionKey = (HarnessId, String);
@@ -108,6 +118,7 @@ pub struct Attribution {
     sessions: HashMap<SessionKey, SessionWindows>,
     trailing_ms: u64,
     stale_ms: u64,
+    hold_ms: u64,
     retention_ms: u64,
     since_sweep: u32,
 }
@@ -120,6 +131,7 @@ impl Attribution {
             sessions: HashMap::new(),
             trailing_ms: millis(settings.trailing_window),
             stale_ms: millis(settings.stale_turn_timeout),
+            hold_ms: millis(settings.hold),
             retention_ms: millis(settings.hold + RETENTION_MARGIN),
             since_sweep: 0,
         }
@@ -152,6 +164,7 @@ impl Attribution {
                 windows: VecDeque::new(),
                 marks: VecDeque::new(),
                 last_ms: ts,
+                asked_ms: None,
             });
         state.network_class = event.network_class;
         state.last_ms = state.last_ms.max(ts);
@@ -170,16 +183,34 @@ impl Attribution {
                     state.has_boundaries = true;
                 }
                 state.turn_open = false;
+                state.asked_ms = None;
                 state.close(Kind::Hook, ts);
                 state.close(Kind::LogTurn, ts);
             }
             EventType::ToolPre if hook => {
+                state.asked_ms = None;
                 state.close(Kind::Hook, ts);
                 if state.turn_open {
                     state.open(Kind::Hook, ts);
                 }
             }
-            EventType::ToolPost | EventType::ToolFail if hook => state.close(Kind::Hook, ts),
+            // While a permission prompt waits, and after a refusal (which
+            // may send no further hook), edits are the user's.
+            EventType::PermissionRequest if hook => {
+                if state.has_open(Kind::Hook) {
+                    state.asked_ms = Some(ts);
+                }
+                state.close(Kind::Hook, ts);
+            }
+            EventType::ToolPost | EventType::ToolFail if hook => {
+                state.close(Kind::Hook, ts);
+                // The tool was approved: its writes landed just before its
+                // result and are still in their hold.
+                if let Some(asked) = state.asked_ms.take() {
+                    let from = asked.max(ts.saturating_sub(self.hold_ms));
+                    state.push_closed(Kind::Hook, from, ts);
+                }
+            }
             _ => {}
         }
         if log {
@@ -282,6 +313,20 @@ impl SessionWindows {
         }
     }
 
+    fn has_open(&self, kind: Kind) -> bool {
+        self.windows
+            .iter()
+            .any(|w| w.kind == kind && w.closed_ms.is_none())
+    }
+
+    /// Records a window that is already over.
+    fn push_closed(&mut self, kind: Kind, opened_ms: u64, closed_ms: u64) {
+        self.open(kind, opened_ms);
+        if let Some(window) = self.windows.back_mut() {
+            window.closed_ms = Some(closed_ms);
+        }
+    }
+
     fn close(&mut self, kind: Kind, ts: u64) {
         for window in &mut self.windows {
             if window.kind == kind && window.closed_ms.is_none() {
@@ -294,6 +339,7 @@ impl SessionWindows {
     /// old Project at `ts` and continue on the new one.
     fn move_to(&mut self, project: Option<String>, ts: u64) {
         self.project = project;
+        self.asked_ms = None;
         let open: Vec<Kind> = self
             .windows
             .iter()

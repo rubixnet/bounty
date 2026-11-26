@@ -836,7 +836,13 @@ fn each_profile_gets_one_block_in_its_shell_syntax_reading_the_token_file() {
         let (block, count) = traction_block(&text);
         assert_eq!(count, 1, "{text}");
         assert!(block.contains(line), "{}: {block}", profile.display());
-        assert!(block.contains(&token_file), "{block}");
+        // fish escapes backslashes (Windows paths).
+        let quoted = if profile.ends_with("config.fish") {
+            token_file.replace('\\', r"\\")
+        } else {
+            token_file.clone()
+        };
+        assert!(block.contains(&quoted), "{block}");
         assert!(!text.contains(CANARY), "the token leaked into {text}");
     }
     let zshrc = fs::read_to_string(&profiles[0]).unwrap();
