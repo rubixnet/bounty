@@ -94,13 +94,15 @@ impl Aggregator {
         if self.tier != TelemetryTier::Full {
             return;
         }
-        if injected {
-            self.injected = self.injected.saturating_add(1);
-            return;
-        }
+        // `key_events` and `pointer_events` count every event, injected ones
+        // included; `injected_events` is the injected subset.
         match kind {
             InputKind::Key => self.keys = self.keys.saturating_add(1),
             InputKind::Pointer => self.pointers = self.pointers.saturating_add(1),
+        }
+        if injected {
+            self.injected = self.injected.saturating_add(1);
+            return;
         }
         let slot = self.slot_of(t_ms);
         self.slot_input[slot] = true;
@@ -208,14 +210,14 @@ mod tests {
     }
 
     #[test]
-    fn counts_split_by_kind_and_injected_events_are_not_real_input() {
+    fn counts_include_injected_events_which_are_not_real_input() {
         let mut agg = full();
         agg.input(START + 100, InputKind::Key, false);
         agg.input(START + 200, InputKind::Pointer, false);
         agg.input(START + 300, InputKind::Pointer, false);
         agg.input(START + 400, InputKind::Key, true);
         let (m, _) = agg.finish();
-        assert_eq!(m.key_events, Some(1));
+        assert_eq!(m.key_events, Some(2));
         assert_eq!(m.pointer_events, Some(2));
         assert_eq!(m.injected_events, Some(1));
         assert_eq!(m.active_subslots, Some(1));

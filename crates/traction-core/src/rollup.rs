@@ -148,11 +148,13 @@ const MISSING: MinuteFacts = MinuteFacts {
     tier_limited: true,
 };
 
+/// `injected_events / (key_events + pointer_events)` in per mille. The key
+/// and pointer counts include the injected events, so the ratio is at most
+/// 1000 (a count that disagrees is clamped). `None` with no counts.
 fn injected_ratio_milli(m: &PresenceMinute) -> Option<u32> {
     let injected = u64::from(m.injected_events?);
-    let real = u64::from(m.key_events.unwrap_or(0)) + u64::from(m.pointer_events.unwrap_or(0));
-    let total = injected + real;
-    (total > 0).then(|| u32::try_from(injected * 1000 / total).unwrap_or(1000))
+    let total = u64::from(m.key_events.unwrap_or(0)) + u64::from(m.pointer_events.unwrap_or(0));
+    (total > 0).then(|| u32::try_from((injected * 1000 / total).min(1000)).unwrap_or(1000))
 }
 
 fn facts(rules: &Ruleset, m: &PresenceMinute) -> MinuteFacts {
@@ -289,7 +291,8 @@ fn input_state(m: &PresenceMinute, f: MinuteFacts) -> Input {
     }
     match (m.key_events, m.pointer_events) {
         (Some(k), Some(p)) => {
-            if k + p > 0 {
+            // The counts include injected events; only the rest is real.
+            if (k + p).saturating_sub(m.injected_events.unwrap_or(0)) > 0 {
                 Input::Real
             } else {
                 Input::Absent
@@ -639,8 +642,7 @@ fn window_rollup(rules: &Ruleset, window: u64, minutes: &[&PresenceMinute]) -> A
         if let Some(i) = m.injected_events {
             has_counts = true;
             injected += u64::from(i);
-            counted += u64::from(i)
-                + u64::from(m.key_events.unwrap_or(0))
+            counted += u64::from(m.key_events.unwrap_or(0))
                 + u64::from(m.pointer_events.unwrap_or(0));
         }
     }
@@ -665,7 +667,7 @@ fn window_rollup(rules: &Ruleset, window: u64, minutes: &[&PresenceMinute]) -> A
         injected_ratio_milli: has_counts.then(|| {
             (injected * 1000)
                 .checked_div(counted)
-                .map_or(0, |v| u32::try_from(v).unwrap_or(1000))
+                .map_or(0, |v| u32::try_from(v.min(1000)).unwrap_or(1000))
         }),
         telemetry_tier: tier,
     }

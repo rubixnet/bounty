@@ -154,6 +154,36 @@ fn injected_ratio_flags_the_minute_and_it_earns_nothing() {
 }
 
 #[test]
+fn the_injected_ratio_is_injected_over_all_key_and_pointer_events() {
+    // key and pointer counts include the injected events, so 20 of 40 is
+    // 500 per mille: at the flag.
+    let mut m = pm(T0, 6, TelemetryTier::Full);
+    m.key_events = Some(20);
+    m.pointer_events = Some(20);
+    m.injected_events = Some(20);
+    let bs = buckets(
+        &[ev(1, T0, EventType::PromptSubmit, "s1", "p")],
+        &[m.clone()],
+        &[],
+        T0,
+        T0 + MIN,
+    );
+    assert!(bs[0].injected_hid_detected);
+    // One fewer injected event is under the flag.
+    m.injected_events = Some(19);
+    let bs = buckets(
+        &[ev(1, T0, EventType::PromptSubmit, "s1", "p")],
+        &[m.clone()],
+        &[],
+        T0,
+        T0 + MIN,
+    );
+    assert!(!bs[0].injected_hid_detected);
+    let r = activity_rollups(&TRACTION_RULES_1, &[m], T0, T0 + 2 * MIN);
+    assert_eq!(r[0].injected_ratio_milli, Some(475));
+}
+
+#[test]
 fn robotic_cadence_flags_the_minute() {
     let mut m = pm(T0, 6, TelemetryTier::Full);
     m.cadence_entropy_milli = Some(100);
@@ -421,7 +451,7 @@ fn activity_rollup_summarizes_a_two_minute_window() {
     });
     a.category_switches = Some(2);
     a.cadence_entropy_milli = Some(2000);
-    a.injected_events = Some(6); // 6 of 66
+    a.injected_events = Some(6); // 6 of 60
     let mut b = pm(T0 + MIN, 4, TelemetryTier::Reduced);
     b.category_switches = Some(4);
     b.cadence_entropy_milli = None;
@@ -437,7 +467,7 @@ fn activity_rollup_summarizes_a_two_minute_window() {
     assert_eq!(r.telemetry_tier, TelemetryTier::Reduced);
     assert_eq!(r.switch_rate_milli, 3000); // 6 switches over 2 minutes
     assert_eq!(r.mean_cadence_entropy_milli, Some(2000));
-    assert_eq!(r.injected_ratio_milli, Some(90)); // 6 of 66
+    assert_eq!(r.injected_ratio_milli, Some(100)); // 6 of 60
     // ide 30 + 60, terminal 30 of 120 category seconds.
     assert_eq!(r.category_share_milli.ide, 750);
     assert_eq!(r.category_share_milli.terminal, 250);

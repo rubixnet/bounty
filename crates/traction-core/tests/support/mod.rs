@@ -211,8 +211,9 @@ pub fn presence_minute(
     }
     PresenceMinute {
         minute_start_ms,
-        key_events: Some(offsets.iter().step_by(2).count() as u32),
-        pointer_events: Some(offsets.iter().skip(1).step_by(2).count() as u32),
+        // Counts include injected events (`docs/protocol.md` section 2b).
+        key_events: Some((offsets.iter().step_by(2).count() as u32) + injected.div_ceil(2)),
+        pointer_events: Some((offsets.iter().skip(1).step_by(2).count() as u32) + injected / 2),
         injected_events: Some(injected),
         active_subslots: Some(subslots.iter().filter(|s| **s).count() as u8),
         cadence_entropy_milli: cadence_entropy_milli(
@@ -232,11 +233,21 @@ pub fn degrade(m: &PresenceMinute, tier: TelemetryTier) -> PresenceMinute {
     let mut m = m.clone();
     m.telemetry_tier = tier;
     if tier != TelemetryTier::Full {
+        // What the real aggregator emits below `full`: no counts or cadence,
+        // but `active_subslots` from the OS idle timer (reset inside the
+        // sub-slot), where injected input cannot be told from real input,
+        // and `idle_sec` in whole sub-slots. `none` reports nothing.
+        let injected_slots = u8::try_from(m.injected_events.unwrap_or(0).min(6)).unwrap_or(6);
+        let timer_active = m.active_subslots.unwrap_or(0).max(injected_slots);
         m.key_events = None;
         m.pointer_events = None;
         m.injected_events = None;
-        m.active_subslots = None;
         m.cadence_entropy_milli = None;
+        m.idle_sec = m.idle_sec.map(|i| i / 10 * 10);
+        m.active_subslots = (tier != TelemetryTier::None).then_some(timer_active);
+        if tier == TelemetryTier::None {
+            m.idle_sec = None;
+        }
     }
     if matches!(tier, TelemetryTier::IdleOnly | TelemetryTier::None) {
         m.category_sec = None;

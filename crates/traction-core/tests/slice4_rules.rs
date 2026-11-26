@@ -93,6 +93,12 @@ fn a_reduced_tier_minute_past_the_idle_limit_is_not_present() {
     let mut st = Stream::default();
     st.mutation(T0 + 1_000, true, 5);
     let busy = RULES.degraded_idle_max_sec;
-    let (human, _) = run(&st.events, &minutes(TelemetryTier::Reduced, busy + 1));
+    // A backend that reports idle time but no sub-slot activity at all.
+    let mut presence = minutes(TelemetryTier::Reduced, busy + 1);
+    presence.iter_mut().for_each(|m| m.active_subslots = None);
+    let (human, _) = run(&st.events, &presence);
     assert_eq!(human, 0);
+    let mut presence = minutes(TelemetryTier::Reduced, busy);
+    presence.iter_mut().for_each(|m| m.active_subslots = None);
+    assert_eq!(run(&st.events, &presence).0, 240);
 }
