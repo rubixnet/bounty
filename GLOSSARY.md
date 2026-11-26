@@ -24,6 +24,30 @@ _Avoid_: Idle time, idle autonomous, AFK time
 One 60-second slice of a Project's timeline holding the three times and the struggle signals for that minute.
 _Avoid_: Heartbeat, interval, slot
 
+**Presence Minute**:
+One wall-clock minute of device-wide presence: counts, ratios and closed enums only (never a key, a pointer position, a window title or a URL), emitted by the Presence Sensor and later assigned to a Project.
+_Avoid_: Heartbeat, input sample, activity log
+
+**Activity Rollup**:
+A 120-second, device-wide audit summary of Presence Minutes (category shares, switch rate, cadence entropy, injected ratio, tier), aligned to the 2-minute Anchor cadence and kept beside the 60-second Work Bucket.
+_Avoid_: Audit bucket, 2-minute bucket
+
+**Telemetry Tier**:
+How much a platform backend could observe in a Presence Minute: `full`, `reduced` (idle + category), `idle_only` or `none`. A weaker tier weighs less as evidence for the user and never counts as evidence against them.
+_Avoid_: Permission level, quality
+
+**Ruleset**:
+One versioned set of every scoring constant (`traction-rules/1`), recorded on each Work Bucket and Activity Rollup; changing any number means a new ID once buckets leave the device.
+_Avoid_: Config, thresholds, settings
+
+**Outcome Anchor**:
+A moment that proves a real outcome nearby (Manual Work, a Harness edit the human's specific prompt asked for, a human commit, a closed fail-to-pass loop, an approved permission with real input); Human Active Time with no anchor in range earns no Credited Time.
+_Avoid_: Checkpoint, proof point
+
+**Credited Time**:
+The part of Human Active Time that counts toward Productive Struggle (`struggle_credit_sec`): Human Active Time scaled by anchor, comfort and tier weights, never above Human Active Time itself.
+_Avoid_: Approved time, paid time, score
+
 ## Tracking Sources
 
 **Harness**:

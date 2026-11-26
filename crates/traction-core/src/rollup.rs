@@ -174,10 +174,14 @@ fn facts(rules: &Ruleset, m: &PresenceMinute) -> MinuteFacts {
     let enough_input = m
         .active_subslots
         .is_some_and(|n| n >= rules.min_active_subslots);
+    // A tier that reports no input counts can only say how long the OS idle
+    // timer ran: a minute that stayed (nearly) un-idle is present.
+    let counts_missing = m.active_subslots.is_none() && m.key_events.is_none();
+    let idle_ok = counts_missing && m.idle_sec.is_some_and(|i| i <= rules.degraded_idle_max_sec);
     MinuteFacts {
         tier: m.telemetry_tier,
         flagged,
-        verified: !flagged && enough_input && category_ok,
+        verified: !flagged && (enough_input || idle_ok) && category_ok,
         tier_limited: category_unknown,
     }
 }

@@ -94,6 +94,22 @@ pub struct Ruleset {
     pub index_max_name_bytes: u32,
     /// Most distinct candidate words kept from one prompt while matching.
     pub index_max_prompt_candidates: u32,
+    /// Shortest word (in characters) a prompt or file name is matched on.
+    pub index_min_word_chars: u32,
+    /// Shortest file stem or folder name indexed or matched alone: shorter
+    /// ones (`db`, `ui`) are ordinary words.
+    pub index_min_stem_chars: u32,
+    /// Directory entries the attach-time index walk may visit, per index
+    /// entry.
+    pub index_seed_visit_factor: u32,
+    // Tier-limited presence and credit (Slice 4).
+    /// On a tier that reports no input counts, a minute is present when the
+    /// OS idle timer was past `idle_threshold_sec` for at most this many
+    /// seconds of it.
+    pub degraded_idle_max_sec: u32,
+    /// Credit kept (per mille) on a `reduced`, `idle_only` or `none` minute:
+    /// it weighs less as evidence for the user, never against.
+    pub degraded_tier_credit_milli: u32,
 }
 
 /// The first Ruleset.
@@ -137,4 +153,39 @@ pub const TRACTION_RULES_1: Ruleset = Ruleset {
     index_max_projects: 16,
     index_max_name_bytes: 64,
     index_max_prompt_candidates: 512,
+    index_min_word_chars: 3,
+    index_min_stem_chars: 4,
+    index_seed_visit_factor: 8,
+    degraded_idle_max_sec: 10,
+    degraded_tier_credit_milli: 600,
+};
+
+/// Persona red-team pass marks (Step 2 Slice 4), kept beside the Ruleset they
+/// tune. Each is `struggle_credit_sec` per mille of a 60-minute wall clock:
+/// the honest debugger must reach its floor, every bot must stay at or
+/// below its ceiling, on every Telemetry Tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersonaMarks {
+    /// Honest debugger on a `full` tier.
+    pub honest_min_milli: u32,
+    /// Honest debugger on `reduced` and `idle_only`.
+    pub honest_degraded_min_milli: u32,
+    /// 59 s key-tapper.
+    pub key_tapper_max_milli: u32,
+    /// Trivial-prompt spammer.
+    pub spammer_max_milli: u32,
+    /// Steer-style rhythm faker with real input.
+    pub steer_faker_max_milli: u32,
+    /// Steer-style faker with injected input.
+    pub steer_injected_max_milli: u32,
+}
+
+/// The marks that go with `traction-rules/1`.
+pub const PERSONA_MARKS_1: PersonaMarks = PersonaMarks {
+    honest_min_milli: 600,
+    honest_degraded_min_milli: 400,
+    key_tapper_max_milli: 20,
+    spammer_max_milli: 50,
+    steer_faker_max_milli: 20,
+    steer_injected_max_milli: 0,
 };

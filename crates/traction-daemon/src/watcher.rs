@@ -59,8 +59,6 @@ use crate::symbol_index::SymbolIndexes;
 
 /// Per-folder ignore files, highest precedence first.
 pub const IGNORE_FILES: [&str; 2] = [".tractionignore", ".gitignore"];
-/// Directory entries the attach-time index walk may visit, per index entry.
-const SEED_VISIT_FACTOR: usize = 8;
 /// Notifications queued for the watcher thread before new ones are dropped
 /// (an `npm install` storm must not grow memory without bound).
 const MAX_QUEUED_NOTIFICATIONS: usize = 65_536;
@@ -387,7 +385,8 @@ impl WatchTable {
         let Some(symbols) = self.symbols.clone() else {
             return;
         };
-        let mut budget = TRACTION_RULES_1.index_max_entries as usize * SEED_VISIT_FACTOR;
+        let mut budget = TRACTION_RULES_1.index_max_entries as usize
+            * TRACTION_RULES_1.index_seed_visit_factor as usize;
         let mut queue = VecDeque::from([root.to_path_buf()]);
         while let Some(folder) = queue.pop_front() {
             let Ok(entries) = fs::read_dir(&folder) else {

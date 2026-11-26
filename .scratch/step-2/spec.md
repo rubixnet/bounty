@@ -8,14 +8,14 @@ Source: `docs/steps.md` (Step 2), `docs/roadmap.md` (sub-steps 2a–2d), `docs/g
 
 Gate items this Step owns (from the Step 2 Exit Gate in `docs/steps.md`):
 
-- [ ] Automated simulation test: prompting an agent and staying idle for 10 minutes logs `10m Agent Compute / 0m Human Active`. *(Slice 2)*
-- [ ] Automated simulation test: an active error → edit → test-fail → edit → test-pass cycle scores high `verified_struggle`, whether the code change is a beginner's size or an expert's. *(Slice 3)*
-- [ ] A synthetic HID / robotic-cadence fixture sets `injected_hid_detected = true` and routes those minutes to Unverified Autonomous Time. *(Slices 1 and 2)*
+- [x] Automated simulation test: prompting an agent and staying idle for 10 minutes logs `10m Agent Compute / 0m Human Active`. *(Slice 2; `tests/rollup.rs::gate_simulation_ten_idle_minutes_is_all_agent_and_mostly_unverified`)*
+- [x] Automated simulation test: an active error → edit → test-fail → edit → test-pass cycle scores high `verified_struggle`, whether the code change is a beginner's size or an expert's. *(Slice 3; `tests/struggle.rs::a_fail_edit_fail_edit_pass_loop_scores_high_and_size_is_ignored`)*
+- [x] A synthetic HID / robotic-cadence fixture sets `injected_hid_detected = true` and routes those minutes to Unverified Autonomous Time. *(Slices 1 and 2; `tests/rollup.rs::injected_ratio_flags_the_minute_and_it_earns_nothing`, `::robotic_cadence_flags_the_minute`)*
 
 Added at the human's request (owned by Slice 4):
 
-- [ ] Property test: summed across every Project and clock rule, credited time never exceeds elapsed wall-clock time, including under floods of events sharing one timestamp.
-- [ ] A deterministic persona red-team simulator runs in CI: the honest debugger earns real credit; the 59 s key-tapper, the trivial-prompt spammer and the Steer-style rhythm-faking bot earn negligible credit.
+- [x] Property test: summed across every Project and clock rule, credited time never exceeds elapsed wall-clock time, including under floods of events sharing one timestamp. *(`tests/credit_properties.rs::credited_time_never_exceeds_elapsed_wall_clock`, `::a_flood_at_one_timestamp_cannot_mint_time`)*
+- [x] A deterministic persona red-team simulator runs in CI: the honest debugger earns real credit; the 59 s key-tapper, the trivial-prompt spammer and the Steer-style rhythm-faking bot earn negligible credit. *(`tests/personas.rs`)*
 
 All of the above pass on Windows, macOS and Linux in CI.
 
