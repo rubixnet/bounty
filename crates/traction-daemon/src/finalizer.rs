@@ -682,6 +682,97 @@ mod tests {
         );
     }
 
+    /// The "no raw text" gate for everything Step 2 derives: after a real
+    /// finalization, every column of every derived table is a number, a
+    /// closed enum, an identifier or a JSON object of numbers. A new free-text
+    /// column fails here until it is reviewed and listed.
+    #[test]
+    fn derived_tables_hold_only_numbers_enums_and_identifiers() {
+        let (_dir, mut conn) = open();
+        let mut ops = vec![
+            event_with(
+                1,
+                T0 + 5_000,
+                "PROMPT_SUBMIT",
+                Some("s"),
+                serde_json::json!({"prompt_char_len": 220, "repo_symbol_hits": 3, "has_stacktrace": true}),
+            ),
+            event_with(2, T0 + 40_000, "TURN_END", Some("s"), serde_json::json!({})),
+            WriteOp::Commit(CommitObservation {
+                project_id: "p".to_owned(),
+                commit_oid: "a".repeat(40),
+                observed_ms: T0 + 1000,
+            }),
+        ];
+        ops.extend((0..4).map(|i| working_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+        finalize(&mut conn, None, T0 + 10 * MIN).unwrap();
+
+        fn numbers_only(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::Number(_) | serde_json::Value::Null => true,
+                serde_json::Value::Array(a) => a.iter().all(numbers_only),
+                serde_json::Value::Object(o) => o.values().all(numbers_only),
+                _ => false,
+            }
+        }
+        for table in [
+            "presence_minute",
+            "commit_observation",
+            "work_bucket",
+            "activity_rollup",
+            "rollup_cursor",
+            "struggle_baseline",
+        ] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert!(rows > 0, "{table} was not populated");
+            let columns: Vec<(String, String)> = conn
+                .prepare(&format!(
+                    "SELECT name, type FROM pragma_table_info('{table}')"
+                ))
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for (name, kind) in columns {
+                if kind == "INTEGER" {
+                    continue;
+                }
+                assert_eq!(kind, "TEXT", "{table}.{name}");
+                let values: Vec<String> = conn
+                    .prepare(&format!(
+                        "SELECT \"{name}\" FROM {table} WHERE \"{name}\" IS NOT NULL"
+                    ))
+                    .unwrap()
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                for v in values {
+                    let ok = match name.as_str() {
+                        "telemetry_tier" => {
+                            ["full", "reduced", "idle_only", "none"].contains(&v.as_str())
+                        }
+                        "ruleset_id" => v.starts_with("traction-rules/"),
+                        "project_id" => v.len() <= 80 && v.chars().all(|c| c.is_ascii_graphic()),
+                        "commit_oid" => v.len() == 40 && v.chars().all(|c| c.is_ascii_hexdigit()),
+                        "category_sec"
+                        | "category_share_milli"
+                        | "friction_hist"
+                        | "specificity_hist" => {
+                            serde_json::from_str(&v).is_ok_and(|j| numbers_only(&j))
+                        }
+                        other => panic!("unreviewed text column {table}.{other}"),
+                    };
+                    assert!(ok, "{table}.{name} holds a non-conforming value: {v}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_new_tables_are_append_only() {
         let (_dir, mut conn) = open();

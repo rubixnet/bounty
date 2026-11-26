@@ -20,11 +20,6 @@ use traction_core::TRACTION_RULES_1;
 
 use crate::paths;
 
-/// Shortest word (in characters) that is matched at all.
-const MIN_WORD_CHARS: usize = 3;
-/// Shortest file stem or folder name that is indexed or matched alone: shorter
-/// ones (`db`, `ui`) are ordinary words.
-const MIN_STEM_CHARS: usize = 4;
 /// Stems and folder names that are ordinary words in prose, never indexed or
 /// matched on their own (the full file name, `main.rs`, still is).
 const COMMON_WORDS: [&str; 24] = [
@@ -67,14 +62,14 @@ fn is_common(word: &str) -> bool {
 }
 
 fn stem_ok(stem: &str) -> bool {
-    stem.chars().count() >= MIN_STEM_CHARS && !is_common(stem)
+    stem.chars().count() >= TRACTION_RULES_1.index_min_stem_chars as usize && !is_common(stem)
 }
 
 /// The hashes `name` (a file or folder name, or a prompt word) answers to:
 /// the whole name when it has an extension, then its stem; 0 for "none".
 fn forms(name: &str) -> [u64; 2] {
     let name = name.trim_matches(|c| matches!(c, '.' | '-'));
-    if name.chars().count() < MIN_WORD_CHARS {
+    if name.chars().count() < TRACTION_RULES_1.index_min_word_chars as usize {
         return [0, 0];
     }
     match stem(name) {

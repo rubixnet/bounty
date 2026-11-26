@@ -94,6 +94,14 @@ pub struct Ruleset {
     pub index_max_name_bytes: u32,
     /// Most distinct candidate words kept from one prompt while matching.
     pub index_max_prompt_candidates: u32,
+    /// Shortest word (in characters) a prompt or file name is matched on.
+    pub index_min_word_chars: u32,
+    /// Shortest file stem or folder name indexed or matched alone: shorter
+    /// ones (`db`, `ui`) are ordinary words.
+    pub index_min_stem_chars: u32,
+    /// Directory entries the attach-time index walk may visit, per index
+    /// entry.
+    pub index_seed_visit_factor: u32,
     // Tier-limited presence and credit (Slice 4).
     /// On a tier that reports no input counts, a minute is present when the
     /// OS idle timer was past `idle_threshold_sec` for at most this many
@@ -145,6 +153,9 @@ pub const TRACTION_RULES_1: Ruleset = Ruleset {
     index_max_projects: 16,
     index_max_name_bytes: 64,
     index_max_prompt_candidates: 512,
+    index_min_word_chars: 3,
+    index_min_stem_chars: 4,
+    index_seed_visit_factor: 8,
     degraded_idle_max_sec: 10,
     degraded_tier_credit_milli: 600,
 };
