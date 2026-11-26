@@ -135,6 +135,14 @@ impl TestDaemon {
         self.caller().via_socket(self.socket_path())
     }
 
+    /// Waits until the commit observer has a baseline for `count` worktrees.
+    pub fn await_commit_baselines(&self, count: usize) {
+        let handle = self.handle.as_ref().expect("daemon is running");
+        poll_until(Duration::from_secs(30), "the commit baselines", || {
+            (handle.commit_baselined_worktrees() >= count).then_some(())
+        });
+    }
+
     /// Graceful shutdown: flushes pending events, then stops. Idempotent.
     pub fn shutdown(&mut self) {
         if let Some(handle) = self.handle.take() {

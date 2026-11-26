@@ -344,6 +344,15 @@ impl DaemonHandle {
         &self.socket_path
     }
 
+    /// How many Git worktrees the commit observer has a baseline for; a
+    /// commit made in a worktree before then is never observed. Zero when
+    /// the observer is disabled.
+    pub fn commit_baselined_worktrees(&self) -> usize {
+        self.commits
+            .as_ref()
+            .map_or(0, CommitObserver::baselined_worktrees)
+    }
+
     /// Stops accepting requests, commits every accepted Traction Event and
     /// waits for all daemon threads to finish.
     pub fn shutdown(mut self) -> Result<(), ShutdownError> {

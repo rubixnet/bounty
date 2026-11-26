@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
@@ -75,9 +76,17 @@ impl CommitWatch {
 pub struct CommitObserver {
     tx: Sender<Msg>,
     handle: JoinHandle<()>,
+    baselined: Arc<AtomicUsize>,
 }
 
 impl CommitObserver {
+    /// How many worktrees have a baseline. A worktree's commits can be
+    /// observed only once it is counted here: discovery is asynchronous and
+    /// takes several Git calls.
+    pub fn baselined_worktrees(&self) -> usize {
+        self.baselined.load(Ordering::Acquire)
+    }
+
     pub fn watch_handle(&self) -> CommitWatch {
         CommitWatch(self.tx.clone())
     }
@@ -109,6 +118,8 @@ pub fn spawn(
     settings: CommitSettings,
 ) -> io::Result<CommitObserver> {
     let (tx, rx) = mpsc::channel();
+    let baselined = Arc::new(AtomicUsize::new(0));
+    let published = Arc::clone(&baselined);
     let handle = thread::Builder::new()
         .name("traction-commits".to_owned())
         .spawn(move || {
@@ -117,6 +128,7 @@ pub fn spawn(
                 match rx.recv_timeout(settings.poll) {
                     Ok(Msg::Watch { project_id, folder }) => {
                         track(&git, &mut tracked, project_id, folder);
+                        published.store(tracked.len(), Ordering::Release);
                     }
                     Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                     Err(RecvTimeoutError::Timeout) => {
@@ -131,7 +143,11 @@ pub fn spawn(
                 }
             }
         })?;
-    Ok(CommitObserver { tx, handle })
+    Ok(CommitObserver {
+        tx,
+        handle,
+        baselined,
+    })
 }
 
 /// Starts tracking `folder`'s worktree, with its current state as the

@@ -39,6 +39,12 @@ fn lexical(path: &Path) -> PathBuf {
 
 #[cfg(windows)]
 fn normalize(text: &str) -> String {
+    normalize_windows(text)
+}
+
+/// The Windows rules of [`canonicalize`], on text so every OS tests them.
+#[cfg(any(windows, test))]
+fn normalize_windows(text: &str) -> String {
     let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
     } else {
@@ -98,5 +104,25 @@ pub fn name_matches(name: &str, wanted: &str) -> bool {
         name.eq_ignore_ascii_case(wanted)
     } else {
         name == wanted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_normalization_strips_verbatim_prefixes_and_uppercases_the_drive() {
+        for (raw, wanted) in [
+            (r"\\?\c:\code\alpha", r"C:\code\alpha"),
+            (r"\\?\UNC\server\share\alpha", r"\\server\share\alpha"),
+            (r"c:\code\alpha", r"C:\code\alpha"),
+            (
+                "c:/code/alpha/.git/worktrees/x",
+                "C:/code/alpha/.git/worktrees/x",
+            ),
+        ] {
+            assert_eq!(normalize_windows(raw), wanted, "{raw}");
+        }
     }
 }

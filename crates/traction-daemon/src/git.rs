@@ -637,6 +637,53 @@ mod tests {
         );
     }
 
+    /// Linked worktrees are found through their `.git` file (`gitdir:`),
+    /// which only Git parses. Each spelling Windows tools produce must name
+    /// the same per-worktree git dir.
+    #[test]
+    fn a_linked_worktree_has_its_own_git_dir_however_its_gitdir_line_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = plain_repo(tmp.path());
+        let linked = tmp.path().join("linked");
+        fixture_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        std::fs::create_dir_all(linked.join("sub")).unwrap();
+        let dot_git = linked.join(".git");
+        let written = std::fs::read_to_string(&dot_git).unwrap();
+        let target = written.trim().strip_prefix("gitdir: ").unwrap().to_owned();
+        let mut spellings = vec![
+            format!("gitdir: {target}\n"),
+            format!("gitdir: {target}\r\n"),
+        ];
+        if cfg!(windows) {
+            spellings.push(format!("gitdir: {}\r\n", target.replace('/', "\\")));
+        }
+
+        let git = Git::new(None);
+        let expected = repo.join(".git").join("worktrees").join("linked");
+        for spelling in spellings {
+            // Git for Windows marks `.git` files hidden, which blocks
+            // truncating them in place: replace the file instead.
+            std::fs::remove_file(&dot_git).unwrap();
+            std::fs::write(&dot_git, &spelling).unwrap();
+            for folder in [linked.clone(), linked.join("sub")] {
+                let git_dir = git.git_dir(&folder).unwrap();
+                assert!(same_path(&git_dir, &expected), "{spelling:?}: {git_dir:?}");
+                let common = git.common_dir(&folder).unwrap();
+                assert!(same_path(&common, &repo.join(".git")), "{spelling:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_folder_outside_any_repo_is_not_a_repo() {
         let tmp = tempfile::tempdir().unwrap();

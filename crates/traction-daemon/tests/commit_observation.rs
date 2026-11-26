@@ -6,19 +6,27 @@
 mod common;
 
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 use common::fixtures::{self, git, git_output};
 use common::{TestDaemon, poll_until, routed_event};
 use rusqlite::Connection;
+use traction_daemon::DaemonConfig;
 
 const CANARY: &str = "CANARY-commit-message-7f3a91c2";
 
 fn watching_daemon() -> TestDaemon {
+    watching_daemon_with(|_| {})
+}
+
+fn watching_daemon_with(adjust: impl FnOnce(&mut DaemonConfig)) -> TestDaemon {
     TestDaemon::start_with(|config| {
         config.presence.enabled = false;
         config.commits.poll = Duration::from_millis(25);
         config.writer.commit_interval = Duration::from_millis(25);
+        adjust(config);
     })
 }
 
@@ -44,8 +52,7 @@ fn observed(db: &Connection) -> Vec<(String, String)> {
 fn register(daemon: &TestDaemon, repo: &Path) -> String {
     let response = daemon.caller().register_project(repo);
     assert_eq!(response.status, 200, "{response:?}");
-    // The observer takes its baseline when it processes the watch message.
-    settle();
+    daemon.await_commit_baselines(1);
     fixtures::git_id(repo, None)
 }
 
@@ -142,7 +149,40 @@ fn branch_switches_pulls_resets_and_amends_are_not_commits() {
 
 #[test]
 fn a_commit_in_a_linked_worktree_is_observed_for_that_worktree_only() {
-    let mut daemon = watching_daemon();
+    linked_worktree_scenario(watching_daemon());
+}
+
+/// Guards the Windows failure on every Unix: where starting `git` is slow,
+/// discovering a worktree outlasts any fixed sleep.
+#[cfg(unix)]
+#[test]
+fn a_linked_worktree_commit_is_observed_when_git_is_slow() {
+    let bin = tempfile::tempdir().expect("temp bin folder");
+    let slow_git = slow_git(bin.path());
+    linked_worktree_scenario(watching_daemon_with(|config| {
+        config.git_program = slow_git;
+    }));
+}
+
+/// A `git` that waits before running the real one.
+#[cfg(unix)]
+fn slow_git(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("git");
+    std::fs::write(&path, "#!/bin/sh\nsleep 0.08\nexec git \"$@\"\n").expect("write script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // Another test thread's fork can briefly hold the script open for
+    // writing (ETXTBSY); once it has run, that can no longer happen.
+    poll_until(Duration::from_secs(10), "the slow git script", || {
+        std::process::Command::new(&path)
+            .arg("--version")
+            .output()
+            .ok()
+    });
+    path
+}
+
+fn linked_worktree_scenario(mut daemon: TestDaemon) {
     let code = daemon.home().join("code");
     let main = fixtures::repo(&code.join("alpha"), None);
     let linked = fixtures::worktree(&main, &code.join("alpha-feature"), "feature");
@@ -154,7 +194,8 @@ fn a_commit_in_a_linked_worktree_is_observed_for_that_worktree_only() {
         .caller()
         .post_event(&routed_event(1, "TOOL_POST", "s1", Some(&linked)));
     assert_eq!(response.status, 202, "{response:?}");
-    settle();
+    // `202` only means queued: wait for the second worktree's baseline.
+    daemon.await_commit_baselines(2);
 
     let linked_oid = commit(&linked, "in the linked worktree");
     let db = daemon.live_db();
