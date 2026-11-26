@@ -28,5 +28,21 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The Presence Sensor's Linux integration tests need an X server and
+      # xdotool (real XTEST input).
+      - name: Install Xvfb and xdotool
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb xdotool
       - name: Test
+        if: runner.os != 'Linux'
         run: cargo test --workspace
+      - name: Test (under Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a cargo test --workspace
+      # macOS has no prompt-free injection signal: the injection test skips
+      # loudly. Surface that in the job summary so it is never silent.
+      - name: Report skipped macOS injection test
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p traction-daemon --test presence -- --nocapture macos_injection | tee presence-skip.log
+          grep 'SKIPPED (macOS injection)' presence-skip.log | tee -a "$GITHUB_STEP_SUMMARY"
