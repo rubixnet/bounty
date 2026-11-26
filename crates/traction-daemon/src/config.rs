@@ -43,7 +43,8 @@ pub const WINDOW_CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// crashed, `kill -9`ed or unterminated turn or tool call then stops
 /// turning the user's hand edits into Agent Compute. Any event of the
 /// session counts as activity; closed windows are unaffected.
-pub const STALE_TURN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const STALE_TURN_TIMEOUT: Duration =
+    Duration::from_millis(traction_core::TRACTION_RULES_1.stale_turn_timeout_ms);
 /// Clock-skew tolerance of the hook-coverage rule (`docs/protocol.md`,
 /// "Hook coverage"): hook timestamps are the daemon's receive times,
 /// transcript timestamps are Claude Code's own write times, so a tailed

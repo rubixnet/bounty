@@ -9,10 +9,6 @@ use serde::{Deserialize, Serialize};
 pub const SUBSLOT_SEC: u32 = 10;
 /// Sub-slots per Presence Minute.
 pub const SUBSLOTS_PER_MINUTE: u8 = 6;
-/// An OS idle timer at or above this counts the sub-slot as idle seconds.
-pub const IDLE_THRESHOLD_SEC: u32 = 30;
-/// Fewer real inter-event intervals than this and cadence entropy is `null`.
-pub const MIN_CADENCE_SAMPLES: u32 = 8;
 
 /// What the foreground application is, resolved in memory from a compiled-in
 /// table. The raw identifier is never kept.
