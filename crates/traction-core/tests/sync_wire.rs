@@ -169,12 +169,7 @@ fn the_heartbeat_response_round_trips_and_refuses_unknown_fields() {
     round_trips(&ErrorBody {
         error: "future_window".into(),
     });
-    rejects_extra_at(
-        &ErrorBody {
-            error: "x".into(),
-        },
-        &[&[]],
-    );
+    rejects_extra_at(&ErrorBody { error: "x".into() }, &[&[]]);
 }
 
 #[test]
