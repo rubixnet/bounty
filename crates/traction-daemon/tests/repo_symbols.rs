@@ -54,25 +54,36 @@ fn a_prompt_naming_repo_files_hits_the_index_and_nothing_textual_is_stored() {
     fs::write(repo.join("src").join(IGNORED_NAME), "secret\n").unwrap();
     assert_eq!(daemon.caller().register_project(&repo).status, 200);
 
-    prompt(
-        &daemon,
-        &repo,
-        &format!("the failure is in {FILE_NAME} again, {PROMPT_CANARY}"),
-    );
-    prompt(&daemon, &repo, "continue");
-    prompt(
-        &daemon,
-        &repo,
-        &format!("is {IGNORED_NAME} the problem? {PROMPT_CANARY}"),
-    );
+    let named = format!("the failure is in {FILE_NAME} again, {PROMPT_CANARY}");
+    let terse = "continue";
+    let ignored = format!("is {IGNORED_NAME} the problem? {PROMPT_CANARY}");
+    prompt(&daemon, &repo, &named);
+    prompt(&daemon, &repo, terse);
+    prompt(&daemon, &repo, &ignored);
 
     let db = daemon.shutdown_and_open_db();
     let rows = hits(&db);
     assert_eq!(rows.len(), 3, "{rows:?}");
-    assert_eq!(rows[0].1, Some(1), "a named repo file hits: {rows:?}");
-    assert_eq!(rows[1].1, Some(0), "a terse prompt has no hits: {rows:?}");
+    // Prompts sent back to back can share a millisecond and event ids are
+    // random, so each row is found by its (distinct) prompt length.
+    let hits_for = |text: &str| {
+        let len = i64::try_from(text.chars().count()).unwrap();
+        let matching: Vec<_> = rows.iter().filter(|(l, _)| *l == len).collect();
+        assert_eq!(matching.len(), 1, "one row of length {len}: {rows:?}");
+        matching[0].1
+    };
     assert_eq!(
-        rows[2].1,
+        hits_for(&named),
+        Some(1),
+        "a named repo file hits: {rows:?}"
+    );
+    assert_eq!(
+        hits_for(terse),
+        Some(0),
+        "a terse prompt has no hits: {rows:?}"
+    );
+    assert_eq!(
+        hits_for(&ignored),
         Some(0),
         "an ignored file is not indexed: {rows:?}"
     );
