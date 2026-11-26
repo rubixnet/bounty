@@ -2015,6 +2015,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

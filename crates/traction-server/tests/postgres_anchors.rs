@@ -403,13 +403,12 @@ async fn the_rate_limit_answers_429_with_retry_after() {
     assert_eq!(send_heartbeat(&server, &token, &request).await.status, 200);
     let limited = send_heartbeat(&server, &token, &request).await;
     assert_eq!(limited.status, 429);
-    assert_eq!(
+    assert!(
         limited
             .retry_after
             .as_deref()
             .and_then(|v| v.parse::<u64>().ok())
-            .is_some_and(|s| s >= 1),
-        true
+            .is_some_and(|s| s >= 1)
     );
 }
 

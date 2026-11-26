@@ -46,3 +46,33 @@ jobs:
         run: |
           cargo test -p traction-daemon --test presence -- --nocapture macos_injection | tee presence-skip.log
           grep 'SKIPPED (macOS injection)' presence-skip.log | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Step 4 deviation 1 (docs/adr/0006): the Postgres-backed `traction-server`
+  # tests run on Linux only, against a real Postgres 17 service container.
+  # TRACTION_REQUIRE_DB=1 turns a missing database into a failure, so these
+  # tests can never be skipped silently here. Every other job and test stays
+  # on the 3-OS matrix above.
+  postgres:
+    name: Postgres 17 (ubuntu-latest)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TRACTION_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      TRACTION_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Test traction-server (Postgres-backed)
+        run: cargo test -p traction-server -- --nocapture

@@ -197,7 +197,23 @@ pub async fn pair(
     .await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     let started: PairingStartResponse = serde_json::from_str(&reply.body).unwrap();
-    let page = http("GET", started.login_url.clone(), None, vec![], None).await;
+    approve(server, &started.login_url).await;
+    let poll = serde_json::json!({
+        "pair_code": started.pair_code,
+        "poll_secret": started.poll_secret
+    })
+    .to_string();
+    let polled = post_json(format!("{}/v1/pairings/poll", server.base), None, poll).await;
+    let polled: traction_core::sync::PairingPollResponse =
+        serde_json::from_str(&polled.body).unwrap();
+    (polled.device_token.unwrap(), polled.device_id.unwrap())
+}
+
+/// What a user does in the browser: open the login URL, then press
+/// **Approve device** (with the CSRF cookie the page set).
+pub async fn approve(server: &TestServer, login_url: &str) {
+    let pair_code = login_url.rsplit_once("pair=").unwrap().1.to_owned();
+    let page = http("GET", login_url.to_owned(), None, vec![], None).await;
     assert_eq!(page.status, 200);
     let cookie = page.set_cookie.unwrap();
     let csrf = cookie
@@ -213,21 +229,12 @@ pub async fn pair(
         None,
         vec![("cookie", format!("traction_csrf={csrf}"))],
         Some((
-            format!("pair={}&csrf={csrf}", started.pair_code),
+            format!("pair={pair_code}&csrf={csrf}"),
             "application/x-www-form-urlencoded",
         )),
     )
     .await;
     assert_eq!(approve.status, 200, "{}", approve.body);
-    let poll = serde_json::json!({
-        "pair_code": started.pair_code,
-        "poll_secret": started.poll_secret
-    })
-    .to_string();
-    let polled = post_json(format!("{}/v1/pairings/poll", server.base), None, poll).await;
-    let polled: traction_core::sync::PairingPollResponse =
-        serde_json::from_str(&polled.body).unwrap();
-    (polled.device_token.unwrap(), polled.device_id.unwrap())
 }
 
 pub const PROJECT: &str = "dir:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

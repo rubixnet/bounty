@@ -212,13 +212,22 @@ pub async fn login_page(
     Ok(response)
 }
 
+#[derive(sqlx::FromRow)]
+struct ApprovalRow {
+    public_key: String,
+    previous_key_id: Option<String>,
+    expires_at_ms: i64,
+    approved_device_id: Option<String>,
+    device_label: String,
+}
+
 #[derive(Deserialize)]
 pub struct ApproveForm {
     pair: String,
     csrf: Option<String>,
 }
 
-fn header<'a>(headers: &'a HeaderMap, name: axum::http::HeaderName) -> Option<&'a str> {
+fn header(headers: &HeaderMap, name: axum::http::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
@@ -241,7 +250,7 @@ pub async fn approve(
         AuthStep::Redirect(_) => return forbidden("Sign in first."),
     };
     let mut tx = state.pool.begin().await?;
-    let pairing: Option<(String, Option<String>, i64, Option<String>, String)> = sqlx::query_as(
+    let pairing: Option<ApprovalRow> = sqlx::query_as(
         "SELECT public_key, previous_key_id, expires_at_ms, approved_device_id, device_label
          FROM pairings WHERE pair_code = $1 FOR UPDATE",
     )
@@ -249,7 +258,14 @@ pub async fn approve(
     .fetch_optional(&mut *tx)
     .await?;
     let now = i64::try_from(state.now_ms()).unwrap_or(i64::MAX);
-    let Some((public_key, previous, expires, approved, label)) = pairing else {
+    let Some(ApprovalRow {
+        public_key,
+        previous_key_id: previous,
+        expires_at_ms: expires,
+        approved_device_id: approved,
+        device_label: label,
+    }) = pairing
+    else {
         return Ok(html(
             StatusCode::NOT_FOUND,
             message_page("Unknown pairing code."),

@@ -33,4 +33,5 @@ proptest.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true
 ureq.workspace = true
+rusqlite.workspace = true
 traction-daemon = { path = "../traction-daemon" }

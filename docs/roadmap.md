@@ -36,18 +36,21 @@ The gates below are excerpts from `docs/steps.md`. A Step is complete only when 
 |---|---|
 | **3a: Hash-Chain in core** | Signed, domain-separated Chain Links over Work Buckets, Activity Rollups and commit oids (frames reserved as `frame_digest`), the Device Signing Key, sealing in the finalizer, frame-less Audit Bundle export and the offline `verify` command. Gate: tampering, deletion and insertion all fail (`tamper_red_team.rs`). Specced in `.scratch/step-3/`. |
 | **3b: Snapshot Vault** | Opt-in visual proof mode, 720p WebP, dHash dedup, encrypted vault, 45-day retention, denylist (password managers, incognito, `.env`). Gate: zero frames captured while sensitive windows are focused. |
-| **3c: Offline + Review UI + Bundle** | `offline_buffered` sync, `network_class`, `/submit` filmstrip UI, Redaction, zstd `.traction-bundle` export (wrapping the 3a frame-less bundle). Gate: redacting 3 frames still verifies. |
+| **3c: Offline + Review UI + Bundle** | `network_class`, `/submit` filmstrip UI, Redaction, zstd `.traction-bundle` export (wrapping the 3a frame-less bundle). The `offline_buffered` sync mode itself ships in Step 4 S1. Gate: redacting 3 frames still verifies, and frame tampering is caught through the Step 4 server verification path. |
 
 > **Deferral recorded 2026-11-26:** only 3a is built now. Sub-steps 3b and 3c (Step 3 Exit Gate items 2 and 3) follow Step 4, like 1d/1e were deferred past Step 2, and must pass before Step 5. `frame_digest` is already signed into every Chain Link as 32 zero bytes, so they add no chain format change.
 
 ## Step 4: Server, Anchors, DecisionEngine
 
-| Sub-step | Scope |
+Step 4 is one spec in five tracer-bullet slices (`.scratch/step-4/spec.md`, tickets in `.scratch/step-4/issues/`), replacing the earlier 4a to 4d plan. Each slice fits one fresh session.
+
+| Slice | Scope |
 |---|---|
-| **4a: Server Core** | Axum + SQLx, partitioned Postgres 17, `/v1/anchors`, `server_received_at`, merging of multi-device overlap, SSE fanout, `AuthProvider` (dev + Hack Club OIDC). |
-| **4b: Projects + GitHub + R2** | Project metadata (paths, username, owner/reviewer visibility), GitHub linking and commit fetch, Project merge, presigned R2, build provenance. Session timeline API that time-aligns the 2a activity rollup buckets with `FILE_MUTATION`s, Git commits and Harness turns (data source for the 5b Audit Strip). |
-| **4c: HeuristicEngine + Load/Cost** | Default engine with zero network calls, load test (<50 ms p95, <512 MB), itemized cost model ≤$300 (cap $500). Gate: backdating and clock-skew detection. |
-| **4d: JevEngine** | Install the TypeSafe skill first. `v1/systemone` contract tests, `"other"` choice, score distributions, WebP→JPEG, hard spend limit with fallback, 3-way router. |
+| **S1: Anchor tracer** | The thinnest path from a real daemon to a live total: `traction-server` crate (Axum, runtime SQLx, embedded migrations, native monthly partitions), the dev `AuthProvider`, Pairing with pinned Device Signing Keys and hashed device tokens, the daemon sync client, `POST /v1/anchors` with per-item validation, and SSE live totals. Records the Step 4 deviations (Linux-only Postgres/MinIO CI, frame tampering moved to 3b/3c). |
+| **S2: Trust on the timeline** | Anchor timing flags (`late_anchor`, `offline_buffered`, `clock_skew`), multi-device overlap merging, Project metadata and visibility, roles, `DELETE /v1/me`, unsigned Timeline Marks, the timeline API, and the Hack Club OIDC `AuthProvider`. |
+| **S3a: Submission path** | `BlobStore` (R2 and local), bundle upload and `complete`, verification against every Anchor and the live-synced rows, the `DecisionEngine` seam and `HeuristicEngine` (zero network). Gate: the red-team suite (backdating, cut tail, rewritten rows, changed `frame_digest`, two-device clock skew). |
+| **S3b: Ecosystem and scale** | GitHub App linking and commit fetch, alias-only Project merge, soft build provenance, the load test (<50 ms p95, <512 MB) and the itemized cost model (<=$300, cap $500), `docs/deploy.md`. |
+| **S4: JevEngine** | Install the TypeSafe skill first. `v1/systemone` contract tests, the `"other"` choice, score distributions, WebP to JPEG, hard spend limit with fallback, the 3-way router. |
 
 ## Step 5: Fraud Squad and red team
 

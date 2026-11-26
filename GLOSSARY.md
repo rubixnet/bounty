@@ -89,8 +89,8 @@ _Avoid_: Remote, origin, connected repo
 ## Proof & Review
 
 **Logged Hours**:
-All time recorded locally on the user's device.
-_Avoid_: Tracked hours, total hours
+All time recorded on the user's device, and the live totals the server builds from the Work Buckets the device has synced. Logged Hours are never proof: they are synced but not verified, so a live total can be wrong or forged. Only a verified Audit Bundle (checked against the Anchors the server timestamped) is a verified stat. Live pages say "Logged"; they never say "verified".
+_Avoid_: Tracked hours, total hours, verified hours (for a live total)
 
 **Submitted Hours**:
 Logged Hours the user has chosen to put forward for review inside an Audit Bundle.
@@ -103,6 +103,18 @@ _Avoid_: Qualification, approval
 **Anchor**:
 A chain tip sent to the server every two minutes, timestamped by the server on receipt. It carries a Chain Link's `entry_hash`.
 _Avoid_: Heartbeat, checkpoint, sync
+
+**Pairing**:
+Enrolling a device with the server (`traction login`): the user approves it in a browser on an explicit, CSRF-protected page, the server issues the device token and pins the device's Device Signing Key. Re-pairing a Successor Chain adds the new key and keeps every earlier key trusted.
+_Avoid_: Login (that is only the command), registration, linking (linking attaches a Linked Repo)
+
+**Timeline Mark**:
+An unsigned, content-free per-Project, per-minute count record (file mutations by origin, turns started, tool failures, the Harness IDs seen) synced beside the Work Buckets but outside the Chain Link. Always labelled `unsigned`: it helps a reviewer line up activity and is never proof.
+_Avoid_: Event, heartbeat, activity log
+
+**Triage**:
+A `DecisionEngine`'s routing of a submitted Audit Bundle: Green (fast-track human confirmation), Yellow (fail-closed human review) or Red (anomaly pin). Never a ban and never an automatic approval.
+_Avoid_: Verdict (that is the human reviewer's), score, ban
 
 **Chain Link**:
 The local, signed, hash-chained record of one sealed 120-second window: a header (sequence number, previous link's hash, key and window) and a payload of per-Project row digests, signed with the Device Signing Key. Not an Anchor (that is the tip sent to the server).
