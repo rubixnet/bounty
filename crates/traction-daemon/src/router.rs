@@ -33,12 +33,13 @@
 //! copy of the registry and sessions, loaded from SQLite at startup and
 //! updated as it queues writes, and never reads SQLite afterwards.
 
+use crate::clock::now_ms_i64 as now_ms;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::oneshot;
 use traction_core::{
@@ -873,12 +874,6 @@ fn pin_key(common_dir: &Path) -> String {
     } else {
         text.into_owned()
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// The answer to a registration, sent back to the waiting bus request.

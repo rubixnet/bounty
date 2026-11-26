@@ -46,10 +46,11 @@
 //! with unread bytes makes the kernel reset the connection, and a reset can
 //! destroy the reply before the caller reads it (always on Windows).
 
+use crate::clock::now_ms;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Incoming};
@@ -484,12 +485,6 @@ fn registration_path(path: impl AsRef<Path>) -> Option<PathBuf> {
     let text = path.to_str()?;
     (path.is_absolute() && text.len() <= MAX_CWD_LEN && !text.chars().any(char::is_control))
         .then(|| path.to_path_buf())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// `200 {"project_id":"<id>"}`. The ID is daemon-derived (`git:`/`dir:`

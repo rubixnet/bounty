@@ -15,14 +15,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::MINUTE_MS;
 use crate::struggle::{self, BaselineDay, ScoreInput, StruggleAxes};
 use crate::{AppCategory, EventType, PresenceMinute, Ruleset, TelemetryTier, TractionEvent};
 
-const MINUTE_MS: u64 = 60_000;
-/// Fixed-point scale for splitting a second among Projects: divisible by
-/// every share count up to 12, and rounding is always down so the shares of
-/// one second never sum to more than that second.
-const SCALE: u64 = 27_720;
+/// Seconds in one Work Bucket minute (the cap on any per-minute second count).
+const SECS_PER_MINUTE: u32 = 60;
+/// Fixed-point units in one second when it is split evenly among Projects:
+/// 27 720 = lcm(1..=12), so the share for any 1 to 12 active Projects is
+/// exact, and rounding is always down so the shares of one second never sum
+/// to more than that second. A numeric shape, not a tuning knob.
+const SECOND_SHARE_UNITS: u64 = 27_720;
 
 /// A commit the daemon observed (`commit_observation` table). Only the
 /// object id and the observation time: never a message, author or diff.
@@ -148,11 +151,13 @@ const MISSING: MinuteFacts = MinuteFacts {
     tier_limited: true,
 };
 
+/// `injected_events / (key_events + pointer_events)` in per mille. The key
+/// and pointer counts include the injected events, so the ratio is at most
+/// 1000 (a count that disagrees is clamped). `None` with no counts.
 fn injected_ratio_milli(m: &PresenceMinute) -> Option<u32> {
     let injected = u64::from(m.injected_events?);
-    let real = u64::from(m.key_events.unwrap_or(0)) + u64::from(m.pointer_events.unwrap_or(0));
-    let total = injected + real;
-    (total > 0).then(|| u32::try_from(injected * 1000 / total).unwrap_or(1000))
+    let total = u64::from(m.key_events.unwrap_or(0)) + u64::from(m.pointer_events.unwrap_or(0));
+    (total > 0).then(|| u32::try_from((injected * 1000 / total).min(1000)).unwrap_or(1000))
 }
 
 fn facts(rules: &Ruleset, m: &PresenceMinute) -> MinuteFacts {
@@ -289,7 +294,8 @@ fn input_state(m: &PresenceMinute, f: MinuteFacts) -> Input {
     }
     match (m.key_events, m.pointer_events) {
         (Some(k), Some(p)) => {
-            if k + p > 0 {
+            // The counts include injected events; only the rest is real.
+            if (k + p).saturating_sub(m.injected_events.unwrap_or(0)) > 0 {
                 Input::Real
             } else {
                 Input::Absent
@@ -363,7 +369,7 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
     }
     for (sec, projects) in &active {
         let minute = minute_of(sec * 1000);
-        let share = SCALE / projects.len() as u64;
+        let share = SECOND_SHARE_UNITS / projects.len() as u64;
         let idle = !is_fresh(sec * 1000);
         for p in projects {
             let a = accs.entry((minute, (*p).to_owned())).or_default();
@@ -410,8 +416,8 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
         if f.verified {
             accs.entry((minute, project.to_owned()))
                 .or_default()
-                .human_sec = 60;
-            human_used.insert(minute, 60);
+                .human_sec = SECS_PER_MINUTE;
+            human_used.insert(minute, SECS_PER_MINUTE);
         }
     }
 
@@ -483,7 +489,9 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
             if state == Input::Real && !suspected && !fast && !facts_at(minute).flagged {
                 permission_anchors.push((e.timestamp_ms, project.to_owned()));
                 let used = human_used.entry(minute).or_insert(0);
-                let credit = u32::try_from(wait_ms / 1000).unwrap_or(60).min(60 - *used);
+                let credit = u32::try_from(wait_ms / 1000)
+                    .unwrap_or(SECS_PER_MINUTE)
+                    .min(SECS_PER_MINUTE - *used);
                 *used += credit;
                 a.human_sec += credit;
             }
@@ -524,8 +532,10 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
             continue;
         }
         let f = facts_at(minute);
-        let agent = u32::try_from(a.agent_units / SCALE).unwrap_or(60);
-        let idle = u32::try_from(a.idle_units / SCALE).unwrap_or(60).min(agent);
+        let agent = u32::try_from(a.agent_units / SECOND_SHARE_UNITS).unwrap_or(SECS_PER_MINUTE);
+        let idle = u32::try_from(a.idle_units / SECOND_SHARE_UNITS)
+            .unwrap_or(SECS_PER_MINUTE)
+            .min(agent);
         let suspected = a.no_input_approval || a.fast_approvals >= rules.auto_approver_min_fast;
         let nothing = agent == 0
             && a.human_sec == 0
@@ -555,11 +565,17 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
             struggle_credit_sec: 0,
         });
     }
+    let flagged_minutes: BTreeSet<u64> = minute_facts
+        .iter()
+        .filter(|(_, f)| f.flagged)
+        .map(|(m, _)| *m)
+        .collect();
     struggle::score(
         rules,
         &ScoreInput {
             sorted: &sorted,
             presence: &presence,
+            flagged_minutes: &flagged_minutes,
             permission_anchors: &permission_anchors,
             baseline: input.baseline,
         },
@@ -639,9 +655,8 @@ fn window_rollup(rules: &Ruleset, window: u64, minutes: &[&PresenceMinute]) -> A
         if let Some(i) = m.injected_events {
             has_counts = true;
             injected += u64::from(i);
-            counted += u64::from(i)
-                + u64::from(m.key_events.unwrap_or(0))
-                + u64::from(m.pointer_events.unwrap_or(0));
+            counted +=
+                u64::from(m.key_events.unwrap_or(0)) + u64::from(m.pointer_events.unwrap_or(0));
         }
     }
     let tier = minutes
@@ -665,7 +680,7 @@ fn window_rollup(rules: &Ruleset, window: u64, minutes: &[&PresenceMinute]) -> A
         injected_ratio_milli: has_counts.then(|| {
             (injected * 1000)
                 .checked_div(counted)
-                .map_or(0, |v| u32::try_from(v).unwrap_or(1000))
+                .map_or(0, |v| u32::try_from(v.min(1000)).unwrap_or(1000))
         }),
         telemetry_tier: tier,
     }

@@ -10,8 +10,10 @@
 //!
 //! Nothing here reads key codes, characters, pointer positions, window
 //! titles or URLs into any retained value. A minute the daemon only joined
-//! part-way (or slept through) is dropped, so nothing is written for time
-//! the daemon was not watching. Presence is device-wide: tray and session
+//! part-way is dropped. After a stall (a suspended machine) the minute it
+//! interrupted is written with only the sub-slots actually observed, and a
+//! minute nothing was observed in has no row, so nothing is written for
+//! time the daemon was not watching. Presence is device-wide: tray and session
 //! pause do not touch it.
 
 pub mod aggregate;
@@ -23,10 +25,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use traction_core::{AppCategory, SUBSLOT_SEC, SUBSLOTS_PER_MINUTE, TelemetryTier};
+use traction_core::{
+    AppCategory, PresenceMinute, Ruleset, SUBSLOT_SEC, SUBSLOTS_PER_MINUTE, TelemetryTier,
+};
 
+use crate::clock::now_ms;
 use crate::storage::WriteOp;
 use crate::writer::WriterSender;
 use aggregate::{Aggregator, InputKind, Sample};
@@ -102,13 +107,105 @@ impl PresenceSensor {
     }
 }
 
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+/// The sensor's clock-free state machine: sub-slots close on a fixed grid
+/// from the minute start, whatever time the caller wakes up at, and a stall
+/// closes the sub-slots and minutes it covered instead of dropping them.
+struct Tracker {
+    rules: &'static Ruleset,
+    slot_ms: u64,
+    minute_ms: u64,
+    minute_start: u64,
+    /// Index (0 to 5) of the next sub-slot to close.
+    next_slot: usize,
+    /// The daemon joined this minute late: it never writes a row.
+    partial: bool,
+    agg: Aggregator,
+}
+
+impl Tracker {
+    fn new(
+        rules: &'static Ruleset,
+        slot_ms: u64,
+        now: u64,
+        previous: Option<AppCategory>,
+        backend: &dyn Backend,
+    ) -> Self {
+        let minute_ms = slot_ms * u64::from(SUBSLOTS_PER_MINUTE);
+        let minute_start = now / minute_ms * minute_ms;
+        let into = now - minute_start;
+        Self {
+            rules,
+            slot_ms,
+            minute_ms,
+            minute_start,
+            next_slot: usize::try_from(into / slot_ms).unwrap_or(0),
+            // Joined more than a sub-slot late: a partial minute.
+            partial: into > slot_ms,
+            agg: Aggregator::new(rules, minute_start, slot_ms, backend.tier(), previous),
+        }
+    }
+
+    /// The end of the next sub-slot to close.
+    fn deadline(&self) -> u64 {
+        self.minute_start + (self.next_slot as u64 + 1) * self.slot_ms
+    }
+
+    /// Input older than the open minute belongs to a minute already closed.
+    fn input(&mut self, t_ms: u64, kind: InputKind, injected: bool) {
+        if t_ms >= self.minute_start {
+            self.agg.input(t_ms, kind, injected);
+        }
+    }
+
+    /// Closes every sub-slot whose end is at or before `now`. Only a
+    /// sub-slot closed within one slot of its end is sampled (the backend
+    /// reflects now); one the sensor was too late for stays unobserved, so a
+    /// stall adds nothing it did not see. A completed minute with any
+    /// observation is pushed to `out`; one nothing was observed in has no
+    /// row (the rollup treats it as `none`) and is logged.
+    fn tick(&mut self, now: u64, backend: &mut dyn Backend, out: &mut Vec<PresenceMinute>) {
+        let mut unobserved_minutes = 0u64;
+        while self.deadline() <= now {
+            let timely = now - self.deadline() < self.slot_ms;
+            let sample = if timely {
+                backend.sample()
+            } else {
+                Sample::default()
+            };
+            self.agg.slot_end(self.next_slot, sample);
+            self.next_slot += 1;
+            if self.next_slot == usize::from(SUBSLOTS_PER_MINUTE) {
+                let next_start = self.minute_start + self.minute_ms;
+                let finished = std::mem::replace(
+                    &mut self.agg,
+                    Aggregator::new(self.rules, next_start, self.slot_ms, backend.tier(), None),
+                );
+                let observed = finished.observed();
+                let (minute, last) = finished.finish();
+                if !self.partial {
+                    if observed {
+                        out.push(minute);
+                    } else {
+                        unobserved_minutes += 1;
+                    }
+                }
+                self.agg =
+                    Aggregator::new(self.rules, next_start, self.slot_ms, backend.tier(), last);
+                self.minute_start = next_start;
+                self.next_slot = 0;
+                self.partial = false;
+            }
+        }
+        if unobserved_minutes > 0 {
+            crate::log::warn(
+                "presence sensor was stalled; minutes it could not observe have no row",
+            );
+        }
+    }
 }
 
 pub fn spawn(
+    rules: &'static Ruleset,
     mut backend: Box<dyn Backend>,
     writer: WriterSender,
     subslot: Duration,
@@ -120,50 +217,40 @@ pub fn spawn(
     let slot_ms = u64::try_from(subslot.as_millis())
         .unwrap_or(u64::MAX)
         .max(1);
-    let minute_ms = slot_ms * u64::from(SUBSLOTS_PER_MINUTE);
     let handle = thread::Builder::new()
         .name("traction-presence".to_owned())
         .spawn(move || {
-            let fresh = |now: u64, previous: Option<AppCategory>, backend: &dyn Backend| {
-                let start = now / minute_ms * minute_ms;
-                // Joined more than a sub-slot late: a partial minute.
-                let partial = now - start > slot_ms;
-                (
-                    start,
-                    partial,
-                    Aggregator::new(start, slot_ms, backend.tier(), previous),
-                )
-            };
-            let (mut minute_start, mut skip, mut agg) = fresh(now_ms(), None, backend.as_ref());
+            let mut tracker = Tracker::new(rules, slot_ms, now_ms(), None, backend.as_ref());
+            let mut ready = Vec::new();
             loop {
                 let now = now_ms();
-                let boundary = (now / slot_ms + 1) * slot_ms;
-                match rx.recv_timeout(Duration::from_millis(boundary - now)) {
+                tracker.tick(now, backend.as_mut(), &mut ready);
+                for minute in ready.drain(..) {
+                    if writer.send(WriteOp::Presence(minute)).is_err() {
+                        return;
+                    }
+                }
+                let deadline = tracker.deadline();
+                let wait = deadline.saturating_sub(now_ms()).max(1);
+                match rx.recv_timeout(Duration::from_millis(wait)) {
                     Ok(Msg::Input {
                         t_ms,
                         kind,
                         injected,
                     }) => {
                         counter.fetch_add(1, Ordering::Relaxed);
-                        agg.input(t_ms, kind, injected);
+                        tracker.input(t_ms, kind, injected);
                     }
                     Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                     Err(RecvTimeoutError::Timeout) => {
                         counter.fetch_add(1, Ordering::Relaxed);
-                        let after = now_ms();
-                        if after > boundary + slot_ms {
-                            // Suspended or stalled: the minute is unreliable.
-                            (minute_start, skip, agg) = fresh(after, None, backend.as_ref());
-                            continue;
-                        }
-                        let slot = (boundary - slot_ms).saturating_sub(minute_start) / slot_ms;
-                        agg.slot_end(usize::try_from(slot).unwrap_or(0), backend.sample());
-                        if boundary >= minute_start + minute_ms {
-                            let (minute, last) = agg.finish();
-                            if !skip && writer.send(WriteOp::Presence(minute)).is_err() {
+                        // The timer fired for `deadline`: count it as reached
+                        // even if the wall clock reads a hair early.
+                        tracker.tick(now_ms().max(deadline), backend.as_mut(), &mut ready);
+                        for minute in ready.drain(..) {
+                            if writer.send(WriteOp::Presence(minute)).is_err() {
                                 return;
                             }
-                            (minute_start, skip, agg) = fresh(boundary, last, backend.as_ref());
                         }
                     }
                 }
@@ -264,15 +351,30 @@ mod tests {
         .collect()
     }
 
+    /// Waits (bounded) until `count` presence rows are stored: a positive
+    /// barrier instead of a guessed sleep.
+    fn wait_for_rows(db: &Connection, count: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while minutes(db).len() < count {
+            assert!(std::time::Instant::now() < deadline, "rows never arrived");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn one_row_per_wall_clock_minute_and_no_busy_polling() {
         let (dir, db, sender, writer_thread) = open();
         let (backend, reads, _) = fake(TelemetryTier::Reduced);
         let slot = Duration::from_millis(40);
         let started = now_ms();
-        let sensor = spawn(Box::new(backend), sender, slot).unwrap();
-        // About 3.5 minutes of 240 ms.
-        thread::sleep(slot * 6 * 3 + slot * 3);
+        let sensor = spawn(
+            &traction_core::TRACTION_RULES_1,
+            Box::new(backend),
+            sender,
+            slot,
+        )
+        .unwrap();
+        wait_for_rows(&db, 3);
         let wakeups = sensor.wakeups();
         let elapsed_slots = (now_ms() - started) / 40;
         sensor.stop().unwrap();
@@ -284,10 +386,6 @@ mod tests {
         assert!(reads.load(Ordering::Relaxed) <= elapsed_slots + 1);
 
         let rows = minutes(&db);
-        assert!(
-            (2..=4).contains(&rows.len()),
-            "expected 2 to 4 minutes, got {rows:?}"
-        );
         for pair in rows.windows(2) {
             assert_eq!(pair[1].0 - pair[0].0, 240, "contiguous wall-clock minutes");
         }
@@ -298,12 +396,85 @@ mod tests {
         drop(dir);
     }
 
+    const SLOT: u64 = 10;
+    const MINUTE: u64 = 6 * SLOT;
+    /// A minute-aligned origin for the injected clock.
+    const START: u64 = 1_000_000 * MINUTE;
+
+    fn tracker(now: u64, backend: &Fake) -> Tracker {
+        Tracker::new(&traction_core::TRACTION_RULES_1, SLOT, now, None, backend)
+    }
+
+    #[test]
+    fn sub_slots_close_on_a_fixed_grid_whatever_time_each_wakeup_is_late() {
+        let (mut backend, reads, _) = fake(TelemetryTier::Reduced);
+        let mut t = tracker(START, &backend);
+        let mut out = Vec::new();
+        // Every wakeup is 0 to 9 ms late (less than a sub-slot): three
+        // minutes still close 18 sub-slots on the grid, none skipped.
+        for i in 0..18u64 {
+            assert_eq!(t.deadline(), START + (i + 1) * SLOT);
+            t.tick(t.deadline() + (i * 7) % 10, &mut backend, &mut out);
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 18);
+        let starts: Vec<u64> = out.iter().map(|m| m.minute_start_ms).collect();
+        assert_eq!(starts, [START, START + MINUTE, START + 2 * MINUTE]);
+        for m in &out {
+            assert_eq!(m.category_sec.unwrap().ide, 0, "10 ms slots are 0 s");
+            assert_eq!(m.active_subslots, Some(6));
+        }
+    }
+
+    #[test]
+    fn a_stall_closes_the_minute_it_interrupted_with_what_was_observed() {
+        let (mut backend, reads, _) = fake(TelemetryTier::Reduced);
+        let mut t = tracker(START, &backend);
+        let mut out = Vec::new();
+        t.tick(START + SLOT, &mut backend, &mut out); // slot 0 observed
+        assert!(out.is_empty());
+        // The machine sleeps through 2.5 minutes, then wakes.
+        t.tick(START + 3 * MINUTE + 4 * SLOT + 3, &mut backend, &mut out);
+        // The interrupted minute is written, not dropped, with one observed
+        // sub-slot; the two minutes nothing was observed in have no row.
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].minute_start_ms, START);
+        assert_eq!(out[0].active_subslots, Some(1));
+        assert_eq!(out[0].telemetry_tier, TelemetryTier::Reduced);
+        // Only the first slot and the one the wakeup closed were sampled.
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        // The sensor is back on the grid inside the fourth minute.
+        assert_eq!(t.deadline(), START + 3 * MINUTE + 5 * SLOT);
+        t.tick(START + 4 * MINUTE, &mut backend, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].minute_start_ms, START + 3 * MINUTE);
+        assert_eq!(out[1].active_subslots, Some(2));
+    }
+
+    #[test]
+    fn input_stamped_before_the_open_minute_is_not_counted_in_it() {
+        let (mut backend, _, _) = fake(TelemetryTier::Full);
+        let mut t = tracker(START, &backend);
+        let mut out = Vec::new();
+        t.tick(START + MINUTE, &mut backend, &mut out);
+        // Delivered late, stamped in the minute that just closed.
+        t.input(START + 5, InputKind::Key, false);
+        t.input(START + MINUTE + 5, InputKind::Key, false);
+        t.tick(START + 2 * MINUTE, &mut backend, &mut out);
+        assert_eq!(out[1].key_events, Some(1));
+    }
+
     #[test]
     fn a_full_tier_minute_carries_the_input_counts_and_injection() {
         let (dir, db, sender, writer_thread) = open();
         let (backend, _, input_tx) = fake(TelemetryTier::Full);
         let slot = Duration::from_millis(50);
-        let sensor = spawn(Box::new(backend), sender, slot).unwrap();
+        let sensor = spawn(
+            &traction_core::TRACTION_RULES_1,
+            Box::new(backend),
+            sender,
+            slot,
+        )
+        .unwrap();
         let tx = input_tx.lock().unwrap().clone().unwrap();
         // Send input for ~2.5 minutes of 300 ms, alternating real/injected.
         let end = now_ms() + 750;
@@ -338,7 +509,8 @@ mod tests {
             )
             .unwrap();
         assert!(keys.unwrap() > 0);
-        assert_eq!(pointers, Some(0));
+        // Every pointer event here was injected, and counts include those.
+        assert_eq!(pointers, injected);
         assert!(injected.unwrap() > 0);
         assert!(active.unwrap() >= 5);
         drop(dir);
@@ -359,7 +531,13 @@ mod tests {
         };
         thread::sleep(Duration::from_millis(wait));
         let first_minute_start = now_ms() / minute * minute;
-        let sensor = spawn(Box::new(backend), sender, slot).unwrap();
+        let sensor = spawn(
+            &traction_core::TRACTION_RULES_1,
+            Box::new(backend),
+            sender,
+            slot,
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(minute + 300));
         sensor.stop().unwrap();
         writer_thread.join().unwrap();

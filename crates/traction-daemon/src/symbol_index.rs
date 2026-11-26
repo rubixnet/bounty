@@ -51,8 +51,9 @@ fn is_word_char(c: char) -> bool {
 /// `name` without its last `.extension` (a short, alphanumeric one).
 fn stem(name: &str) -> Option<&str> {
     let (stem, ext) = name.rsplit_once('.')?;
+    let longest = TRACTION_RULES_1.index_max_extension_chars as usize;
     let ok = !stem.is_empty()
-        && (1..=8).contains(&ext.len())
+        && (1..=longest).contains(&ext.len())
         && ext.chars().all(|c| c.is_ascii_alphanumeric());
     ok.then_some(stem)
 }
@@ -179,6 +180,12 @@ impl SymbolIndexes {
             }
         }
         index.names.len() < cap
+    }
+
+    /// [`Self::hits`] for a prompt's possibly missing `cwd` (`None` when
+    /// there is none).
+    pub fn hits_at(&self, cwd: Option<&str>, words: &Candidates) -> Option<u64> {
+        self.hits(Path::new(cwd?), words)
     }
 
     /// How many distinct words of `words` name something in the Project

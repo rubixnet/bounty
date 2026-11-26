@@ -47,3 +47,4 @@ Acceptance:
 - **Canary:** the "no raw text" extension runs only on Linux/Xvfb; the daemon-log half is structural (log messages are `&'static str`), not asserted.
 - Seconds resolution is 10 s (category sampled once per sub-slot).
 - `IDLE_THRESHOLD_SEC` = 30 and `MIN_CADENCE_SAMPLES` = 8 are my choices; Slice 2 should fold them into the `Ruleset`.
+- **Review fix pass:** the macOS counter-delta helpers (`counter_delta`, `injected_from_counters`) and their unit tests were deleted as dead code; the spike result above stands (no prompt-free injection signal, macOS stays `reduced`).

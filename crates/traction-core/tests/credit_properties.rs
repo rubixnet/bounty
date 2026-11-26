@@ -4,17 +4,21 @@
 //! exceed Human Active Time; any arrival order gives byte-identical
 //! canonical JSON.
 //!
-//! The case count and seed are fixed so CI is deterministic. Shrunk
-//! failures are kept in `tests/credit_properties.proptest-regressions`
-//! (proptest replays them first) and, once understood, as named tests below.
+//! Ranges, non-empty comfort baselines and commit order are generated too,
+//! and a split-range property checks that rolling a range up in two batches,
+//! each run with the Ruleset's context, equals one run over the whole range.
+//!
+//! The case count and seed are fixed so CI is deterministic. A shrunk
+//! failure is kept as a named test below once understood (no
+//! `.proptest-regressions` file is committed).
 
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use traction_core::{
-    AttributionSource, CategorySec, CommitObservation, EndReason, EventType, HarnessId,
-    MetricsOnly, MutationKind, NetworkClass, PresenceMinute, RollupInput, RollupOutput,
+    AttributionSource, BaselineDay, CategorySec, CommitObservation, EndReason, EventType,
+    HarnessId, MetricsOnly, MutationKind, NetworkClass, PresenceMinute, RollupInput, RollupOutput,
     SCHEMA_VERSION, TRACTION_RULES_1, TelemetryTier, TractionEvent, canonical_json, rollup,
 };
 
@@ -233,25 +237,83 @@ fn events() -> impl Strategy<Value = Vec<RawEvent>> {
     ]
 }
 
-fn run(
-    events: &[TractionEvent],
-    presence: &[PresenceMinute],
-    commits: &[CommitObservation],
-) -> RollupOutput {
+/// A minute-aligned range inside the generated data, and an even-minute cut
+/// strictly inside it (for the split property).
+fn range() -> impl Strategy<Value = (u64, u64, u64)> {
+    (0u64..2, 2u64..=6)
+        .prop_flat_map(|(a, l)| (Just(a), Just(l), 1..l))
+        .prop_map(|(a, l, c)| {
+            let from = T0 + a * 2 * MIN;
+            (from, from + l * 2 * MIN, from + c * 2 * MIN)
+        })
+}
+
+fn baseline() -> impl Strategy<Value = Vec<BaselineDay>> {
+    prop::collection::vec(
+        (
+            prop::array::uniform10(0u32..40),
+            prop::array::uniform10(0u32..40),
+        ),
+        0..6,
+    )
+    .prop_map(|days| {
+        days.into_iter()
+            .enumerate()
+            .map(|(i, (friction_hist, specificity_hist))| BaselineDay {
+                day: i as u64,
+                friction_hist,
+                specificity_hist,
+            })
+            .collect()
+    })
+}
+
+struct Data<'a> {
+    events: &'a [TractionEvent],
+    presence: &'a [PresenceMinute],
+    commits: &'a [CommitObservation],
+    baseline: &'a [BaselineDay],
+}
+
+fn run(d: &Data<'_>, from: u64, to: u64) -> RollupOutput {
     rollup(
         &TRACTION_RULES_1,
         &RollupInput {
-            events,
-            presence,
-            commits,
-            baseline: &[],
-            from_ms: T0,
-            to_ms: T0 + SPAN_MIN * MIN,
+            events: d.events,
+            presence: d.presence,
+            commits: d.commits,
+            baseline: d.baseline,
+            from_ms: from,
+            to_ms: to,
         },
     )
 }
 
-fn assert_caps(out: &RollupOutput) -> Result<(), TestCaseError> {
+/// What the finalizer does for one batch: run the engine over the batch plus
+/// the Ruleset's context on both sides and keep only the batch's minutes.
+fn batch(d: &Data<'_>, from: u64, to: u64) -> RollupOutput {
+    let rules = &TRACTION_RULES_1;
+    let width = rules.activity_rollup_ms;
+    let out = run(
+        d,
+        from.saturating_sub(rules.context_back_ms()) / width * width,
+        to + rules.context_fwd_ms(),
+    );
+    RollupOutput {
+        work_buckets: out
+            .work_buckets
+            .into_iter()
+            .filter(|b| (from..to).contains(&b.minute_start_ms))
+            .collect(),
+        activity_rollups: out
+            .activity_rollups
+            .into_iter()
+            .filter(|r| (from..to).contains(&r.window_start_ms))
+            .collect(),
+    }
+}
+
+fn assert_caps(out: &RollupOutput, from: u64, to: u64) -> Result<(), TestCaseError> {
     let mut human: BTreeMap<u64, u32> = BTreeMap::new();
     let mut agent: BTreeMap<u64, u32> = BTreeMap::new();
     for b in &out.work_buckets {
@@ -273,7 +335,7 @@ fn assert_caps(out: &RollupOutput) -> Result<(), TestCaseError> {
     for (m, v) in &agent {
         prop_assert!(*v <= 60, "agent {v} s in minute {m}");
     }
-    let range = u32::try_from(SPAN_MIN * 60).unwrap();
+    let range = u32::try_from((to - from) / 1000).unwrap();
     prop_assert!(human.values().sum::<u32>() <= range);
     prop_assert!(agent.values().sum::<u32>() <= range);
     let credit: u32 = out.work_buckets.iter().map(|b| b.struggle_credit_sec).sum();
@@ -294,24 +356,61 @@ proptest! {
         raw in events(),
         pm in presence(),
         cm in commits(),
+        bl in baseline(),
+        (from, to, _) in range(),
     ) {
         let ev = build(&raw);
-        assert_caps(&run(&ev, &pm, &cm))?;
+        let d = Data { events: &ev, presence: &pm, commits: &cm, baseline: &bl };
+        assert_caps(&run(&d, from, to), from, to)?;
     }
 
     /// Arrival order is irrelevant: byte-identical canonical JSON.
     #[test]
     fn any_arrival_order_gives_byte_identical_output(
-        (raw, shuffled, pm, shuffled_pm) in (events(), presence()).prop_flat_map(|(raw, pm)| {
-            let ev = build(&raw);
-            (Just(raw), Just(ev).prop_shuffle(), Just(pm.clone()), Just(pm).prop_shuffle())
-        }),
-        cm in commits(),
+        (raw, shuffled, pm, shuffled_pm, cm, shuffled_cm) in (events(), presence(), commits())
+            .prop_flat_map(|(raw, pm, cm)| {
+                let ev = build(&raw);
+                (
+                    Just(raw),
+                    Just(ev).prop_shuffle(),
+                    Just(pm.clone()),
+                    Just(pm).prop_shuffle(),
+                    Just(cm.clone()),
+                    Just(cm).prop_shuffle(),
+                )
+            }),
+        bl in baseline(),
+        (from, to, _) in range(),
     ) {
         let ev = build(&raw);
-        let a = canonical(&run(&ev, &pm, &cm));
-        let b = canonical(&run(&shuffled, &shuffled_pm, &cm));
+        let a = canonical(&run(&Data { events: &ev, presence: &pm, commits: &cm, baseline: &bl }, from, to));
+        let b = canonical(&run(
+            &Data { events: &shuffled, presence: &shuffled_pm, commits: &shuffled_cm, baseline: &bl },
+            from,
+            to,
+        ));
         prop_assert_eq!(a, b);
+    }
+
+    /// Rolling a range up in two batches (each with the Ruleset's context)
+    /// gives byte-identical output to one batch over the whole range.
+    #[test]
+    fn a_range_split_into_batches_equals_the_whole_range(
+        raw in events(),
+        pm in presence(),
+        cm in commits(),
+        bl in baseline(),
+        (from, to, cut) in range(),
+    ) {
+        let ev = build(&raw);
+        let d = Data { events: &ev, presence: &pm, commits: &cm, baseline: &bl };
+        let whole = batch(&d, from, to);
+        let (first, second) = (batch(&d, from, cut), batch(&d, cut, to));
+        let joined = RollupOutput {
+            work_buckets: first.work_buckets.into_iter().chain(second.work_buckets).collect(),
+            activity_rollups: first.activity_rollups.into_iter().chain(second.activity_rollups).collect(),
+        };
+        prop_assert_eq!(canonical(&joined), canonical(&whole));
     }
 }
 
@@ -336,13 +435,16 @@ fn a_flood_at_one_timestamp_cannot_mint_time() {
             hits: 3,
         })
         .collect();
-    let pm: Vec<PresenceMinute> = Vec::new();
-    let out = run(&build(&raw), &pm, &[]);
+    let ev = build(&raw);
+    let d = Data {
+        events: &ev,
+        presence: &[],
+        commits: &[],
+        baseline: &[],
+    };
+    let (from, to) = (T0, T0 + SPAN_MIN * MIN);
+    let out = run(&d, from, to);
     let agent: u32 = out.work_buckets.iter().map(|b| b.agent_compute_sec).sum();
     assert!(agent <= u32::try_from(SPAN_MIN * 60).unwrap());
-    assert_caps_plain(&out);
-}
-
-fn assert_caps_plain(out: &RollupOutput) {
-    assert_caps(out).expect("caps hold");
+    assert_caps(&out, from, to).expect("caps hold");
 }

@@ -35,6 +35,7 @@
 //! deleting them while they are read. Transcript text never reaches a log
 //! line, and paths only reach SQLite as `transcript_offset.path`.
 
+use crate::clock::now_ms_i64 as now_ms;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -43,7 +44,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::transcript::{self, Line, LineError, ToolNames};
 use crate::log;
@@ -598,12 +598,6 @@ fn offset_row(key: &str, identity: &str, offset: u64) -> TranscriptOffset {
         offset: i64::try_from(offset).unwrap_or(i64::MAX),
         updated_ms: now_ms(),
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Opens a transcript for reading without blocking its writer, with its

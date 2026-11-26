@@ -7,6 +7,7 @@
 mod attribution;
 mod bus;
 mod claude_code;
+mod clock;
 mod commits;
 mod config;
 mod content_metrics;
@@ -50,6 +51,8 @@ pub use config::{DATA_DIR_SOCKET_FILE, RUNTIME_SOCKET_FILE, default_socket_path}
 pub use daemon::{DaemonHandle, ShutdownError, StartError, start};
 pub use exclusions::{DEPENDENCY_FOLDERS, PROJECT_MARKER_EXTENSION, PROJECT_MARKERS};
 pub use finalizer::FinalizerSettings;
+#[doc(hidden)]
+pub use finalizer::finalize_settled;
 pub use install::claude_code::{ClaudeCodeInstall, InstallError, InstallReport};
 pub use install::{BACKUP_SUFFIX, MIN_ON_FAILURE_VERSION, VERSION_TIMEOUT, Version};
 pub use lock::LOCK_FILE;

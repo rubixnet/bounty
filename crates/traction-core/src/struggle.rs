@@ -11,16 +11,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::MINUTE_MS;
 use crate::rollup::WorkBucket;
 use crate::{AppCategory, EventType, PresenceMinute, Ruleset, TelemetryTier, TractionEvent};
 
-const MINUTE_MS: u64 = 60_000;
 const DAY_MS: u64 = 86_400_000;
 
 /// Histogram bins per axis per baseline day (each 100 per mille wide). This
 /// is the stored shape of [`BaselineDay`], not a tuning knob.
 pub const BASELINE_BINS: usize = 10;
-const BIN_WIDTH: u32 = 100;
+/// Width of one histogram bin (per mille): `1000 / BASELINE_BINS`. Part of the
+/// stored baseline shape, not a tuning knob; changing it needs a new storage
+/// format, not a new Ruleset.
+const BIN_WIDTH: u32 = 1000 / BASELINE_BINS as u32;
 
 /// The four axes of one Work Bucket, each 0 to 1000.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +136,8 @@ pub(crate) struct ScoreInput<'a> {
     /// Events with a Project, sorted by `(timestamp, event_id)`.
     pub sorted: &'a [&'a TractionEvent],
     pub presence: &'a BTreeMap<u64, &'a PresenceMinute>,
+    /// Minutes flagged `injected_hid_detected`.
+    pub flagged_minutes: &'a BTreeSet<u64>,
     /// Approved permissions that earned real-input credit.
     pub permission_anchors: &'a [(u64, String)],
     pub baseline: &'a [BaselineDay],
@@ -200,10 +205,13 @@ pub(crate) fn score(rules: &Ruleset, input: &ScoreInput<'_>, buckets: &mut [Work
 
     for (session, events) in &by_session {
         session_signals(
-            rules,
+            &SessionEnv {
+                rules,
+                flagged_minutes: input.flagged_minutes,
+                mutations: &mutations,
+            },
             session,
             events,
-            &mutations,
             &mut anchor,
             &mut loops,
             &mut spans,
@@ -322,8 +330,8 @@ fn nearest(list: &[u64], m: u64) -> Option<u64> {
 
 /// The anchor weight (per mille) of a present minute: the strongest anchor
 /// within `anchor_window_ms`, each scaled by its own strength. A `browser` /
-/// `other` minute holding no anchor of its own decays linearly to 0 over
-/// `drift_decay_ms`.
+/// `other` minute holding no anchor of its own decays linearly from 1 to 0
+/// over `drift_decay_ms` of distance, and keeps counting anchors that far.
 fn anchor_weight(
     rules: &Ruleset,
     presence: Option<&PresenceMinute>,
@@ -341,7 +349,14 @@ fn anchor_weight(
         } else {
             ts.saturating_sub(m + MINUTE_MS - 1)
         };
-        if d > rules.anchor_window_ms {
+        // A drifting minute decays over the whole `drift_decay_ms`; any
+        // other minute counts anchors only inside `anchor_window_ms`.
+        let reach = if drifting {
+            rules.drift_decay_ms.max(rules.anchor_window_ms)
+        } else {
+            rules.anchor_window_ms
+        };
+        if d > reach {
             continue;
         }
         let mut w = *strength;
@@ -386,16 +401,28 @@ fn steering(
     (interleaved * 1000).checked_div(total).unwrap_or(0)
 }
 
+/// What every session's scan reads besides its own events.
+struct SessionEnv<'a> {
+    rules: &'a Ruleset,
+    /// Minutes flagged `injected_hid_detected`.
+    flagged_minutes: &'a BTreeSet<u64>,
+    mutations: &'a BTreeMap<&'a str, Vec<&'a TractionEvent>>,
+}
+
 /// One session's anchors, friction loops and prompt specificity spans.
 fn session_signals(
-    rules: &Ruleset,
+    env: &SessionEnv<'_>,
     session: &str,
     events: &[&TractionEvent],
-    mutations: &BTreeMap<&str, Vec<&TractionEvent>>,
     anchor: &mut impl FnMut(&str, u64, u32),
     loops: &mut BTreeMap<String, Vec<Loop>>,
     spans: &mut BTreeMap<String, Vec<(u64, u64, u32)>>,
 ) {
+    let SessionEnv {
+        rules,
+        flagged_minutes,
+        mutations,
+    } = *env;
     let stale = rules.stale_turn_timeout_ms;
     let mut open = false;
     let mut last = 0u64;
@@ -412,7 +439,13 @@ fn session_signals(
                 open = true;
                 let (end, diff) = turn_extent(events, i, stale);
                 let value = prompt_specificity(rules, e, diff);
-                prompt_strength = value;
+                // A prompt submitted in a minute of synthetic input is not
+                // known to be human: the edits it launches anchor nothing.
+                prompt_strength = if flagged_minutes.contains(&minute_of(e.timestamp_ms)) {
+                    0
+                } else {
+                    value
+                };
                 spans
                     .entry(project.to_owned())
                     .or_default()
@@ -420,7 +453,8 @@ fn session_signals(
             }
             t if is_closer(t) => open = false,
             // An agent edit is only as strong an anchor as the prompt that
-            // asked for it: a terse "continue" proves nothing.
+            // asked for it (a terse "continue" proves nothing), and only when a
+            // human submitted that prompt.
             EventType::FileMutation if open => anchor(project, e.timestamp_ms, prompt_strength),
             EventType::ToolFail => {
                 if let Some(name) = e.metrics_only.tool_name.as_deref() {

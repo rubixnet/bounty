@@ -186,7 +186,12 @@ fn linux_xdotool_input_is_flagged_injected_and_leaves_no_text() {
     let real_keys: i64 = rows.iter().filter_map(|r| r.key_events).sum();
     let real_pointer: i64 = rows.iter().filter_map(|r| r.pointer_events).sum();
     assert!(injected > 0, "{rows:?}");
-    assert_eq!(real_keys + real_pointer, 0, "XTEST input is never real");
+    // Key and pointer counts include injected events: here all of them are.
+    assert_eq!(
+        real_keys + real_pointer,
+        injected,
+        "XTEST input is never real"
+    );
     assert!(
         rows.iter().all(|r| r.active_subslots == Some(0)),
         "{rows:?}"
@@ -222,27 +227,65 @@ fn presence_minutes_are_append_only() {
     );
 }
 
+/// Waits (bounded) until `done` holds for the live rows: a positive barrier
+/// instead of a guessed sleep.
+fn wait_until(daemon: &TestDaemon, done: impl Fn(&[Row]) -> bool) -> Vec<Row> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let db = daemon.live_db();
+        let all = rows(&db);
+        if done(&all) {
+            return all;
+        }
+        assert!(std::time::Instant::now() < deadline, "rows never arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wall_ms() -> i64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock");
+    i64::try_from(since.as_millis()).expect("ms")
+}
+
 #[test]
 fn a_restart_leaves_no_rows_for_the_minutes_the_daemon_was_down() {
     let first = TestDaemon::start_with(fast_presence);
-    std::thread::sleep(Duration::from_millis(900));
-    let mut second = first.restart_with(|config| {
-        // Down for a while first: the gap below is the down time.
+    wait_until(&first, |r| r.len() >= 2);
+    let (down_from, down_to) = (
+        std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+    );
+    let (from, to) = (down_from.clone(), down_to.clone());
+    let mut second = first.restart_with(move |config| {
+        // The first daemon is already stopped; stay down for several minutes.
+        from.store(wall_ms(), std::sync::atomic::Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(1100));
+        to.store(wall_ms(), std::sync::atomic::Ordering::SeqCst);
         fast_presence(config);
     });
-    std::thread::sleep(Duration::from_millis(900));
+    let down_to = down_to.load(std::sync::atomic::Ordering::SeqCst);
+    let down_from = down_from.load(std::sync::atomic::Ordering::SeqCst);
+    // Positive barrier: rows from the new run exist before we look for holes.
+    wait_until(&second, |r| {
+        r.iter().filter(|x| x.minute_start_ms >= down_to).count() >= 2
+    });
     let db = second.shutdown_and_open_db();
     let rows = rows(&db);
     drop(db);
-    let starts: Vec<i64> = rows.iter().map(|r| r.minute_start_ms).collect();
-    let gap = starts
-        .windows(2)
-        .map(|p| p[1] - p[0])
-        .max()
-        .expect("at least two rows");
     assert!(
-        gap >= 3 * MINUTE_MS,
-        "a minute of down time must leave a hole: {starts:?}"
+        rows.iter()
+            .any(|r| r.minute_start_ms + MINUTE_MS <= down_from)
     );
+    // No row starts while the daemon was down, except a minute it joined
+    // within its first sub-slot.
+    let slot = i64::try_from(SUBSLOT.as_millis()).unwrap();
+    for r in &rows {
+        assert!(
+            r.minute_start_ms + MINUTE_MS <= down_from || r.minute_start_ms + slot >= down_to,
+            "row {} inside the down time {down_from}..{down_to}",
+            r.minute_start_ms
+        );
+    }
 }

@@ -241,7 +241,27 @@ fn a_harness_edit_inside_a_human_prompted_turn_is_an_anchor_but_one_outside_is_n
 }
 
 #[test]
-fn unanchored_browser_minutes_decay_linearly_and_nothing_counts_past_the_window() {
+fn an_agent_edit_after_a_prompt_in_an_injected_minute_anchors_nothing() {
+    // The prompt is specific, but the minute it was submitted in was flagged
+    // as synthetic input, so no human is known to have submitted it.
+    let events = vec![
+        prompt(1, T0 + 5_000, 120, 4, false),
+        mutation(2, T0 + MIN + 20_000, false, 4),
+        turn_end(3, T0 + MIN + 40_000),
+    ];
+    let mut presence: Vec<_> = (0..2).map(|i| present(T0 + i * MIN, 40, 20, 0)).collect();
+    let control = run(&events, &presence, &[], 2);
+    assert_eq!(at(&control, 1).struggle_credit_sec, 60);
+    presence[0].injected_events = Some(60);
+    let out = run(&events, &presence, &[], 2);
+    assert!(at(&out, 0).injected_hid_detected);
+    assert_eq!(sum(&out, |b| b.struggle_credit_sec), 0, "{out:#?}");
+    // Its specificity still scores; only the anchor is withheld.
+    assert!(at(&out, 1).struggle_axes.specificity > 0);
+}
+
+#[test]
+fn unanchored_browser_minutes_decay_linearly_while_other_categories_stop_at_the_window() {
     // One manual edit; then minutes of pure browsing.
     // A later prompt keeps the minutes assigned to the Project; it is no
     // anchor.
@@ -259,7 +279,10 @@ fn unanchored_browser_minutes_decay_linearly_and_nothing_counts_past_the_window(
     assert_eq!(credit(2), 48);
     assert!(credit(3) > credit(4) && credit(4) > 0);
     assert!(credit(5) > 0, "290 s is inside the 5 minute window");
-    assert_eq!(credit(6), 0, "past the 5 minute window: {out:#?}");
+    assert!(
+        credit(6) > 0 && credit(6) < credit(5),
+        "drift keeps decaying past the 5 minute window: {out:#?}"
+    );
     // The same minutes in the IDE are not discounted inside the window.
     let ide: Vec<_> = (0..8).map(|i| present(T0 + i * MIN, 60, 0, 0)).collect();
     let out = run(&events, &ide, &[], 8);
@@ -268,6 +291,25 @@ fn unanchored_browser_minutes_decay_linearly_and_nothing_counts_past_the_window(
     assert_eq!(at(&out, 6).struggle_credit_sec, 0);
     // human_active_sec is never reduced.
     assert_eq!(at(&out, 6).human_active_sec, 60);
+}
+
+#[test]
+fn browser_drift_decays_linearly_over_the_whole_decay_span() {
+    // Terse prompts (no anchor) keep every minute assigned to the Project.
+    let mut events = vec![mutation(1, T0, true, 1)];
+    for (i, m) in [2u64, 5, 8].into_iter().enumerate() {
+        let n = 10 + 2 * i as u32;
+        events.push(prompt(n, T0 + m * MIN, 20, 0, false));
+        events.push(turn_end(n + 1, T0 + m * MIN + 10_000));
+    }
+    let browsing: Vec<_> = (0..11).map(|i| present(T0 + i * MIN, 0, 0, 60)).collect();
+    let out = run(&events, &browsing, &[], 11);
+    let credit = |m| at(&out, m).struggle_credit_sec;
+    // Weight is 1 - d / 10 min, d = whole minutes from the anchor.
+    assert_eq!(credit(3), 42, "3 min: 0.7");
+    assert_eq!(credit(5), 30, "5 min: 0.5, no cliff at the anchor window");
+    assert_eq!(credit(7), 18, "7 min: 0.3");
+    assert_eq!(credit(10), 0, "10 min: 0");
 }
 
 #[test]

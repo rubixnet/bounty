@@ -22,7 +22,11 @@ fn watching_daemon() -> TestDaemon {
     })
 }
 
-/// Lets the observer notice what just happened (poll plus Git runs).
+/// Spaces two Git operations by more than a poll so the observer sees them
+/// as separate transitions. It proves nothing by itself: no assertion may
+/// rely on "nothing happened during the wait"; negative claims are checked
+/// after a later, known commit has been observed (the observer handles a
+/// worktree's transitions in order).
 fn settle() {
     std::thread::sleep(Duration::from_millis(250));
 }
@@ -128,10 +132,10 @@ fn branch_switches_pulls_resets_and_amends_are_not_commits() {
         let rows = observed(&db);
         (!rows.is_empty()).then_some(rows)
     });
-    settle();
-    let rows_after = observed(&db);
-    assert_eq!(rows_after.len(), 1, "only the real commit counts: {rows:?}");
-    assert_eq!(rows_after[0].1, oid);
+    // The real commit comes after every operation above and the observer
+    // handles them in order, so anything wrongly counted is already stored.
+    assert_eq!(rows.len(), 1, "only the real commit counts: {rows:?}");
+    assert_eq!(rows[0].1, oid);
     drop(db);
     daemon.shutdown();
 }
@@ -157,20 +161,27 @@ fn a_commit_in_a_linked_worktree_is_observed_for_that_worktree_only() {
     poll_until(Duration::from_secs(10), "the linked commit", || {
         (!observed(&db).is_empty()).then_some(())
     });
-    settle();
-    assert_eq!(
-        observed(&db),
-        [(project.clone(), linked_oid)],
-        "the main worktree must not double-count it"
-    );
 
-    let main_oid = commit(&main, "in the main worktree");
-    let rows = poll_until(Duration::from_secs(10), "the main commit", || {
-        let rows = observed(&db);
-        (rows.len() >= 2).then_some(rows)
+    // Later known commits in the main worktree: once they are observed, a
+    // double count of the linked commit would already be stored too.
+    let first_main = commit(&main, "in the main worktree");
+    poll_until(Duration::from_secs(10), "the first main commit", || {
+        (observed(&db).len() >= 2).then_some(())
     });
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1], (project, main_oid));
+    let second_main = commit(&main, "and again");
+    let rows = poll_until(Duration::from_secs(10), "the main commits", || {
+        let rows = observed(&db);
+        (rows.len() >= 3).then_some(rows)
+    });
+    assert_eq!(
+        rows,
+        [
+            (project.clone(), linked_oid),
+            (project.clone(), first_main),
+            (project, second_main)
+        ],
+        "the main worktree must not double-count the linked commit"
+    );
     drop(db);
     daemon.shutdown();
 }

@@ -10,7 +10,7 @@
 //! ([`pause::Command::matching`]), which maps to [`HookAction::Pause`] and no
 //! event. A `UserPromptSubmit` that is a task notification maps to nothing.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer};
 use traction_core::{
@@ -247,7 +247,7 @@ fn map_payload(payload: Payload, received_ms: u64, symbols: &SymbolIndexes) -> H
     // are dropped with the metrics: only the count is kept.
     let repo_symbol_hits = prompt
         .as_ref()
-        .and_then(|m| symbols.hits(Path::new(cwd.as_deref()?), &m.candidates));
+        .and_then(|m| symbols.hits_at(cwd.as_deref(), &m.candidates));
     let tool_name = payload
         .tool_name
         .filter(|_| hook.is_tool_hook())

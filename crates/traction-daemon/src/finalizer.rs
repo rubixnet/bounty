@@ -21,16 +21,15 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, params};
 use traction_core::{
-    CommitObservation, PresenceMinute, RollupInput, Ruleset, TRACTION_RULES_1, TractionEvent,
-    fold_baseline, rollup,
+    CommitObservation, MINUTE_MS, PresenceMinute, RollupInput, Ruleset, TRACTION_RULES_1,
+    TractionEvent, fold_baseline, rollup,
 };
 
+use crate::clock::now_ms;
 use crate::log;
-use crate::presence::now_ms;
 use crate::storage::{self, DB_FILE, RollupBatch, WriteOp};
 use crate::writer::WriterSender;
 
-const MINUTE_MS: u64 = 60_000;
 /// The most minutes one batch covers (a day), so catching up after a long
 /// pause stays bounded.
 const MAX_BATCH_MINUTES: u64 = 24 * 60;
@@ -135,6 +134,24 @@ pub fn spawn(
     Ok(FinalizerThread { stop, handle })
 }
 
+/// Finalizes everything settled at `now_ms` in the database under
+/// `data_dir`, batch by batch, returning how many batches were written.
+/// For a stopped daemon only (it opens its own writing connection): the
+/// catch-up pass the integration tests use to inspect derived tables.
+#[doc(hidden)]
+pub fn finalize_settled(data_dir: &Path, now_ms: u64) -> rusqlite::Result<usize> {
+    let rules = &TRACTION_RULES_1;
+    let mut conn = storage::open(data_dir)?;
+    let mut cursor = read_cursor(&conn, rules)?;
+    let mut batches = 0;
+    while let Some(batch) = finalize_range(&conn, rules, cursor, now_ms, rules.bucket_settle_ms)? {
+        cursor = Some(batch.through_ms);
+        storage::apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(batch))])?;
+        batches += 1;
+    }
+    Ok(batches)
+}
+
 fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
@@ -165,9 +182,19 @@ pub fn read_cursor(conn: &Connection, rules: &Ruleset) -> rusqlite::Result<Optio
 ///
 /// `cursor` is where the previous batch ended (`None` on the very first
 /// pass, which starts at the earliest stored event or Presence Minute).
-/// Everything older than `settle_ms` before `now_ms` is settled; ranges are
-/// aligned to the Activity Rollup window, so a rollup never straddles two
-/// batches. Pure with respect to the clock: `now_ms` is a parameter.
+/// A minute is final once `settle_ms` has passed over the end of everything
+/// its Work Bucket can depend on (`Ruleset::context_fwd_ms`: Anchors,
+/// steering neighbours, a friction loop that closes later), so the horizon
+/// is `now_ms - settle_ms - context_fwd_ms`. Ranges are aligned to the
+/// Activity Rollup window, so a rollup never straddles two batches.
+///
+/// The pure engine runs over the batch plus `context_back_ms` before it and
+/// `context_fwd_ms` after it, with the inputs of that whole span loaded, and
+/// only the minutes inside the batch are kept: the result equals one engine
+/// call over the whole range (given a baseline of fewer than
+/// `baseline_min_days`, which the baseline fold otherwise changes between
+/// batches by design). Pure with respect to the clock: `now_ms` is a
+/// parameter.
 pub fn finalize_range(
     conn: &Connection,
     rules: &Ruleset,
@@ -176,7 +203,8 @@ pub fn finalize_range(
     settle_ms: u64,
 ) -> rusqlite::Result<Option<RollupBatch>> {
     let width = rules.activity_rollup_ms;
-    let horizon = now_ms.saturating_sub(settle_ms) / width * width;
+    let forward = rules.context_fwd_ms();
+    let horizon = now_ms.saturating_sub(settle_ms + forward) / width * width;
     let from = match cursor {
         Some(c) => c,
         None => match earliest(conn)? {
@@ -188,9 +216,13 @@ pub fn finalize_range(
         return Ok(None);
     }
     let to = horizon.min(from + MAX_BATCH_MINUTES * MINUTE_MS / width * width);
-    let events = load_events(conn, rules, from, to)?;
-    let presence = load_presence(conn, from, to + MINUTE_MS * 3)?;
-    let commits = load_commits(conn, from, to)?;
+    let (ctx_from, ctx_to) = (
+        from.saturating_sub(rules.context_back_ms()) / width * width,
+        to + forward,
+    );
+    let events = load_events(conn, rules, ctx_from, ctx_to)?;
+    let presence = load_presence(conn, ctx_from, ctx_to)?;
+    let commits = load_commits(conn, ctx_from, ctx_to)?;
     let mut baseline = storage::load_baseline(conn)?;
     let out = rollup(
         rules,
@@ -199,18 +231,29 @@ pub fn finalize_range(
             presence: &presence,
             commits: &commits,
             baseline: &baseline,
-            from_ms: from,
-            to_ms: to,
+            from_ms: ctx_from,
+            to_ms: ctx_to,
         },
     );
+    let inside = |ms: u64| ms >= from && ms < to;
+    let buckets: Vec<_> = out
+        .work_buckets
+        .into_iter()
+        .filter(|b| inside(b.minute_start_ms))
+        .collect();
+    let rollups = out
+        .activity_rollups
+        .into_iter()
+        .filter(|r| inside(r.window_start_ms))
+        .collect();
     // The batch's present minutes join the baseline after it was scored
     // against the history that came before.
-    fold_baseline(rules, &mut baseline, &out.work_buckets);
+    fold_baseline(rules, &mut baseline, &buckets);
     Ok(Some(RollupBatch {
         ruleset_id: rules.ruleset_id.to_owned(),
         through_ms: to,
-        buckets: out.work_buckets,
-        rollups: out.activity_rollups,
+        buckets,
+        rollups,
         baseline,
     }))
 }
@@ -375,6 +418,9 @@ mod tests {
     use crate::storage::{self, EventRow, apply_batch};
 
     const MIN: u64 = 60_000;
+    /// Tests think in "minutes older than the settle delay"; the finalizer
+    /// also waits out the forward context, which `finalize` adds to `now`.
+    const LAG: u64 = TRACTION_RULES_1.context_fwd_ms();
     const T0: u64 = 1_800_000_000_000 - 1_800_000_000_000 % (2 * MIN);
 
     fn event(n: u32, ts: u64, kind: &str, project: Option<&str>) -> WriteOp {
@@ -431,7 +477,7 @@ mod tests {
     }
 
     fn finalize(conn: &mut Connection, cursor: Option<u64>, now: u64) -> Option<u64> {
-        let batch = finalize_range(conn, &TRACTION_RULES_1, cursor, now, 120_000).unwrap()?;
+        let batch = finalize_range(conn, &TRACTION_RULES_1, cursor, now + LAG, 120_000).unwrap()?;
         let through = batch.through_ms;
         apply_batch(conn, &[WriteOp::Rollup(Box::new(batch))]).unwrap();
         Some(through)
@@ -519,7 +565,7 @@ mod tests {
         assert_eq!(totals(&conn), before);
         // Replaying the same range (a crash before the cursor moved) is a
         // no-op for the rows.
-        let batch = finalize_range(&conn, &TRACTION_RULES_1, None, T0 + 10 * MIN, 120_000)
+        let batch = finalize_range(&conn, &TRACTION_RULES_1, None, T0 + 10 * MIN + LAG, 120_000)
             .unwrap()
             .unwrap();
         apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(batch))]).unwrap();
@@ -771,6 +817,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn raw_event(
+        n: u32,
+        ts: u64,
+        kind: &str,
+        session: Option<&str>,
+        metrics: serde_json::Value,
+    ) -> TractionEvent {
+        let manual = session.is_none();
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "event_id": format!("019a7c2e-8b4d-7000-8000-{n:012x}"),
+            "timestamp_ms": ts,
+            "harness_id": if manual { None } else { Some("claude-code") },
+            "session_id": session,
+            "parent_orchestrator_id": null,
+            "event_type": kind,
+            "end_reason": null,
+            "cwd": "/code/p",
+            "project_id": "p",
+            "model_id": null,
+            "network_class": if manual { "manual" } else { "cloud_api" },
+            "attribution_source": if manual { "file_watcher" } else { "harness_hook" },
+            "metrics_only": metrics,
+        }))
+        .expect("event")
+    }
+
+    fn working(ts: u64) -> PresenceMinute {
+        match working_minute(ts) {
+            WriteOp::Presence(m) => m,
+            _ => unreachable!(),
+        }
+    }
+
+    fn browsing(ts: u64) -> PresenceMinute {
+        PresenceMinute {
+            category_sec: Some(traction_core::CategorySec {
+                browser: 60,
+                ..traction_core::CategorySec::default()
+            }),
+            category_switches: Some(0),
+            ..working(ts)
+        }
+    }
+
+    /// Finalizing a range in many small batches must give exactly what one
+    /// call of the pure engine over the whole range gives: a minute's score
+    /// reaches across batch edges (a verified minute's 90 s grace, Anchors
+    /// 5 to 10 minutes away, a friction loop that closes later, steering's
+    /// neighbours), so a batch loads and settles that context.
+    #[test]
+    fn finalizing_in_many_small_batches_equals_one_whole_range_rollup() {
+        let (_dir, mut conn) = open();
+        let tool = |name: &str| serde_json::json!({ "tool_name": name });
+        let edit = serde_json::json!({"mutation_kind": "modified", "diff_lines_delta": 3});
+        let specific = serde_json::json!({"prompt_char_len": 200, "repo_symbol_hits": 3});
+        let terse = serde_json::json!({"prompt_char_len": 8, "repo_symbol_hits": 0});
+        let none = serde_json::json!({});
+        let m = |n: u64, sec: u64| T0 + n * MIN + sec * 1000;
+        let events = vec![
+            raw_event(1, m(2, 5), "PROMPT_SUBMIT", Some("s"), specific),
+            raw_event(2, m(2, 30), "FILE_MUTATION", Some("s"), edit.clone()),
+            raw_event(3, m(4, 0), "TURN_END", Some("s"), none.clone()),
+            raw_event(4, m(8, 0), "PROMPT_SUBMIT", Some("s"), terse.clone()),
+            raw_event(5, m(9, 20), "PERMISSION_REQUEST", Some("s"), none.clone()),
+            raw_event(6, m(9, 40), "TOOL_POST", Some("s"), tool("Bash")),
+            raw_event(7, m(22, 0), "TURN_END", Some("s"), none.clone()),
+            raw_event(8, m(24, 10), "FILE_MUTATION", None, edit.clone()),
+            raw_event(9, m(33, 0), "TOOL_FAIL", Some("t"), tool("Bash")),
+            raw_event(10, m(36, 30), "FILE_MUTATION", None, edit.clone()),
+            raw_event(11, m(41, 0), "TOOL_POST", Some("t"), tool("Bash")),
+            raw_event(12, m(45, 0), "PROMPT_SUBMIT", Some("t"), terse),
+            raw_event(13, m(46, 0), "FILE_MUTATION", Some("t"), edit),
+            raw_event(14, m(47, 0), "TURN_END", Some("t"), none),
+        ];
+        let presence: Vec<PresenceMinute> = (0..52)
+            .filter(|i| ![7, 30].contains(i))
+            .map(|i| {
+                if (25..32).contains(&i) {
+                    browsing(T0 + i * MIN)
+                } else {
+                    working(T0 + i * MIN)
+                }
+            })
+            .collect();
+        let commits = vec![CommitObservation {
+            project_id: "p".to_owned(),
+            commit_oid: "b".repeat(40),
+            observed_ms: m(29, 0),
+        }];
+
+        let mut ops: Vec<WriteOp> = events
+            .iter()
+            .map(|e| WriteOp::Event(Box::new(EventRow::try_from(e.clone()).expect("row"))))
+            .collect();
+        ops.extend(presence.iter().cloned().map(WriteOp::Presence));
+        ops.extend(commits.iter().cloned().map(WriteOp::Commit));
+        apply_batch(&mut conn, &ops).unwrap();
+
+        // Many small batches: the clock moves 4 minutes at a time.
+        let rules = &TRACTION_RULES_1;
+        let (mut cursor, mut batches) = (None, 0);
+        let (mut buckets, mut rollups) = (Vec::new(), Vec::new());
+        let mut now = T0;
+        while now < T0 + 200 * MIN {
+            now += 4 * MIN;
+            if let Some(batch) = finalize_range(&conn, rules, cursor, now, 120_000).unwrap() {
+                cursor = Some(batch.through_ms);
+                batches += 1;
+                buckets.extend(batch.buckets);
+                rollups.extend(batch.rollups);
+            }
+        }
+        assert!(batches >= 8, "{batches} batches");
+        let through = cursor.unwrap();
+        assert!(through >= T0 + 52 * MIN);
+
+        let whole = rollup(
+            rules,
+            &RollupInput {
+                events: &events,
+                presence: &presence,
+                commits: &commits,
+                baseline: &[],
+                from_ms: T0,
+                to_ms: through,
+            },
+        );
+        assert!(
+            whole.work_buckets.iter().any(|b| b.struggle_credit_sec > 0),
+            "the scenario must score something"
+        );
+        assert_eq!(buckets, whole.work_buckets);
+        assert_eq!(rollups, whole.activity_rollups);
     }
 
     #[test]
