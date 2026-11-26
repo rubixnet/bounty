@@ -9,6 +9,8 @@
 //!   until it appears. Only files exactly one folder below `projects/` are
 //!   transcripts: subagent transcripts (`<session>/subagents/*.jsonl`) are
 //!   never read (`SubagentStart`/`SubagentStop` hooks cover subagents).
+//!   A project folder is scanned only once it is watched (see
+//!   [`watched_transcripts`]).
 //! - **Resume.** Each file is tracked by path, file identity (inode +
 //!   device on Unix, volume serial + file index on Windows) and the byte
 //!   offset just past its last complete line, persisted in
@@ -52,7 +54,7 @@ use crate::router::{RouterSender, TailedItem};
 use crate::storage::{TailerStartRow, TailerState, TranscriptOffset};
 use crate::symbol_index::SymbolIndexes;
 use notify::event::EventKind;
-use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
 
 /// The folder under the Claude config folder that holds transcripts.
 pub const PROJECTS_DIR: &str = "projects";
@@ -334,14 +336,14 @@ impl Worker {
     }
 
     /// Every transcript currently on disk.
-    fn transcripts(&self) -> Vec<PathBuf> {
+    fn transcripts(&mut self) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let Ok(slugs) = fs::read_dir(&self.projects) else {
             return found;
         };
         for slug in slugs.flatten() {
             if slug.file_type().is_ok_and(|t| t.is_dir()) {
-                found.extend(transcripts_in(&slug.path()));
+                found.extend(watched_transcripts(self.backend.as_mut(), &slug.path()));
             }
         }
         found
@@ -396,7 +398,7 @@ impl Worker {
         match depth {
             // A new project folder: its transcripts may predate its watch.
             1 if path.is_dir() => {
-                for transcript in transcripts_in(path) {
+                for transcript in watched_transcripts(self.backend.as_mut(), path) {
                     self.read(&transcript);
                 }
             }
@@ -568,6 +570,24 @@ fn hint_target(projects: &Path, path: &Path) -> Option<PathBuf> {
     (rest.components().count() == 2 && canonical.is_file()).then_some(canonical)
 }
 
+/// The transcripts of one project folder, listed only once the folder is
+/// watched, so that each is either listed here or notified later.
+///
+/// `notify`'s recursive inotify watch reports a new folder before it watches
+/// it. An explicit `watch` is answered by the same `notify` thread, after the
+/// watches it still owes, so it returns with the folder watched. Other
+/// backends cover new folders natively, and FSEvents would restart its
+/// stream (losing notifications) on every `watch`.
+fn watched_transcripts<W: Watcher>(backend: Option<&mut W>, folder: &Path) -> Vec<PathBuf> {
+    if let Some(backend) = backend
+        && W::kind() == WatcherKind::Inotify
+        && backend.watch(folder, RecursiveMode::NonRecursive).is_err()
+    {
+        log::warn("cannot watch a Claude project folder; its transcripts may be read late");
+    }
+    transcripts_in(folder)
+}
+
 /// The `*.jsonl` files directly in `folder`.
 fn transcripts_in(folder: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(folder) else {
@@ -665,6 +685,141 @@ mod tests {
     fn file(path: &Path) {
         fs::create_dir_all(path.parent().expect("parent")).expect("folder");
         fs::write(path, b"{}\n").expect("file");
+    }
+
+    /// A watcher backend of a given kind whose watch on a new folder is not
+    /// yet in place when the folder is reported. A writer creates the
+    /// transcript before it is: no notification will ever mention the file.
+    struct LateWatch<const INOTIFY: bool> {
+        transcript: PathBuf,
+        watched: Vec<(PathBuf, RecursiveMode)>,
+    }
+
+    impl<const INOTIFY: bool> LateWatch<INOTIFY> {
+        fn on(transcript: PathBuf) -> Self {
+            Self {
+                transcript,
+                watched: Vec::new(),
+            }
+        }
+
+        fn writer_runs(&self) {
+            fs::write(&self.transcript, b"{}\n").expect("transcript");
+        }
+    }
+
+    impl<const INOTIFY: bool> Watcher for LateWatch<INOTIFY> {
+        fn new<F: notify::EventHandler>(_: F, _: Config) -> notify::Result<Self> {
+            unimplemented!("built with `on`")
+        }
+
+        /// Returns once the watch is in place; the writer got in first.
+        fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+            self.writer_runs();
+            self.watched.push((path.to_path_buf(), mode));
+            Ok(())
+        }
+
+        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+            Ok(())
+        }
+
+        fn kind() -> notify::WatcherKind {
+            if INOTIFY {
+                notify::WatcherKind::Inotify
+            } else {
+                notify::WatcherKind::Fsevent
+            }
+        }
+    }
+
+    #[test]
+    fn a_transcript_written_before_a_new_folders_watch_is_in_place_is_still_found() {
+        let dir = tempfile::tempdir().expect("temp");
+        let slug = dir.path().join("-code-app");
+        fs::create_dir(&slug).expect("slug");
+        let transcript = slug.join("abc.jsonl");
+        let mut backend = LateWatch::<true>::on(transcript.clone());
+
+        // The folder is reported while still empty, and the tailer scans it.
+        let found = watched_transcripts(Some(&mut backend), &slug);
+        // A tailer that did not wait for the watch scanned before this.
+        backend.writer_runs();
+
+        assert_eq!(found, vec![transcript]);
+        assert_eq!(backend.watched, vec![(slug, RecursiveMode::NonRecursive)]);
+    }
+
+    /// The same race against the real inotify backend: its thread is held
+    /// inside the new folder's notification, so it cannot yet have watched
+    /// the folder.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_inotify_is_watching_a_new_folder_before_it_is_scanned() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let projects = paths::canonicalize(dir.path()).expect("canonical");
+        let slug = projects.join("-code-app");
+        let transcript = slug.join("abc.jsonl");
+
+        let (reported_tx, reported) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let held = slug.clone();
+        let mut first = true;
+        let mut backend = RecommendedWatcher::new(
+            move |result: notify::Result<notify::Event>| {
+                if first && result.is_ok_and(|event| event.paths.contains(&held)) {
+                    first = false;
+                    let _ = reported_tx.send(());
+                    let _ = released.recv();
+                }
+            },
+            Config::default(),
+        )
+        .expect("watcher");
+        backend
+            .watch(&projects, RecursiveMode::Recursive)
+            .expect("watch projects");
+
+        fs::create_dir(&slug).expect("slug");
+        reported
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the new folder is reported");
+        let (scanned_tx, scanned) = mpsc::channel();
+        let scan = thread::spawn(move || {
+            let found = watched_transcripts(Some(&mut backend), &slug);
+            let _ = scanned_tx.send(found);
+        });
+        // A scan that waits for the watch cannot finish while the backend is
+        // held; one that does not gets this long to list the empty folder.
+        let early = scanned.recv_timeout(Duration::from_millis(500));
+        fs::write(&transcript, b"{}\n").expect("transcript");
+        drop(release);
+
+        let found = early.unwrap_or_else(|_| {
+            scanned
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the scan finishes")
+        });
+        scan.join().expect("scan thread");
+        assert_eq!(found, vec![transcript]);
+    }
+
+    /// FSEvents restarts its whole stream on every `watch`, losing what
+    /// happens meanwhile; it and `ReadDirectoryChangesW` cover new
+    /// subfolders natively.
+    #[test]
+    fn backends_that_cover_new_folders_natively_get_no_extra_watch() {
+        let dir = tempfile::tempdir().expect("temp");
+        let transcript = dir.path().join("abc.jsonl");
+        file(&transcript);
+        let mut backend = LateWatch::<false>::on(transcript.clone());
+
+        let found = watched_transcripts(Some(&mut backend), dir.path());
+
+        assert_eq!(found, vec![transcript]);
+        assert!(backend.watched.is_empty());
     }
 
     #[test]

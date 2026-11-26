@@ -34,9 +34,11 @@ The gates below are excerpts from `docs/steps.md`. A Step is complete only when 
 
 | Sub-step | Scope |
 |---|---|
-| **3a: Hash-Chain in core** | Salted frame hashes, `H_n`, canonical bucket JSON, verification. Gate: tampering, deletion and insertion all fail. |
+| **3a: Hash-Chain in core** | Signed, domain-separated Chain Links over Work Buckets, Activity Rollups and commit oids (frames reserved as `frame_digest`), the Device Signing Key, sealing in the finalizer, frame-less Audit Bundle export and the offline `verify` command. Gate: tampering, deletion and insertion all fail (`tamper_red_team.rs`). Specced in `.scratch/step-3/`. |
 | **3b: Snapshot Vault** | Opt-in visual proof mode, 720p WebP, dHash dedup, encrypted vault, 45-day retention, denylist (password managers, incognito, `.env`). Gate: zero frames captured while sensitive windows are focused. |
-| **3c: Offline + Review UI + Bundle** | `offline_buffered` sync, `network_class`, `/submit` filmstrip UI, Redaction, `.traction-bundle` export. Gate: redacting 3 frames still verifies. |
+| **3c: Offline + Review UI + Bundle** | `offline_buffered` sync, `network_class`, `/submit` filmstrip UI, Redaction, zstd `.traction-bundle` export (wrapping the 3a frame-less bundle). Gate: redacting 3 frames still verifies. |
+
+> **Deferral recorded 2026-11-26:** only 3a is built now. Sub-steps 3b and 3c (Step 3 Exit Gate items 2 and 3) follow Step 4, like 1d/1e were deferred past Step 2, and must pass before Step 5. `frame_digest` is already signed into every Chain Link as 32 zero bytes, so they add no chain format change.
 
 ## Step 4: Server, Anchors, DecisionEngine
 

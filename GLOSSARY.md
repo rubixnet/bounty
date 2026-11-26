@@ -101,11 +101,35 @@ Whether a Project's hours may be submitted to a program; true only when it has a
 _Avoid_: Qualification, approval
 
 **Anchor**:
-A chain tip sent to the server every two minutes, timestamped by the server on receipt.
+A chain tip sent to the server every two minutes, timestamped by the server on receipt. It carries a Chain Link's `entry_hash`.
 _Avoid_: Heartbeat, checkpoint, sync
 
+**Chain Link**:
+The local, signed, hash-chained record of one sealed 120-second window: a header (sequence number, previous link's hash, key and window) and a payload of per-Project row digests, signed with the Device Signing Key. Not an Anchor (that is the tip sent to the server).
+_Avoid_: Block, ledger entry, checkpoint
+
+**Seal**:
+To compute a finalized window's payload, link it to the previous Chain Link, sign it and commit it in the same transaction as the window's rows.
+_Avoid_: Sign, anchor, commit (a commit is a Git commit)
+
+**Sealed Window**:
+A 120-second window that holds a Chain Link; its Work Buckets, Commit Observations and Activity Rollup can no longer change without verification failing.
+_Avoid_: Closed window, finalized window (finalized only means computed, not yet sealed)
+
+**Chain Tip**:
+The highest Chain Link of a Device Signing Key's chain; its `entry_hash` is what an Anchor carries.
+_Avoid_: Head, latest hash
+
+**Device Signing Key**:
+The per-device Ed25519 key in `signing.key` that signs every Chain Link and Audit Bundle manifest. Different from the device secret (`device.secret`, which keys `dir:` Project IDs).
+_Avoid_: Device key, secret key, private key
+
+**Successor Chain**:
+A new chain, under a new Device Signing Key, started after `signing.key` was lost; its genesis link names the previous chain's tip. Verification always reports it as a key discontinuity (two chains), never as one unbroken chain.
+_Avoid_: Fork, rotated chain, reset
+
 **Audit Bundle**:
-The user-reviewed, optionally redacted export of a Project's buckets and snapshot frames that reviewers verify against Anchors.
+The export of one Project's buckets (and, from Step 3c, user-reviewed, optionally redacted snapshot frames) together with every Chain Link the device holds and a signed manifest, which reviewers verify offline and against Anchors. Frame-less until Step 3c.
 _Avoid_: Export, archive, proof pack
 
 **Redaction**:

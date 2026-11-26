@@ -127,15 +127,17 @@
    - Auto-privacy denylist: automatically suspend capture when password managers (`1Password`, `Bitwarden`, `KeePass`), private/incognito browser windows, or `.env` files are focused; run regex secret redaction before writing any local metadata.
    - Store encrypted frames locally in `~/.traction/vault/` with rolling retention (default 45 days unless pinned to an active project).
 2. **Salted Hash-Chain & Offline Consistency (`traction-core` + `traction-daemon`):**
-   - For each captured frame $i$: generate 16-byte cryptographic salt and compute `frame_hash = SHA256(image_bytes || salt)`.
-   - Every 2 minutes compute `H_n = SHA256(H_{n-1} || canonical_bucket_json || frame_hash || git_diff_hash)`.
+   - For each captured frame $i$: generate 16-byte cryptographic salt and compute `frame_hash = SHA256(image_bytes || salt)` (Step 3b; folded into the chain as `frame_digest`, reserved as 32 zero bytes until then).
+   - Every 2 minutes (one 120 s Activity Rollup window) seal a Chain Link with the domain-separated formula `entry_hash = SHA256("traction/v1/link\0" || canonical_json(header))`, where the header holds `prev_hash` (the previous `entry_hash`, 64 zeros at genesis) and `payload_digest = SHA256("traction/v1/payload\0" || canonical_json(payload))` over the window's per-Project `rows_digest`s (Work Buckets and commit oids), the Activity Rollup digest and `frame_digest`; sign `entry_hash` with the Device Signing Key (Ed25519, `verify_strict`). Full spec in `docs/protocol.md` section 4. (Replaces the bare `H_n = SHA256(H_{n-1} || ...)` line.)
    - When offline, queue buckets in SQLite tagged `sync_mode = offline_buffered` and flush upon reconnect; track harness network type (`cloud_api` vs `local_model` vs `manual`) so impossible offline cloud sessions are detectable. Offline manual coding and local-model Harnesses (e.g. `ollama`) must track and verify fully. Non-Git Projects use 32 zero bytes for `git_diff_hash` and a file size/mtime churn digest for the shadow diff.
 3. **Local Review & Redact UI (Served On-Demand at `http://127.0.0.1:41937/submit`):**
    - Lightweight HTML/JS served straight from the Rust daemon (zero Electron/WebView RAM when closed).
    - Lets the user visually scrub their project's sparse filmstrip, click to redact/blur any private frame (dropping `image_bytes` and `salt`, keeping `{ "redacted": true, "frame_hash": "<hex>" }` so hash-chain integrity stays intact), inspect `% redacted`, and export a compressed `.traction-bundle` archive (~15–25 MB per 30-hour project).
 
 ### Exit Gate (Must Pass Before Step 4)
-- [ ] Tampering with, deleting, or inserting any past bucket or frame in local SQLite fails `traction-core` hash-chain verification immediately.
+> **Scope deviation recorded 2026-11-26:** Step 3 is split. Sub-step 3a (item 1, minus frames) is built and gated first; items 2 and 3 (and the frame-bearing parts of item 1) are deferred to 3b/3c until after Step 4, and must pass before Step 5. Item 1 and the bundle tamper suite are proven by `crates/traction-daemon/tests/tamper_red_team.rs`.
+
+- [ ] Tampering with, deleting, or inserting any past bucket in local SQLite fails `traction-core` hash-chain verification immediately (frames: deferred to 3b). *(Proven for 3a by `tamper_red_team.rs`; ticked at human sign-off of 3a.)*
 - [ ] Redacting 3 frames removes 100% of their pixel bytes and salts from the exported bundle while passing chain verification and accurately reporting `% redacted`.
 - [ ] Password-manager / `.env` focus test confirms zero frames are captured during sensitive focus.
 

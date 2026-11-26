@@ -12,6 +12,13 @@
 //! (default `$XDG_RUNTIME_DIR/traction.sock`, else `<data dir>/daemon.sock`).
 //!
 //! Subcommands:
+//! - `export-bundle --project <project_id> --out <file> [--data-dir <path>]`
+//!   writes that Project's frame-less Audit Bundle (read-only; safe while the
+//!   daemon runs).
+//! - `verify <bundle> [--trusted-key <hex>]... [--expect-tip <key_id>:<seq>:<hash>]`
+//!   or `verify --data-dir <path> ...` checks a bundle or the local database
+//!   offline. Exit 0 = verified (one chain), 2 = verified with more than one
+//!   chain (key discontinuity), 1 = failed or unreadable.
 //! - `install claude-code [--settings <path>] [--claude-program <path>]
 //!   [--port <n>] [--profile <path>]...` merges Traction's hooks into Claude
 //!   Code's `settings.json` (default `$CLAUDE_CONFIG_DIR/settings.json`, else
@@ -32,6 +39,12 @@ use traction_daemon::{ClaudeCodeInstall, DaemonConfig};
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
+        Err(message) if message.starts_with("exit:") => ExitCode::from(
+            message
+                .strip_prefix("exit:")
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(1),
+        ),
         Err(message) => {
             eprintln!("traction-daemon: {message}");
             ExitCode::FAILURE
@@ -41,9 +54,20 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1).peekable();
-    if args.peek().and_then(|arg| arg.to_str()) == Some("install") {
-        args.next();
-        return install(args);
+    match args.peek().and_then(|arg| arg.to_str()) {
+        Some("install") => {
+            args.next();
+            return install(args);
+        }
+        Some("export-bundle") => {
+            args.next();
+            return finish(traction_daemon::run_export(args)?);
+        }
+        Some("verify") => {
+            args.next();
+            return finish(traction_daemon::run_verify(args)?);
+        }
+        _ => {}
     }
     let config = config_from_args(args)?;
 
@@ -103,6 +127,16 @@ fn config_from_args(mut args: impl Iterator<Item = OsString>) -> Result<DaemonCo
         config.socket_path = socket_path;
     }
     Ok(config)
+}
+
+/// Prints a finished `export-bundle`/`verify` run. A non-zero code travels as
+/// the internal `exit:<n>` error so `main` returns it without printing more.
+fn finish(outcome: traction_daemon::Outcome) -> Result<(), String> {
+    print!("{}", outcome.stdout);
+    match outcome.code {
+        0 => Ok(()),
+        code => Err(format!("exit:{code}")),
+    }
 }
 
 /// `install <harness> [options]`.

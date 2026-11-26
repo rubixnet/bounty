@@ -85,3 +85,31 @@ fn no_specificity_tuning_constant_lives_outside_the_ruleset() {
         }
     }
 }
+
+/// How many `[[package]]` entries a `Cargo.lock` has for exactly `name`.
+fn locked_versions(lock: &str, name: &str) -> usize {
+    let wanted = format!("name = \"{name}\"");
+    lock.lines().filter(|line| *line == wanted).count()
+}
+
+/// Git checks `Cargo.lock` out with CRLF line endings on Windows.
+#[test]
+fn locked_versions_reads_crlf_and_lf_lockfiles_alike() {
+    let lf = "[[package]]\nname = \"sha2\"\nversion = \"0.10.9\"\n\n\
+              [[package]]\nname = \"sha2-asm\"\nversion = \"0.6.4\"\n";
+    for lock in [lf.to_owned(), lf.replace('\n', "\r\n")] {
+        assert_eq!(locked_versions(&lock, "sha2"), 1, "{lock:?}");
+        assert_eq!(locked_versions(&lock, "digest"), 0, "{lock:?}");
+    }
+}
+
+/// The hash-chain's crypto crates must resolve to one version each, so the
+/// daemon and the server never link two `sha2` / `curve25519-dalek` trees.
+#[test]
+fn cargo_lock_has_one_version_of_each_crypto_crate() {
+    let lock = std::fs::read_to_string(workspace_root().join("Cargo.lock")).expect("Cargo.lock");
+    for name in ["sha2", "digest", "rand_core", "curve25519-dalek"] {
+        let count = locked_versions(&lock, name);
+        assert_eq!(count, 1, "Cargo.lock has {count} versions of {name}");
+    }
+}

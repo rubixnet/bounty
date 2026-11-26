@@ -35,8 +35,10 @@ use crate::lock::{InstanceLock, LockError};
 use crate::presence::{self, PresenceSensor};
 use crate::router::{self, Router, RouterThread};
 use crate::secret::DeviceSecret;
+use crate::signing_key;
 #[cfg(unix)]
 use crate::socket::{self, SocketError, SocketFile};
+use crate::storage::Sealer;
 use crate::symbol_index::SymbolIndexes;
 use crate::token::BusToken;
 use crate::watcher::{self, WatcherThread, Watches};
@@ -81,6 +83,9 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let device_secret =
         DeviceSecret::load_or_create(&config.data_dir).map_err(StartError::DeviceSecret)?;
     let conn = storage::open(&config.data_dir).map_err(StartError::Database)?;
+    let signing_key =
+        signing_key::load_or_create(&config.data_dir).map_err(StartError::SigningKey)?;
+    let sealer = Sealer::open(&conn, signing_key).map_err(StartError::Database)?;
     let registry = storage::load_registry(&conn).map_err(StartError::Database)?;
     let tailer_state = storage::load_tailer_state(&conn).map_err(StartError::Database)?;
 
@@ -114,7 +119,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         .map_err(StartError::Runtime)?;
 
     let (writer_sender, writer_thread) =
-        writer::spawn(conn, config.writer).map_err(StartError::Runtime)?;
+        writer::spawn(conn, config.writer, sealer).map_err(StartError::Runtime)?;
 
     let exclusions = Exclusions::load(
         config.home_dir.as_deref(),
@@ -435,6 +440,9 @@ pub enum StartError {
     /// `device.secret` could not be read or created, or is malformed (it is
     /// never replaced, since that would change every `dir:` Project ID).
     DeviceSecret(io::Error),
+    /// `signing.key` could not be read or created, or is malformed (it is
+    /// never replaced: a new key would silently fork the chain's trust).
+    SigningKey(io::Error),
     Database(rusqlite::Error),
     /// The configured port is taken. The daemon never falls back to another.
     PortInUse {
@@ -468,6 +476,7 @@ impl fmt::Display for StartError {
             Self::Lock(e) => write!(f, "cannot take the single-instance lock: {e}"),
             Self::Token(e) => write!(f, "cannot read or create daemon.token: {e}"),
             Self::DeviceSecret(e) => write!(f, "cannot read or create device.secret: {e}"),
+            Self::SigningKey(e) => write!(f, "cannot read or create signing.key: {e}"),
             Self::Database(e) => write!(f, "cannot open the database: {e}"),
             Self::PortInUse { port } => write!(
                 f,
@@ -499,6 +508,7 @@ impl std::error::Error for StartError {
             | Self::Lock(e)
             | Self::Token(e)
             | Self::DeviceSecret(e)
+            | Self::SigningKey(e)
             | Self::Runtime(e) => Some(e),
             Self::AlreadyRunning | Self::PortInUse { .. } => None,
             Self::Bind { source, .. } => Some(source),

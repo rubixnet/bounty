@@ -234,6 +234,9 @@ The persona pass marks (`PERSONA_MARKS_1`, per mille of a 60-minute wall clock) 
 - `activity_rollup`, key `(window_start_ms, ruleset_id)`.
 - `struggle_baseline (day, friction_hist, specificity_hist)`: the local comfort baseline (see "Struggle signals and credit"). The one table exempt from append-only: a day's row is upserted as days are finalized and days past `baseline_window_days` are pruned. It holds 10-bin histogram counts only, never events or timestamps.
 - `rollup_cursor (ruleset_id, finalized_through_ms)`: the finalizer's bookmark, the only mutable table of the three-clock output, written in the same transaction as the rows it covers.
+- `chain_key (key_id, public_key, created_at_ms)` and `chain_link (key_id, seq, window_start_ms, ruleset_id, prev_hash, payload_digest, entry_hash, sealed_at_ms, clock_regressed, payload_json, signature)`: the signed chain of section 4, **append-only** (`BEFORE UPDATE`/`BEFORE DELETE` triggers abort). Each non-empty window is sealed in the same transaction as its rows and the cursor, so a finalized row is never unsealed. No mutable "tip" table exists: the Chain Tip is the current key's highest `seq`. The only tables that are not append-only remain `struggle_baseline` and `rollup_cursor`.
+
+**Device Signing Key.** `<data dir>/signing.key` holds the 32 raw bytes of an Ed25519 seed (created from the OS CSPRNG, never the macOS Keychain or the Linux Secret Service, which can prompt or fail on a headless machine); `<data dir>/signing.pub` holds the public key as lowercase hex plus a newline, for the user to give a reviewer. `signing.key` is owner-only: mode `0600` on Unix (a looser mode is tightened and warned about), a protected DACL with one full-control ACE for the current user on Windows. It is distinct from `device.secret` (the `dir:` Project ID key) and the bus token, never logged or sent, and a malformed file stops startup instead of being replaced. A missing file while a chain exists starts a successor chain (section 4).
 
 The finalizer computes each minute once `bucket_settle_ms` has passed over the end of everything the minute can depend on (aligned down to a whole rollup window). That forward context is derived from the Ruleset (`context_fwd_ms`: Anchors and steering neighbours out to `drift_decay_ms`, a friction loop closing up to `stale_turn_timeout_ms` later, a permission reply within the latency cap), so a minute is final about 12 minutes after it ends. Each batch runs the pure engine over the batch plus `context_back_ms` before it and `context_fwd_ms` after it, with all inputs of that span loaded, and keeps only its own minutes: finalizing in many small batches is byte-identical to one whole-range engine call (while the baseline holds fewer than `baseline_min_days` days; the baseline fold between batches is the one intended difference), writes buckets with `INSERT OR IGNORE`, and resumes after a restart from `rollup_cursor`. Later events never rewrite a finalized minute (attribution is live-only). Its first pass waits one settle period after daemon start, so a restarting tailer can add the down-time events first.
 
@@ -267,50 +270,114 @@ Sent to `POST /v1/anchors` per `project_id`, containing aggregated 60-second `Wo
 - `human_active_sec`, `agent_compute_sec`, `idle_autonomous_sec` (the Work Bucket, Activity Rollup, Ruleset and their tables are defined in section 2c)
 - `injected_hid_detected`, `window_category_counts`, `struggle_axes` (`steering`, `specificity`, `friction`, `comfort_delta`)
 - `sync_mode`: `"realtime" | "offline_buffered"`
-- `chain_tip_hex`: 32-byte SHA-256 hex digest
+- `chain_tip_hex`: 32-byte SHA-256 hex digest, the `entry_hash` of the tip Chain Link (section 4)
 
 Server assigns authoritative monotonic `server_received_at`.
 
-## 4. Salted Hash-Chain & Redaction Tombstones
+## 4. Signed Hash-Chain & Redaction Tombstones
 
-**Per Snapshot Frame `i`:** Generate 16 random bytes `salt_i`, store encrypted locally, compute:
+Step 3a (`traction-core::chain`, sealed by the daemon's single writer, verified by the same code in the `verify` command and, from Step 4, the server). Frame hashing and redaction tombstones are Step 3b/3c; their slot in the format is already reserved (see `frame_digest`).
+
+**Domain separation.** Every hash and signature input starts with a fixed ASCII tag that ends in `0x00`. No tag is a prefix of another, so no byte string is valid in two domains. All JSON is canonical (sorted keys, no whitespace, no floats), all digests are SHA-256 in lowercase hex, signatures are 64 bytes of lowercase hex.
+
+| Tag | Input after the tag |
+|---|---|
+| `traction/v1/key-id\0` | the 32-byte Ed25519 public key |
+| `traction/v1/rows\0` | canonical JSON of one Project's rows in one window |
+| `traction/v1/device-rows\0` | canonical JSON of the window's Activity Rollup, or `null` |
+| `traction/v1/payload\0` | canonical JSON of the Link Payload |
+| `traction/v1/link\0` | canonical JSON of the Link Header |
+| `traction/v1/sig/link\0` | the 32-byte `entry_hash` (what Ed25519 signs) |
+| `traction/v1/manifest\0` | canonical JSON of the bundle manifest body (and of the `chains` array, for `chains_digest`) |
+| `traction/v1/sig/manifest\0` | the 32-byte manifest digest |
+| `traction/v1/frames\0` | reserved for Step 3b (`frame_digest`) |
+
+**Chain Link.** One per sealed 120 s Activity Rollup window that holds any row (a window with nothing in it gets no link).
 
 ```text
-frame_hash_i = SHA256(webp_bytes_i || salt_i)
+key_id         = "ed25519:" || hex(SHA256("traction/v1/key-id\0" || public_key)[..16])
+rows_digest    = SHA256("traction/v1/rows\0" || canonical_json(ProjectWindowRows))
+payload        = { window_start_ms, ruleset_id, device_rows_digest,
+                   projects: [{ project_id, rows_digest }, ...],   # sorted by project_id, unique
+                   frame_digest,                                   # 32 zero bytes until Step 3b
+                   supersedes }                                    # null, or the previous chain's tip (see below)
+header         = { schema_version: 1, seq, prev_hash, payload_digest, key_id, ruleset_id,
+                   window_start_ms, sealed_at_ms, clock_regressed }
+payload_digest = SHA256("traction/v1/payload\0" || canonical_json(payload))
+entry_hash     = SHA256("traction/v1/link\0" || canonical_json(header))
+signature      = Ed25519.sign("traction/v1/sig/link\0" || entry_hash)
 ```
 
-**Per 2-Minute Anchor `n`:**
+- `ProjectWindowRows = { project_id, work_buckets (sorted by minute), commit_oids (sorted, de-duplicated, lowercase 40/64 hex) }` for one Project in one window. Commit oids replace the old `git_diff_hash`: a Step 4 reviewer can cross-check them against the Linked Repo, and reading them needs no diff.
+- `device_rows_digest` covers the window's Activity Rollup (counts and ratios only), device-wide.
+- Genesis sentinel: `prev_hash` is 64 `'0'` characters exactly when `seq == 0`, and never otherwise. Later links carry the previous link's `entry_hash`.
+- `frame_digest` replaces the old `frame_hash_n`. It is 32 zero bytes in Step 3a and is already signed into every payload, so Step 3b needs no format change.
+- `sealed_at_ms` is the wall clock at sealing, stored as is. If it is earlier than the previous link's, the link sets `clock_regressed: true`: advisory, signed, counted in the report, never a failure on its own. `window_start_ms` must still strictly increase.
+
+**Verification** (`verify_strict` only: it rejects small-order public keys and non-canonical `S`; a loaded public key must also not be weak). The checks run per link in this order and the first failure in chain order is returned, so the result is deterministic for any tamper. Each error has a stable `code`.
+
+| # | Check | Error (`code`) |
+|---|---|---|
+| 1 | `schema_version == 1` | `unsupported_schema` |
+| 2 | position: link 0 is `seq 0` with the genesis sentinel; link `i > 0` has `seq == i` | `truncated_genesis`, `duplicate_seq`, `seq_gap` |
+| 3 | `key_id` is the chain's (and pinned) key | `unknown_key` |
+| 4 | `payload_digest` recomputes; window and ruleset match the header; every digest the held rows cover recomputes (a Project in scope with rows but no entry, or an entry but no rows, also fails) | `payload_hash_mismatch` (`part`: payload, device_rows or the Project) |
+| 5 | `entry_hash` recomputes from the header | `entry_hash_mismatch` |
+| 6 | the signature verifies strictly | `invalid_signature` |
+| 7 | `prev_hash` is the previous `entry_hash` | `broken_prev_hash` |
+| 8 | the window advances and is aligned to the window length | `window_order` |
+
+After the walk: a row in a window between the first genesis and the last tip that no link covers is `unanchored_row`; an expected tip that differs from the last link is `tip_mismatch`. Rows after the last tip are reported as `pending`, rows before the first genesis as `legacy` (they predate Step 3; they are not proof and are left out of bundles).
+
+**Key discontinuity and successor chains.** A device has one chain per Device Signing Key it ever held. A missing `signing.key` while a chain exists starts a **successor chain**: a new key, a new genesis at `seq 0`, and `payload.supersedes = { key_id, seq, entry_hash }` naming the previous chain's tip (only the new key can sign it, since the old key is gone). Chains are ordered by genesis window; a chain that starts before the previous one ends is `chain_overlap`, two chains with one key are `duplicate_chain`, and a `supersedes` that is not the previous tip is `supersedes_mismatch` (the old chain's tail was cut or changed). A successor shown without its predecessor never passes: rows before its genesis are `unanchored_row`, and with those removed too its `supersedes` is `supersedes_mismatch`. A successor genesis with `supersedes: null` is allowed (a key lost together with the database cannot name a tip) and is reported as an unlinked discontinuity. Several chains are **never merged silently**: the report lists every chain and every discontinuity, and there is no combined tip.
+
+**`verify` output and exit codes.** `traction-daemon verify <bundle> | --data-dir <path> [--trusted-key <hex>]... [--expect-tip <key_id>:<seq>:<entry_hash>]` prints:
+
+- `OK chains=<n> links=<n> tip=<key_id>:<seq>:<hash> pinned=<bool> clock_regressions=<n> pending=<n> legacy=<n>`
+- one `WARN key_discontinuity from=<key_id> to=<key_id> at_window=<ms> linked=<bool>` per discontinuity
+- a `NOTE` line when no `--trusted-key` was given (the keys are self-asserted by the input)
+- or `FAIL <code> key=<key_id> seq=<n>` (`-` where a field does not apply; `part=` and `window=` follow for `payload_hash_mismatch` and `unanchored_row`).
+
+Exit code **0**: verified, exactly one chain. **2**: verified, but more than one chain (a key discontinuity must never read as a clean pass). **1**: verification failed or the input was unreadable.
+
+**Honest limits.**
+
+- The local chain is tamper-evident *since sealing*: rows finalized before Step 3a, and rows a window after the tip, are not covered.
+- Truncating the **tail** of a chain (or of a database) is invisible without a tip learned from outside (`--expect-tip`, or an Anchor the server holds from Step 4). A bundle's manifest tip stops edits only because the manifest is signed.
+- Without `--trusted-key` the chain's own public key is trusted on first use, so a whole chain rebuilt under a fresh key verifies (with a different `key_id` and `pinned=false`). Pin the key from the user's `signing.pub`.
+- `clock_regressed` and `sealed_at_ms` are the device's own clock; they flag, they do not prove.
+
+**User Redaction (Step 3c).** Dropping frame `i` will delete its bytes and salt from the Audit Bundle while retaining `{ "frame_id": "i", "redacted": true, "frame_hash": "<hex>" }`, so `frame_digest` still recomputes. Not implemented in Step 3a.
+
+## 5. Audit Bundle and `.traction-bundle` Archive (Step 3a export / Step 3c archive / Step 4)
+
+### Frame-less Audit Bundle (Step 3a)
+
+`traction-daemon export-bundle --project <project_id> --out <file> [--data-dir <path>]` writes one canonical JSON file (suggested extension `.traction-bundle.json`). It opens SQLite `mode=ro` with `PRAGMA query_only = ON`, so it is safe while the daemon runs and never blocks its writer. An unknown Project ID is an error (exit 1).
 
 ```text
-H_n = SHA256(
-  H_(n-1) ||
-  canonical_json(buckets_n) ||
-  frame_hash_n ||
-  git_diff_hash_n
-)
-```
-
-- `H_0` = 32 zero bytes at project start.
-- `frame_hash_n` = SHA-256 of the concatenated `frame_hash_i` captured in that anchor window, or 32 zero bytes when none.
-- `git_diff_hash_n` = 32 zero bytes for non-Git Projects (shadow diff uses a file size/mtime churn digest instead).
-- JSON keys are sorted lexicographically with zero extra whitespace.
-
-**User Redaction:** Dropping frame `i` deletes `webp_bytes_i` and `salt_i` from the Audit Bundle while retaining:
-
-```json
 {
-  "frame_id": "i",
-  "redacted": true,
-  "frame_hash": "<hex>"
+  "manifest":     { <manifest body>, "signature": "<hex>" },
+  "chains":       [ { "public_key": "<hex>", "links": [ every Chain Link of that key, genesis to tip ] }, ... ],
+  "project_rows": { "work_buckets": [ ... ], "commit_oids": { "<window_start_ms>": [ ... ] } },
+  "device_rows":  { "activity_rollups": [ ... ] },
+  "frames":       []
 }
 ```
 
-The server recomputes the exact chain without pixel data and computes the percentage redacted.
+- `chains` holds every chain the device holds, in order, device-wide (see "Disclosure" below). `project_rows` holds the exported Project's rows only; `device_rows` holds the Activity Rollups (counts only). Rows before the first genesis window are not exported.
+- Manifest body: `bundle_schema: 1`, `project_id`, `linked_repo: null` (Step 5 fills it), the current `key_id` and `public_key`, `chain_count`, `key_ids`, `first_window_ms`, `tip { key_id, seq, entry_hash }` (the last chain's), `link_count`, `bucket_count`, `ruleset_ids`, `exported_at_ms`, `chains_digest` (`SHA256("traction/v1/manifest\0" || canonical_json(chains))`). It is signed with the current Device Signing Key: `Ed25519.sign("traction/v1/sig/manifest\0" || SHA256("traction/v1/manifest\0" || canonical_json(body)))`.
+- Verification order: manifest signature (`manifest_signature_invalid`), `chain_count`/`key_ids` against `chains` (`manifest_chains_mismatch`), then the chain checks of section 4 over this Project's rows (`scope = Project`) with the manifest tip as the expected tip, then the manifest's counts, `first_window_ms`, tip key and `chains_digest` (`manifest_chains_mismatch`). With `--trusted-key`, the manifest's signer must be pinned too. A malformed or non-bundle file is `malformed_bundle`.
+- Step 3c wraps this same JSON as `manifest.json` + `buckets.jsonl` (+ frames) inside the zstd archive below; the digests do not change.
 
-## 5. `.traction-bundle` Archive Format (Step 3 / Step 4)
+### Disclosure: other Projects in a device-wide bundle (`git:` ID trade-off)
+
+One chain per device means each Link Payload carries a `{ project_id, rows_digest }` entry for **every** Project that was active in that window (needed to recompute `payload_digest`). A bundle therefore reveals, per sealed window, how many other Projects were active and their opaque `project_id`s, never their rows. `dir:` IDs are keyed by `device.secret` and cannot be linked to a path. A `git:` ID is `SHA-256(root_commit, normalized origin)`, so anyone who already knows a repository's root commit and origin can confirm that the user worked on it in that window. Do not export while a sensitive `git:` Project is tracked. A blinded per-bundle encoding is a possible later change (a new `bundle_schema`), not part of Step 3a.
+
+### `.traction-bundle` archive (Step 3c)
 
 Zstd-compressed tar archive containing:
 
-- `manifest.json` — schema version, `project_id`, `linked_repo` (submission requires a public GitHub repo), device provenance tag, total frames, redacted frame count, start/end anchor hashes.
-- `buckets.jsonl` — canonical 60-second buckets matching anchored hashes.
+- `manifest.json` — the manifest above plus device provenance tag, total frames, redacted frame count.
+- `buckets.jsonl` — canonical Work Buckets matching the sealed digests.
 - `frames/<frame_id>.webp` + `frames/<frame_id>.salt` — only for unredacted frames.

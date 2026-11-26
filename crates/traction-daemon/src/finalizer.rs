@@ -27,7 +27,8 @@ use traction_core::{
 
 use crate::clock::now_ms;
 use crate::log;
-use crate::storage::{self, DB_FILE, RollupBatch, WriteOp};
+use crate::signing_key;
+use crate::storage::{self, DB_FILE, RollupBatch, Sealer, WriteOp};
 use crate::writer::WriterSender;
 
 /// The most minutes one batch covers (a day), so catching up after a long
@@ -142,11 +143,13 @@ pub fn spawn(
 pub fn finalize_settled(data_dir: &Path, now_ms: u64) -> rusqlite::Result<usize> {
     let rules = &TRACTION_RULES_1;
     let mut conn = storage::open(data_dir)?;
+    let loaded = signing_key::load_or_create(data_dir).map_err(storage::user_error)?;
+    let mut sealer = Sealer::open(&conn, loaded)?;
     let mut cursor = read_cursor(&conn, rules)?;
     let mut batches = 0;
     while let Some(batch) = finalize_range(&conn, rules, cursor, now_ms, rules.bucket_settle_ms)? {
         cursor = Some(batch.through_ms);
-        storage::apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(batch))])?;
+        storage::apply_batch_with(&mut conn, &[WriteOp::Rollup(Box::new(batch))], &mut sealer)?;
         batches += 1;
     }
     Ok(batches)
@@ -251,6 +254,8 @@ pub fn finalize_range(
     fold_baseline(rules, &mut baseline, &buckets);
     Ok(Some(RollupBatch {
         ruleset_id: rules.ruleset_id.to_owned(),
+        from_ms: from,
+        sealed_at_ms: now_ms,
         through_ms: to,
         buckets,
         rollups,
@@ -987,5 +992,409 @@ mod tests {
                 "{table} delete"
             );
         }
+    }
+
+    // ---- Step 3a: sealing in the rollup transaction ----
+
+    use traction_core::{
+        ChainError, ChainReport, DeviceSigningKey, PayloadPart, VerifyPolicy, canonical_json,
+        verify_chains,
+    };
+
+    const FAR: u64 = u64::MAX / 4;
+
+    trait Canon {
+        fn canon(&self) -> Vec<u8>;
+    }
+    impl<T: serde::Serialize> Canon for T {
+        fn canon(&self) -> Vec<u8> {
+            canonical_json(&serde_json::to_value(self).unwrap()).unwrap()
+        }
+    }
+
+    fn rich_minute(ts: u64) -> WriteOp {
+        WriteOp::Presence(PresenceMinute {
+            minute_start_ms: ts,
+            key_events: Some(40),
+            pointer_events: Some(10),
+            injected_events: Some(2),
+            active_subslots: Some(4),
+            cadence_entropy_milli: Some(2500),
+            category_sec: Some(traction_core::CategorySec {
+                ide: 30,
+                terminal: 20,
+                browser: 5,
+                ai_desktop: 0,
+                other: 5,
+            }),
+            category_switches: Some(3),
+            idle_sec: Some(0),
+            telemetry_tier: traction_core::TelemetryTier::Full,
+        })
+    }
+
+    fn verify(conn: &Connection) -> Result<ChainReport, ChainError> {
+        let stored = storage::load_chains(conn).unwrap();
+        let rows = storage::load_sealed_rows(conn, 0, FAR).unwrap();
+        verify_chains(&stored.chains, &rows, &VerifyPolicy::default())
+    }
+
+    fn key(seed: u8) -> DeviceSigningKey {
+        DeviceSigningKey::from_seed(zeroize::Zeroizing::new([seed; 32])).unwrap()
+    }
+
+    fn links(conn: &Connection) -> Vec<(i64, i64)> {
+        let mut stmt = conn
+            .prepare("SELECT seq, window_start_ms FROM chain_link ORDER BY window_start_ms")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Every distinct window holding a row, computed straight from SQL.
+    fn windows_with_rows(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT w FROM (
+                     SELECT window_start_ms AS w FROM activity_rollup
+                     UNION SELECT minute_start_ms / {w} * {w} FROM work_bucket
+                     UNION SELECT observed_ms / {w} * {w} FROM commit_observation
+                 ) ORDER BY w",
+                w = TRACTION_RULES_1.activity_rollup_ms
+            ))
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn cursor(conn: &Connection) -> Option<u64> {
+        read_cursor(conn, &TRACTION_RULES_1).unwrap()
+    }
+
+    #[test]
+    fn every_non_empty_window_is_sealed_once_and_the_chain_verifies() {
+        let (_dir, mut conn) = open();
+        let mut ops = vec![
+            event(1, T0, "PROMPT_SUBMIT", Some("p")),
+            event(2, T0 + 6 * MIN, "TURN_END", Some("p")),
+            WriteOp::Commit(CommitObservation {
+                project_id: "p".to_owned(),
+                commit_oid: "a".repeat(40),
+                observed_ms: T0 + 3 * MIN,
+            }),
+        ];
+        // A quiet gap: nothing at all between T0+8 min and T0+30 min.
+        ops.extend((0..8).map(|i| rich_minute(T0 + i * MIN)));
+        ops.extend((30..34).map(|i| rich_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+
+        finalize(&mut conn, None, T0 + 40 * MIN).unwrap();
+
+        let sealed: Vec<i64> = links(&conn).into_iter().map(|(_, w)| w).collect();
+        assert_eq!(sealed, windows_with_rows(&conn));
+        assert!(sealed.len() >= 6, "{sealed:?}");
+        let seqs: Vec<i64> = links(&conn).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(
+            seqs,
+            (0..i64::try_from(seqs.len()).unwrap()).collect::<Vec<_>>()
+        );
+        let report = verify(&conn).unwrap();
+        assert_eq!(report.chains.len(), 1);
+        assert!(report.key_discontinuities.is_empty());
+        assert_eq!(report.pending_rows_after_tip, 0);
+    }
+
+    #[test]
+    fn stored_rows_map_back_to_the_engines_exact_canonical_json() {
+        let (_dir, mut conn) = open();
+        let mut ops = vec![
+            event(1, T0, "PROMPT_SUBMIT", Some("p")),
+            event(2, T0 + 6 * MIN, "TURN_END", Some("p")),
+        ];
+        ops.extend((0..8).map(|i| rich_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+        let batch = finalize_range(&conn, &TRACTION_RULES_1, None, T0 + 40 * MIN + LAG, 120_000)
+            .unwrap()
+            .unwrap();
+        apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(batch.clone()))]).unwrap();
+
+        let rows = storage::load_sealed_rows(&conn, 0, FAR).unwrap();
+
+        let canon = |v: &dyn Canon| v.canon();
+        assert!(!batch.buckets.is_empty() && !batch.rollups.is_empty());
+        assert!(
+            batch
+                .rollups
+                .iter()
+                .any(|r| r.category_share_milli.ide > 0 && r.mean_cadence_entropy_milli.is_some())
+        );
+        assert_eq!(canon(&rows.work_buckets), canon(&batch.buckets));
+        assert_eq!(canon(&rows.rollups), canon(&batch.rollups));
+        assert_eq!(rows.work_buckets, batch.buckets);
+        assert_eq!(rows.rollups, batch.rollups);
+    }
+
+    #[test]
+    fn a_failed_seal_rolls_back_rows_links_and_cursor_together_and_the_retry_seals() {
+        let (_dir, mut conn) = open();
+        let mut ops = vec![
+            event(1, T0, "PROMPT_SUBMIT", Some("p")),
+            event(2, T0 + 6 * MIN, "TURN_END", Some("p")),
+        ];
+        ops.extend((0..8).map(|i| rich_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+        let batch = finalize_range(&conn, &TRACTION_RULES_1, None, T0 + 40 * MIN + LAG, 120_000)
+            .unwrap()
+            .unwrap();
+        let op = [WriteOp::Rollup(Box::new(batch))];
+        let mut sealer = storage::Sealer::open(&conn, key(3)).unwrap();
+        sealer.fail_after(Some(2));
+
+        let failed = storage::apply_batch_with(&mut conn, &op, &mut sealer);
+
+        assert!(failed.is_err());
+        assert_eq!(totals(&conn).0, 0, "no work bucket survives");
+        assert!(links(&conn).is_empty());
+        assert_eq!(cursor(&conn), None);
+        let rollups: i64 = conn
+            .query_row("SELECT count(*) FROM activity_rollup", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rollups, 0);
+
+        sealer.fail_after(None);
+        storage::apply_batch_with(&mut conn, &op, &mut sealer).unwrap();
+
+        assert_eq!(links(&conn).len(), windows_with_rows(&conn).len());
+        assert!(cursor(&conn).is_some());
+        verify(&conn).unwrap();
+    }
+
+    #[test]
+    fn a_clock_that_goes_back_never_refinalizes_and_marks_the_next_link() {
+        let (_dir, mut conn) = open();
+        // 26 hours of presence: the first batch is capped at one day.
+        let ops: Vec<WriteOp> = (0..26 * 60).map(|i| idle_minute(T0 + i * MIN)).collect();
+        apply_batch(&mut conn, &ops).unwrap();
+        let rules = &TRACTION_RULES_1;
+        let now = T0 + 27 * 60 * MIN + LAG;
+
+        let first = finalize_range(&conn, rules, None, now, 120_000)
+            .unwrap()
+            .unwrap();
+        let first_through = first.through_ms;
+        assert_eq!(first_through, T0 + 24 * 60 * MIN);
+        apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(first))]).unwrap();
+        let sealed_before = links(&conn).len();
+        assert!(links_regressed(&conn).is_empty());
+
+        // Ten minutes back: the rest of the data is still settled, nothing
+        // already finalized is touched, and the next link records the dip.
+        let second = finalize_range(&conn, rules, Some(first_through), now - 10 * MIN, 120_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.sealed_at_ms, now - 10 * MIN);
+        apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(second))]).unwrap();
+        let after_second = cursor(&conn).unwrap();
+        assert!(after_second > first_through);
+
+        // A clock far back settles nothing and moves nothing.
+        assert!(
+            finalize_range(&conn, rules, Some(after_second), T0 + LAG, 120_000)
+                .unwrap()
+                .is_none()
+        );
+        // Forward again: the quiet minutes settle, the cursor only moves
+        // forward, and no data means no new link.
+        let linked = links(&conn).len();
+        let third = finalize_range(&conn, rules, Some(after_second), now + 10 * MIN, 120_000)
+            .unwrap()
+            .unwrap();
+        assert!(third.buckets.is_empty() && third.rollups.is_empty());
+        apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(third))]).unwrap();
+        assert!(cursor(&conn).unwrap() > after_second);
+        assert_eq!(links(&conn).len(), linked);
+
+        assert!(links(&conn).len() > sealed_before);
+        assert_eq!(
+            links_regressed(&conn).len(),
+            1,
+            "only the first link after the dip"
+        );
+        let (sealed_at, tip_before): (i64, i64) = conn
+            .query_row(
+                "SELECT sealed_at_ms, (SELECT sealed_at_ms FROM chain_link p
+                                       WHERE p.seq = c.seq - 1)
+                 FROM chain_link c WHERE clock_regressed = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            sealed_at,
+            i64::try_from(now - 10 * MIN).unwrap(),
+            "stored unclamped"
+        );
+        assert!(sealed_at < tip_before);
+        let report = verify(&conn).unwrap();
+        assert_eq!(report.clock_regressions, 1);
+        assert_eq!(report.chains.len(), 1);
+    }
+
+    fn links_regressed(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT seq FROM chain_link WHERE clock_regressed = 1")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_conflicting_existing_row_is_detected_and_never_silently_resealed() {
+        let (_dir, mut conn) = open();
+        let mut ops = vec![
+            event(1, T0, "PROMPT_SUBMIT", Some("p")),
+            event(2, T0 + 6 * MIN, "TURN_END", Some("p")),
+        ];
+        ops.extend((0..8).map(|i| rich_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+        // A different Work Bucket for a minute about to be finalized.
+        conn.execute(
+            "INSERT INTO work_bucket
+                 (project_id, minute_start_ms, ruleset_id, agent_compute_sec,
+                  idle_autonomous_sec, human_active_sec, permission_wait_ms, commits_human,
+                  commits_agent, injected_hid_detected, auto_approver_suspected,
+                  telemetry_tier, tier_limited)
+             VALUES ('p', ?1, 'traction-rules/1', 7, 0, 0, 0, 0, 0, 0, 0, 'full', 0)",
+            [i64::try_from(T0 + 2 * MIN).unwrap()],
+        )
+        .unwrap();
+
+        finalize(&mut conn, None, T0 + 40 * MIN).unwrap();
+
+        match verify(&conn) {
+            Err(ChainError::PayloadHashMismatch {
+                part: PayloadPart::Project(project),
+                ..
+            }) => assert_eq!(project, "p"),
+            other => panic!("expected a Project mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_window_that_does_not_follow_the_tip_is_refused_not_forced() {
+        let (_dir, mut conn) = open();
+        let ops: Vec<WriteOp> = (0..8).map(|i| idle_minute(T0 + i * MIN)).collect();
+        apply_batch(&mut conn, &ops).unwrap();
+        finalize(&mut conn, None, T0 + 40 * MIN).unwrap();
+        let before = links(&conn);
+        let cursor_before = cursor(&conn);
+        let late = ActivityRollupFixture::at(T0 - 10 * MIN);
+
+        let stale = RollupBatch {
+            ruleset_id: "traction-rules/1".to_owned(),
+            from_ms: T0 - 10 * MIN,
+            sealed_at_ms: T0,
+            through_ms: T0 - 8 * MIN,
+            buckets: Vec::new(),
+            rollups: vec![late],
+            baseline: Vec::new(),
+        };
+        apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(stale))]).unwrap();
+
+        assert_eq!(links(&conn), before);
+        assert_eq!(cursor(&conn), cursor_before);
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM activity_rollup WHERE window_start_ms = ?1",
+                [i64::try_from(T0 - 10 * MIN).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "the refused window's rows are dropped too");
+    }
+
+    #[test]
+    fn a_lost_cursor_never_counts_sealed_minutes_into_the_baseline_twice() {
+        let (_dir, mut conn) = open();
+        let mut ops = vec![
+            event(1, T0, "PROMPT_SUBMIT", Some("p")),
+            event(2, T0 + 6 * MIN, "TURN_END", Some("p")),
+        ];
+        ops.extend((0..8).map(|i| rich_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+        finalize(&mut conn, None, T0 + 40 * MIN).unwrap();
+        let once = storage::load_baseline(&conn).unwrap();
+        assert!(!once.is_empty(), "the sealed minutes are in the baseline");
+        conn.execute("DELETE FROM rollup_cursor", []).unwrap();
+        // Newer data with no present minute, so it adds nothing itself.
+        let newer: Vec<WriteOp> = (90..98).map(|i| idle_minute(T0 + i * MIN)).collect();
+        apply_batch(&mut conn, &newer).unwrap();
+        let sealed = links(&conn).len();
+
+        finalize(&mut conn, None, T0 + 150 * MIN).unwrap();
+
+        assert!(links(&conn).len() > sealed, "a mixed batch");
+        assert_eq!(storage::load_baseline(&conn).unwrap(), once);
+    }
+
+    struct ActivityRollupFixture;
+    impl ActivityRollupFixture {
+        fn at(window: u64) -> traction_core::ActivityRollup {
+            traction_core::ActivityRollup {
+                window_start_ms: window,
+                ruleset_id: "traction-rules/1".to_owned(),
+                minutes_observed: 2,
+                category_share_milli: traction_core::CategoryShareMilli::default(),
+                switch_rate_milli: 0,
+                mean_cadence_entropy_milli: None,
+                injected_ratio_milli: None,
+                telemetry_tier: traction_core::TelemetryTier::Reduced,
+            }
+        }
+    }
+
+    #[test]
+    fn a_second_key_starts_a_linked_successor_chain_and_the_old_chain_is_untouched() {
+        let (_dir, mut conn) = open();
+        let ops: Vec<WriteOp> = (0..4).map(|i| idle_minute(T0 + i * MIN)).collect();
+        apply_batch(&mut conn, &ops).unwrap();
+        let cursor = finalize(&mut conn, None, T0 + 20 * MIN).unwrap();
+        let old = links(&conn);
+
+        // The old key file is gone: a new key opens on the same database.
+        let mut sealer = storage::Sealer::open(&conn, key(9)).unwrap();
+        let more: Vec<WriteOp> = (30..34).map(|i| idle_minute(T0 + i * MIN)).collect();
+        apply_batch(&mut conn, &more).unwrap();
+        let batch = finalize_range(
+            &conn,
+            &TRACTION_RULES_1,
+            Some(cursor),
+            T0 + 60 * MIN + LAG,
+            120_000,
+        )
+        .unwrap()
+        .unwrap();
+        storage::apply_batch_with(&mut conn, &[WriteOp::Rollup(Box::new(batch))], &mut sealer)
+            .unwrap();
+
+        assert_eq!(&links(&conn)[..old.len()], old.as_slice());
+        let report = verify(&conn).unwrap();
+        assert_eq!(report.chains.len(), 2);
+        assert_eq!(report.key_discontinuities.len(), 1);
+        assert!(report.key_discontinuities[0].linked);
+        let genesis: (i64,) = conn
+            .query_row(
+                "SELECT min(seq) FROM chain_link WHERE key_id = ?1",
+                [key(9).key_id().to_string()],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        assert_eq!(genesis.0, 0);
     }
 }

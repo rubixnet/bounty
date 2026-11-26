@@ -275,3 +275,73 @@ fn stored_events_cannot_be_updated_or_deleted() {
     assert_eq!(model_id, "optional-model-string");
     assert_eq!(stored_event_count(&db), 1);
 }
+
+#[test]
+fn migration_10_adds_append_only_chain_tables() {
+    let mut daemon = TestDaemon::start();
+    daemon.shutdown();
+    let db = Connection::open(daemon.data_dir().join(DB_FILE)).expect("read-write connection");
+
+    let link_columns: Vec<String> = columns(&db, "chain_link")
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+    assert_eq!(
+        link_columns,
+        [
+            "key_id",
+            "seq",
+            "window_start_ms",
+            "ruleset_id",
+            "prev_hash",
+            "payload_digest",
+            "entry_hash",
+            "sealed_at_ms",
+            "clock_regressed",
+            "payload_json",
+            "signature"
+        ]
+    );
+    let key_columns: Vec<String> = columns(&db, "chain_key")
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+    assert_eq!(key_columns, ["key_id", "public_key", "created_at_ms"]);
+
+    let (key_id, public_key): (String, String) = db
+        .query_row("SELECT key_id, public_key FROM chain_key", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("the daemon registered its key");
+    let insert = |seq: i64, window: i64, entry: &str| {
+        db.execute(
+            "INSERT INTO chain_link VALUES (?1, ?2, ?3, 'r', 'p', 'd', ?4, 1, 0, '{}', 's')",
+            rusqlite::params![key_id, seq, window, entry],
+        )
+    };
+    insert(0, 120_000, "a").expect("a link inserts");
+    assert!(insert(0, 240_000, "b").is_err(), "(key_id, seq) is unique");
+    assert!(
+        insert(1, 120_000, "c").is_err(),
+        "(window_start_ms, ruleset_id) is unique"
+    );
+    assert!(insert(1, 240_000, "a").is_err(), "entry_hash is unique");
+    assert!(
+        db.execute("UPDATE chain_link SET signature = 'x'", [])
+            .is_err()
+    );
+    assert!(db.execute("DELETE FROM chain_link", []).is_err());
+    assert!(
+        db.execute("UPDATE chain_key SET public_key = 'x'", [])
+            .is_err()
+    );
+    assert!(db.execute("DELETE FROM chain_key", []).is_err());
+    assert!(
+        db.execute(
+            "INSERT INTO chain_key VALUES ('other', ?1, 1)",
+            [&public_key]
+        )
+        .is_err(),
+        "a public key is registered once"
+    );
+}

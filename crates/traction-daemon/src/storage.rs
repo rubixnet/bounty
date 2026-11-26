@@ -9,6 +9,15 @@
 use crate::clock::now_ms_i64 as now_ms;
 use std::path::Path;
 
+mod chain_store;
+// `StoredChains`, `load_chains` and `load_sealed_rows` are the seam the tests
+// (and Slice 3's export) read the chain through.
+#[allow(unused_imports)]
+pub use chain_store::{
+    Sealer, StoredChains, VerifyDatabaseError, load_chains, load_sealed_rows, open_read_only,
+    user_error, verify_database, verify_database_with,
+};
+
 use rusqlite::{Connection, params};
 use traction_core::{
     ActivityRollup, BaselineDay, CommitObservation, EndReason, HarnessId, MutationKind,
@@ -48,6 +57,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_7,
     MIGRATION_8,
     MIGRATION_9,
+    MIGRATION_10,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -375,6 +385,47 @@ const MIGRATION_9: &str = "
     ) STRICT;
 ";
 
+/// Step 3a: the tamper-evident chain (`docs/protocol.md`).
+///
+/// - `chain_key`: every Device Signing Key's public key the daemon ever held,
+///   so a chain stays verifiable after its `signing.key` is gone.
+/// - `chain_link`: one signed Chain Link per sealed 120 s window, written in
+///   the same transaction as the window's rows and the `rollup_cursor`.
+///   Append-only like the tables it covers. `UNIQUE (window_start_ms,
+///   ruleset_id)` means a window is sealed at most once.
+const MIGRATION_10: &str = "
+    CREATE TABLE chain_key (
+        key_id        TEXT PRIMARY KEY NOT NULL,
+        public_key    TEXT NOT NULL UNIQUE,
+        created_at_ms INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE chain_link (
+        key_id          TEXT NOT NULL REFERENCES chain_key (key_id),
+        seq             INTEGER NOT NULL CHECK (seq >= 0),
+        window_start_ms INTEGER NOT NULL,
+        ruleset_id      TEXT NOT NULL,
+        prev_hash       TEXT NOT NULL,
+        payload_digest  TEXT NOT NULL,
+        entry_hash      TEXT NOT NULL UNIQUE,
+        sealed_at_ms    INTEGER NOT NULL,
+        clock_regressed INTEGER NOT NULL CHECK (clock_regressed IN (0, 1)),
+        payload_json    TEXT NOT NULL,
+        signature       TEXT NOT NULL,
+        PRIMARY KEY (key_id, seq),
+        UNIQUE (window_start_ms, ruleset_id)
+    ) STRICT;
+
+    CREATE TRIGGER chain_key_no_update BEFORE UPDATE ON chain_key
+    BEGIN SELECT RAISE(ABORT, 'chain_key is append-only'); END;
+    CREATE TRIGGER chain_key_no_delete BEFORE DELETE ON chain_key
+    BEGIN SELECT RAISE(ABORT, 'chain_key is append-only'); END;
+    CREATE TRIGGER chain_link_no_update BEFORE UPDATE ON chain_link
+    BEGIN SELECT RAISE(ABORT, 'chain_link is append-only'); END;
+    CREATE TRIGGER chain_link_no_delete BEFORE DELETE ON chain_link
+    BEGIN SELECT RAISE(ABORT, 'chain_link is append-only'); END;
+";
+
 /// The alias-aware events view (see [`MIGRATION_3`]).
 pub const PROJECT_EVENT_VIEW: &str = "project_event";
 
@@ -585,6 +636,11 @@ pub enum WriteOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollupBatch {
     pub ruleset_id: String,
+    /// The first finalized millisecond of the batch (a window boundary).
+    pub from_ms: u64,
+    /// The wall clock the finalizer read when it built the batch: stored,
+    /// unclamped, as each Chain Link's `sealed_at_ms`.
+    pub sealed_at_ms: u64,
     /// Every minute before this is finalized once the batch commits.
     pub through_ms: u64,
     pub buckets: Vec<WorkBucket>,
@@ -912,8 +968,23 @@ fn harness_by_name(name: &str) -> Option<HarnessId> {
     HarnessId::ALL.into_iter().find(|h| h.as_str() == name)
 }
 
-/// Applies a batch of writes in order, in one transaction.
+/// [`apply_batch_with`] under a fixed throwaway key (unit tests that do not
+/// care about the chain; every call continues the same chain).
+#[cfg(test)]
 pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<()> {
+    let key = traction_core::DeviceSigningKey::from_seed(zeroize::Zeroizing::new([3u8; 32]))
+        .expect("test key");
+    let mut sealer = Sealer::open(conn, key)?;
+    apply_batch_with(conn, ops, &mut sealer)
+}
+
+/// Applies a batch of writes in order, in one transaction. A finalized
+/// range is sealed in that same transaction (see [`Sealer`]).
+pub fn apply_batch_with(
+    conn: &mut Connection,
+    ops: &[WriteOp],
+    sealer: &mut Sealer,
+) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     for op in ops {
         match op {
@@ -953,7 +1024,7 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
             }
             WriteOp::Presence(minute) => insert_presence(&tx, minute)?,
             WriteOp::Commit(commit) => insert_commit(&tx, commit)?,
-            WriteOp::Rollup(batch) => insert_rollup(&tx, batch)?,
+            WriteOp::Rollup(batch) => insert_rollup(&tx, batch, sealer)?,
             WriteOp::HookRun(hook) => {
                 tx.prepare_cached(
                     "INSERT OR IGNORE INTO session_hook_run
@@ -1034,8 +1105,32 @@ fn to_i64(v: u64) -> i64 {
 }
 
 /// Rows are `INSERT OR IGNORE`: a finalized minute is never rewritten, so a
-/// replay after a crash between the write and the cursor is a no-op.
-fn insert_rollup(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()> {
+/// replay after a crash between the write and the cursor is a no-op. A range
+/// that reaches back to the chain tip (a lost cursor) is trimmed to what
+/// comes after it, and the cursor still moves past the whole range.
+fn insert_rollup(
+    conn: &Connection,
+    batch: &RollupBatch,
+    sealer: &mut Sealer,
+) -> rusqlite::Result<()> {
+    let trimmed = sealer.after_tip(conn, batch)?;
+    let unsealed = trimmed.as_ref().unwrap_or(batch);
+    insert_rollup_rows(conn, unsealed)?;
+    sealer.seal_batch(conn, unsealed)?;
+    advance_cursor(conn, batch)
+}
+
+fn advance_cursor(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO rollup_cursor (ruleset_id, finalized_through_ms) VALUES (?1, ?2)
+         ON CONFLICT (ruleset_id) DO UPDATE SET
+            finalized_through_ms = max(finalized_through_ms, excluded.finalized_through_ms)",
+    )?
+    .execute(params![batch.ruleset_id, to_i64(batch.through_ms)])?;
+    Ok(())
+}
+
+fn insert_rollup_rows(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()> {
     for b in &batch.buckets {
         conn.prepare_cached(
             "INSERT OR IGNORE INTO work_bucket
@@ -1091,12 +1186,6 @@ fn insert_rollup(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()>
             tier_str(r.telemetry_tier),
         ])?;
     }
-    conn.prepare_cached(
-        "INSERT INTO rollup_cursor (ruleset_id, finalized_through_ms) VALUES (?1, ?2)
-         ON CONFLICT (ruleset_id) DO UPDATE SET
-            finalized_through_ms = max(finalized_through_ms, excluded.finalized_through_ms)",
-    )?
-    .execute(params![batch.ruleset_id, to_i64(batch.through_ms)])?;
     Ok(())
 }
 

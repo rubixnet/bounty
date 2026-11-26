@@ -5,6 +5,7 @@
 //! and [`DaemonHandle`]. Everything else is internal.
 
 mod attribution;
+mod audit;
 mod bus;
 mod claude_code;
 mod clock;
@@ -22,11 +23,14 @@ mod http;
 mod install;
 mod lock;
 mod log;
+#[cfg(windows)]
+mod owner_only;
 mod paths;
 mod pause;
 mod presence;
 mod router;
 mod secret;
+mod signing_key;
 #[cfg(unix)]
 mod socket;
 mod storage;
@@ -35,6 +39,8 @@ mod token;
 mod watcher;
 mod writer;
 
+#[doc(hidden)]
+pub use audit::{ExportError, Outcome, export_bundle, run_export, run_verify};
 pub use bus::{EVENT_PATH, MAX_BODY_BYTES, PROJECT_PATH};
 pub use claude_code::config_dir::{CLAUDE_CONFIG_DIR_ENV, claude_config_dir};
 pub use claude_code::hook::{HOOK_PATH as CLAUDE_CODE_HOOK_PATH, MAX_HOOK_BODY_BYTES};
@@ -59,5 +65,8 @@ pub use lock::LOCK_FILE;
 pub use presence::{DEFAULT_SUBSLOT, PresenceSettings};
 pub use router::RESOLUTION_TTL;
 pub use secret::DEVICE_SECRET_FILE;
+pub use signing_key::{SIGNING_KEY_FILE, SIGNING_PUB_FILE};
 pub use storage::{DB_FILE, PROJECT_EVENT_VIEW};
+#[doc(hidden)]
+pub use storage::{VerifyDatabaseError, verify_database, verify_database_with};
 pub use token::TOKEN_FILE;

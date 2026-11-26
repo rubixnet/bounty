@@ -101,12 +101,64 @@ fn canary_text_never_reaches_the_derived_tables() {
     assert!(batches > 0, "nothing was finalized");
 
     let db = daemon.live_db();
-    for table in ["presence_minute", "commit_observation", "work_bucket"] {
+    for table in [
+        "presence_minute",
+        "commit_observation",
+        "work_bucket",
+        "chain_key",
+        "chain_link",
+    ] {
         assert!(count(&db, table) > 0, "{table} was not populated");
     }
+    let project = common::registered_projects(&db)[0].project_id.clone();
     drop(db);
+
+    // The Audit Bundle for the canary Project, exported from the sealed chain.
+    let bundle_path = daemon.data_dir().join("canary.traction-bundle.json");
+    traction_daemon::export_bundle(daemon.data_dir(), &project, &bundle_path, now).unwrap();
+    let bundle = std::fs::read(&bundle_path).unwrap();
+    assert!(!bundle.is_empty());
+    let chain_text = chain_tables_text(daemon.data_dir());
+    let public_key_file =
+        std::fs::read(daemon.data_dir().join(traction_daemon::SIGNING_PUB_FILE)).unwrap();
+
     let bytes = data_folder_bytes(daemon.data_dir());
     for canary in [PROMPT, FILE_STEM, FILE_BODY, COMMIT_MSG] {
         assert!(!has(&bytes, canary), "{canary} reached the data folder");
+        assert!(
+            !chain_text.contains(canary),
+            "{canary} reached chain_link or chain_key"
+        );
+        assert!(!has(&public_key_file, canary), "{canary} is in signing.pub");
+        assert!(!has(&bundle, canary), "{canary} is in the Audit Bundle");
     }
+    // The bundle names no path: not the Project Root, not the data folder.
+    for path in [
+        path_str(&repo).to_owned(),
+        path_str(daemon.data_dir()).to_owned(),
+    ] {
+        assert!(!has(&bundle, &path), "{path} is in the Audit Bundle");
+    }
+}
+
+/// Every column of every `chain_link` and `chain_key` row, as one text.
+fn chain_tables_text(data_dir: &std::path::Path) -> String {
+    let db = common::open_db_read_only(data_dir);
+    let mut text = String::new();
+    for (table, columns) in [
+        ("chain_key", "key_id || public_key || created_at_ms"),
+        (
+            "chain_link",
+            "key_id || seq || window_start_ms || ruleset_id || prev_hash || payload_digest \
+             || entry_hash || sealed_at_ms || clock_regressed || payload_json || signature",
+        ),
+    ] {
+        let mut stmt = db
+            .prepare(&format!("SELECT {columns} FROM {table}"))
+            .unwrap();
+        for row in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            text.push_str(&row.unwrap());
+        }
+    }
+    text
 }

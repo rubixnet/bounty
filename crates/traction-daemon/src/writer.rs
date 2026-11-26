@@ -29,7 +29,7 @@ use rusqlite::Connection;
 
 use crate::config::WriterSettings;
 use crate::log;
-use crate::storage::{self, WriteOp};
+use crate::storage::{self, Sealer, WriteOp};
 
 /// The producer side of the channel (the Project Router). Cheap to clone.
 #[derive(Clone)]
@@ -71,11 +71,13 @@ impl WriterThread {
 pub fn spawn(
     conn: Connection,
     settings: WriterSettings,
+    sealer: Sealer,
 ) -> io::Result<(WriterSender, WriterThread)> {
     let (sender, receiver) = mpsc::sync_channel(settings.queue_capacity.max(1));
     let stopping = Arc::new(AtomicBool::new(false));
     let writer = Writer {
         conn,
+        sealer,
         receiver,
         commit_interval: settings.commit_interval,
         max_batch: settings.max_batch.max(1),
@@ -92,6 +94,8 @@ pub fn spawn(
 
 struct Writer {
     conn: Connection,
+    /// The only holder of the Device Signing Key.
+    sealer: Sealer,
     receiver: Receiver<WriteOp>,
     commit_interval: Duration,
     max_batch: usize,
@@ -152,7 +156,7 @@ impl Writer {
             self.deadline = None;
             return;
         }
-        match storage::apply_batch(&mut self.conn, &self.batch) {
+        match storage::apply_batch_with(&mut self.conn, &self.batch, &mut self.sealer) {
             Ok(()) => {
                 self.batch.clear();
                 self.batch_events = 0;
@@ -170,7 +174,8 @@ impl Writer {
     fn finish(mut self) {
         self.batch.extend(self.receiver.try_iter());
         if !self.batch.is_empty()
-            && let Err(error) = storage::apply_batch(&mut self.conn, &self.batch)
+            && let Err(error) =
+                storage::apply_batch_with(&mut self.conn, &self.batch, &mut self.sealer)
         {
             log::error(
                 "failed to commit writes at shutdown, they were dropped",

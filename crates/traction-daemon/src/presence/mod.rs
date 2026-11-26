@@ -322,12 +322,18 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let writer_conn = storage::open(dir.path()).unwrap();
+        let sealer = storage::Sealer::open(
+            &writer_conn,
+            traction_core::DeviceSigningKey::from_seed(zeroize::Zeroizing::new([3u8; 32])).unwrap(),
+        )
+        .unwrap();
         let (sender, thread) = writer::spawn(
             writer_conn,
             WriterSettings {
                 commit_interval: Duration::from_millis(20),
                 ..WriterSettings::default()
             },
+            sealer,
         )
         .unwrap();
         let reader = Connection::open(dir.path().join(storage::DB_FILE)).unwrap();

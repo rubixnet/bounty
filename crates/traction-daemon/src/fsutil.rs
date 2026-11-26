@@ -17,7 +17,33 @@ pub fn write_atomically(dir: &Path, name: &str, contents: &[u8]) -> io::Result<(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    write_through_temp(&dir.join(name), contents, &options, None)
+    write_through_temp(&dir.join(name), contents, &options, None, &create_new)
+}
+
+/// [`write_atomically`] for a secret that must be readable by the owner and
+/// nobody else: mode `0600` on Unix, and on Windows a protected DACL holding
+/// one full-control ACE for the current user (no inherited ACEs), set when the
+/// temp file is created so it is never briefly open to anyone else.
+pub fn write_owner_only(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        write_through_temp(
+            &dir.join(name),
+            contents,
+            &OpenOptions::new(),
+            None,
+            &|_, path| crate::owner_only::create_new(path),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        write_atomically(dir, name, contents)
+    }
+}
+
+/// A fresh file at `path`, failing if it exists.
+fn create_new(options: &OpenOptions, path: &Path) -> io::Result<fs::File> {
+    options.clone().write(true).create_new(true).open(path)
 }
 
 /// Writes `contents` to a user's file at `path` (a settings file, a command
@@ -32,17 +58,24 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         fs::create_dir_all(dir)?;
     }
     let permissions = fs::metadata(&target).ok().map(|meta| meta.permissions());
-    write_through_temp(&target, contents, &OpenOptions::new(), permissions)
+    write_through_temp(
+        &target,
+        contents,
+        &OpenOptions::new(),
+        permissions,
+        &create_new,
+    )
 }
 
 /// The shared write: a fresh temp file next to `path`, opened with
-/// `options` (plus write and create-new), given `permissions` if any,
+/// `options` (plus write and create-new, unless `create` does it differently), given `permissions` if any,
 /// synced, then renamed over `path`. The temp file is removed on failure.
 fn write_through_temp(
     path: &Path,
     contents: &[u8],
     options: &OpenOptions,
     permissions: Option<Permissions>,
+    create: &dyn Fn(&OpenOptions, &Path) -> io::Result<fs::File>,
 ) -> io::Result<()> {
     let name = path
         .file_name()
@@ -52,7 +85,7 @@ fn write_through_temp(
     let temp = path.with_file_name(temp_name);
     let _ = fs::remove_file(&temp);
     let result = (|| {
-        let mut file = options.clone().write(true).create_new(true).open(&temp)?;
+        let mut file = create(options, &temp)?;
         file.write_all(contents)?;
         if let Some(permissions) = permissions {
             file.set_permissions(permissions)?;
