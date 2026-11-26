@@ -43,7 +43,8 @@ pub const WINDOW_CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// crashed, `kill -9`ed or unterminated turn or tool call then stops
 /// turning the user's hand edits into Agent Compute. Any event of the
 /// session counts as activity; closed windows are unaffected.
-pub const STALE_TURN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const STALE_TURN_TIMEOUT: Duration =
+    Duration::from_millis(traction_core::TRACTION_RULES_1.stale_turn_timeout_ms);
 /// Clock-skew tolerance of the hook-coverage rule (`docs/protocol.md`,
 /// "Hook coverage"): hook timestamps are the daemon's receive times,
 /// transcript timestamps are Claude Code's own write times, so a tailed
@@ -82,6 +83,12 @@ pub struct DaemonConfig {
     pub git_program: PathBuf,
     /// File watcher tuning.
     pub watcher: WatcherSettings,
+    /// Presence sensor tuning.
+    pub presence: crate::presence::PresenceSettings,
+    /// Commit observer tuning.
+    pub commits: crate::commits::CommitSettings,
+    /// Finalizer tuning.
+    pub finalizer: crate::finalizer::FinalizerSettings,
     /// Claude Code's config folder, whose `projects/` the transcript tailer
     /// watches. Default: [`crate::claude_code::config_dir::claude_config_dir`]
     /// (the installer's rule). `None` turns the tailer off. Tests point it at a
@@ -110,6 +117,9 @@ impl DaemonConfig {
             home_dir: home,
             git_program: PathBuf::from(DEFAULT_GIT_PROGRAM),
             watcher: WatcherSettings::default(),
+            presence: crate::presence::PresenceSettings::default(),
+            commits: crate::commits::CommitSettings::default(),
+            finalizer: crate::finalizer::FinalizerSettings::default(),
         }
     }
 

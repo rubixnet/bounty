@@ -93,7 +93,7 @@
 
 ### Build
 1. **Cross-Platform OS Presence & HID Module (`traction-daemon`):**
-   - Active foreground window category (`ide`, `terminal`, `browser_localhost_devtools`, `docs`, `other_non_project`—never store raw private window titles outside project domains) + OS idle timer (`GetLastInputInfo` on Windows, `CGEventSourceSecondsSinceLastEventType` on macOS, X11 + graceful Wayland degradation on Linux without crashing).
+   - Active foreground App Category from a closed list (`ide`, `terminal`, `browser`, `ai_desktop`, `other`; resolved in memory from a compiled-in table, never storing a window title, URL or raw application identifier) + OS idle timer (`GetLastInputInfo` on Windows, `CGEventSourceSecondsSinceLastEventType` on macOS, X11 + graceful Wayland degradation on Linux without crashing).
    - Hardware input injection detection (`LLKHF_INJECTED` / `LLMHF_INJECTED` on Windows, synthetic `CGEventSource` checks on macOS) and inter-event cadence entropy (detecting robotic mouse jigglers / macros).
 2. **Three-Clock 60-Second Bucket Aggregator (`traction-core` + `traction-daemon`):**
    - Compute `human_active_sec`, `agent_compute_sec`, and `idle_autonomous_sec` per 60-second bucket.
@@ -101,13 +101,18 @@
    - Ensure `STOP_FAILURE` and `SESSION_END` immediately terminate open agent compute intervals so stuck timers never leak hours.
 3. **Deterministic Local Struggle Signals (`traction-core` — Zero LLM, Zero PII):**
    - **Prompt Specificity:** Repo symbol/filename index overlap, stack-trace detection, and prompt-to-diff ratio (computed in memory before raw text is discarded).
-   - **Verification & Friction Loops:** Correlate `TOOL_FAIL` (`PostToolUseFailure`), optional lightweight shell hook (command category + exit code only—never flags or env vars), and shadow file diff churn/reverts.
+   - **Verification & Friction Loops:** Correlate `TOOL_FAIL` (`PostToolUseFailure`), optional lightweight shell hook (command category + exit code only—never flags or env vars), and shadow file diff churn/reverts. *(The shell hook is deferred: Step 2 ships without it, and a revert is approximated by Manual Work right after Harness churn because the watcher never reads contents.)*
    - **Personal Comfort-Zone Delta:** Maintain a local rolling 30-day per-user baseline so beginners going 0→1 earn full credit while repetitive boilerplate grinding decays smoothly.
 
+> **Deferrals recorded 2026-11-26:** Step 1 was signed off on Step 1c (Claude Code) alone. Sub-steps 1d (OpenCode plugin and Codex rollout tailer) and 1e (tray, auto-start, idle RSS/CPU) follow Step 2; their Step 1 Exit Gate items stay open and must pass before Step 3. Step 2 is Harness-agnostic and tested with Claude Code-shaped events.
+
 ### Exit Gate (Must Pass Before Step 3)
-- [ ] Automated simulation test: prompting an agent and staying idle for 10 minutes logs `10m Agent Compute / 0m Human Active`.
-- [ ] Automated simulation test: active error → edit → test-fail → edit → test-pass cycle scores high `verified_struggle` regardless of beginner vs. advanced code size.
-- [ ] Synthetic HID / robotic cadence fixture sets `injected_hid_detected = true` and routes minutes to `idle_autonomous_sec`.
+- [x] Automated simulation test: prompting an agent and staying idle for 10 minutes logs `10m Agent Compute / 0m Human Active`. (`traction-core` `tests/rollup.rs::gate_simulation_ten_idle_minutes_is_all_agent_and_mostly_unverified`; daemon `finalizer::tests::the_gate_simulation_is_finalized_once_the_minutes_settle`.)
+- [x] Automated simulation test: active error → edit → test-fail → edit → test-pass cycle scores high `verified_struggle` regardless of beginner vs. advanced code size. (`tests/struggle.rs::a_fail_edit_fail_edit_pass_loop_scores_high_and_size_is_ignored`.)
+- [x] Synthetic HID / robotic cadence fixture sets `injected_hid_detected = true` and routes minutes to `idle_autonomous_sec`. (`tests/rollup.rs::injected_ratio_flags_the_minute_and_it_earns_nothing`, `::robotic_cadence_flags_the_minute`.)
+- [x] Property test: summed across every Project and clock rule, credited time never exceeds elapsed wall-clock time, including floods of events at one timestamp. (`tests/credit_properties.rs::credited_time_never_exceeds_elapsed_wall_clock`, `::any_arrival_order_gives_byte_identical_output`, `::a_flood_at_one_timestamp_cannot_mint_time`.)
+- [x] Deterministic persona red-team simulator: the honest debugger earns real credit; the 59 s key-tapper, trivial-prompt spammer and Steer-style rhythm faker earn negligible credit, on `full`, `reduced` and `idle_only` tiers. (`tests/personas.rs`, marks in `PERSONA_MARKS_1`.)
+- [ ] All of the above green on Windows, macOS and Linux in CI (the first 3-OS run is the human's sign-off step; see `.scratch/step-2/issues/04-anti-spoof-suite-and-step-2-gate.md`).
 
 ---
 

@@ -46,10 +46,11 @@
 //! with unread bytes makes the kernel reset the connection, and a reset can
 //! destroy the reply before the caller reads it (always on Windows).
 
+use crate::clock::now_ms;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Incoming};
@@ -65,6 +66,7 @@ use crate::claude_code::tailer::TranscriptHints;
 use crate::log;
 use crate::router::{Pause, RouterSender};
 use crate::storage::EventRow;
+use crate::symbol_index::SymbolIndexes;
 use crate::token::BusToken;
 
 pub const EVENT_PATH: &str = "/v1/event";
@@ -94,6 +96,8 @@ pub struct Bus {
     dropped_hooks: AtomicU64,
     /// Where hook-reported `transcript_path`s go (absent without a tailer).
     transcript_hints: Option<TranscriptHints>,
+    /// File-name indexes, for a hook prompt's `repo_symbol_hits`.
+    symbols: SymbolIndexes,
 }
 
 /// Which listener a request arrived on. Only loopback HTTP checks `Host`: a
@@ -164,7 +168,15 @@ impl Bus {
             port,
             dropped_hooks: AtomicU64::new(0),
             transcript_hints: None,
+            symbols: SymbolIndexes::default(),
         }
+    }
+
+    /// Matches hook prompts against these file-name indexes.
+    #[must_use]
+    pub fn with_symbols(mut self, symbols: SymbolIndexes) -> Self {
+        self.symbols = symbols;
+        self
     }
 
     /// Sends every hook-reported `transcript_path` to the transcript tailer.
@@ -238,7 +250,7 @@ impl Bus {
         }
         if path == HOOK_PATH {
             let body = read_capped_body(body, read, MAX_HOOK_BODY_BYTES).await?;
-            let mapped = hook::map_hook(&body, now_ms());
+            let mapped = hook::map_hook(&body, now_ms(), &self.symbols);
             drop(body);
             if let (Some(path), Some(hints)) = (mapped.transcript_path, &self.transcript_hints) {
                 hints.hint(path);
@@ -473,12 +485,6 @@ fn registration_path(path: impl AsRef<Path>) -> Option<PathBuf> {
     let text = path.to_str()?;
     (path.is_absolute() && text.len() <= MAX_CWD_LEN && !text.chars().any(char::is_control))
         .then(|| path.to_path_buf())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// `200 {"project_id":"<id>"}`. The ID is daemon-derived (`git:`/`dir:`

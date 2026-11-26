@@ -46,7 +46,7 @@ use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
 use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher as _};
 use traction_core::{
     AttributionSource, EventType, MetricsOnly, MutationKind, NetworkClass, SCHEMA_VERSION,
-    TractionEvent,
+    TRACTION_RULES_1, TractionEvent,
 };
 
 use crate::config::WatcherSettings;
@@ -55,6 +55,7 @@ use crate::exclusions::{DEPENDENCY_FOLDERS, Exclusions};
 use crate::log;
 use crate::paths::{self, is_within, name_matches};
 use crate::router::{RegisteredProject, RouterSender};
+use crate::symbol_index::SymbolIndexes;
 
 /// Per-folder ignore files, highest precedence first.
 pub const IGNORE_FILES: [&str; 2] = [".tractionignore", ".gitignore"];
@@ -79,6 +80,8 @@ struct WatchTable {
     roots: Vec<WatchedRoot>,
     exclusions: Exclusions,
     ignores: IgnoreCache,
+    /// File-name indexes the watcher feeds (`repo_symbol_hits`).
+    symbols: Option<SymbolIndexes>,
     limit_logged: bool,
     missing_logged: bool,
     failure_logged: bool,
@@ -135,6 +138,7 @@ impl Watches {
             roots: Vec::new(),
             exclusions,
             ignores: IgnoreCache::default(),
+            symbols: None,
             limit_logged: false,
             missing_logged: false,
             failure_logged: false,
@@ -143,6 +147,13 @@ impl Watches {
             Self(Arc::new(Mutex::new(table))),
             Notifications { rx, tx, queued },
         )
+    }
+
+    /// Feeds `symbols` with the file names of every watched Project: a
+    /// bounded names-only walk when a Project is attached, then each
+    /// reported mutation. Set before the first [`Watches::attach`].
+    pub fn set_symbol_index(&self, symbols: SymbolIndexes) {
+        self.lock().symbols = Some(symbols);
     }
 
     /// Starts watching `project`. A root already watched for another
@@ -254,6 +265,7 @@ impl WatchTable {
             known: std::collections::HashSet::new(),
         };
         self.watch_root(&mut watched);
+        self.seed_symbols(&watched.root);
         self.roots.push(watched);
         if let Some(index) = replaced {
             self.detach_at(index);
@@ -361,6 +373,43 @@ impl WatchTable {
                     && !self.is_filtered(&watched.root, &path, false)
                 {
                     found.push(path);
+                }
+            }
+        }
+    }
+
+    /// Fills the Project's file-name index with a breadth-first, names-only
+    /// walk (no file is opened) that skips everything the watcher filters
+    /// and stops when the index is full or the visit budget is spent.
+    fn seed_symbols(&mut self, root: &Path) {
+        let Some(symbols) = self.symbols.clone() else {
+            return;
+        };
+        let mut budget = TRACTION_RULES_1.index_max_entries as usize
+            * TRACTION_RULES_1.index_seed_visit_factor as usize;
+        let mut queue = VecDeque::from([root.to_path_buf()]);
+        while let Some(folder) = queue.pop_front() {
+            let Ok(entries) = fs::read_dir(&folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if budget == 0 {
+                    return;
+                }
+                budget -= 1;
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                let is_dir = kind.is_dir();
+                if self.is_filtered(root, &path, is_dir) {
+                    continue;
+                }
+                if !symbols.note(root, &path) {
+                    return;
+                }
+                if is_dir {
+                    queue.push_back(path);
                 }
             }
         }
@@ -741,6 +790,11 @@ impl Worker {
                 };
                 if table.is_filtered(&root, &path, false) {
                     continue;
+                }
+                if kind != MutationKind::Removed
+                    && let Some(symbols) = &table.symbols
+                {
+                    symbols.note(&root, &path);
                 }
                 let project_id = table.roots[index].project_id.clone();
                 observations.push((path, project_id, root, kind));

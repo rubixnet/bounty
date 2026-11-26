@@ -135,6 +135,14 @@ impl TestDaemon {
         self.caller().via_socket(self.socket_path())
     }
 
+    /// Waits until the commit observer has a baseline for `count` worktrees.
+    pub fn await_commit_baselines(&self, count: usize) {
+        let handle = self.handle.as_ref().expect("daemon is running");
+        poll_until(Duration::from_secs(30), "the commit baselines", || {
+            (handle.commit_baselined_worktrees() >= count).then_some(())
+        });
+    }
+
     /// Graceful shutdown: flushes pending events, then stops. Idempotent.
     pub fn shutdown(&mut self) {
         if let Some(handle) = self.handle.take() {
@@ -745,4 +753,4 @@ pub fn assert_no_file_contains(data_dir: &Path, needle: &str) -> Vec<String> {
 /// The daemon's current SQLite `user_version` (the number of migrations in
 /// `storage::MIGRATIONS`). Bump it here, once, when a migration is appended.
 #[allow(dead_code)]
-pub const LATEST_SCHEMA_VERSION: i64 = 6;
+pub const LATEST_SCHEMA_VERSION: i64 = 9;

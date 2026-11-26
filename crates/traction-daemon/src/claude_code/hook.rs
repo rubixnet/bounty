@@ -21,6 +21,7 @@ use traction_core::{
 use super::pause::Command;
 use crate::content_metrics::{self, TextMetrics};
 use crate::event_id::fresh_event_id;
+use crate::symbol_index::SymbolIndexes;
 
 /// The bus route Claude Code's HTTP hooks post to.
 pub const HOOK_PATH: &str = "/v1/hooks/claude-code";
@@ -131,7 +132,7 @@ pub(crate) fn is_task_notification(text: &str) -> bool {
 
 /// A prompt as the daemon keeps it: its metrics, the Session Pause command
 /// it is exactly, if any, and whether it is a task notification. The text itself is dropped in parsing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Prompt {
     metrics: TextMetrics,
     command: Option<Command>,
@@ -188,7 +189,7 @@ fn measured<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Prompt>
 
 /// Maps one raw hook body, received at `received_ms`, to what the daemon
 /// does with it. Never fails: anything unusable is [`HookAction::Nothing`].
-pub fn map_hook(body: &[u8], received_ms: u64) -> Mapped {
+pub fn map_hook(body: &[u8], received_ms: u64, symbols: &SymbolIndexes) -> Mapped {
     let Ok(mut payload) = serde_json::from_slice::<Payload>(body) else {
         return Mapped {
             action: HookAction::Nothing,
@@ -201,12 +202,12 @@ pub fn map_hook(body: &[u8], received_ms: u64) -> Mapped {
         .filter(|path| !path.is_empty() && path.len() <= MAX_TRANSCRIPT_PATH_BYTES)
         .map(PathBuf::from);
     Mapped {
-        action: map_payload(payload, received_ms),
+        action: map_payload(payload, received_ms, symbols),
         transcript_path,
     }
 }
 
-fn map_payload(payload: Payload, received_ms: u64) -> HookAction {
+fn map_payload(payload: Payload, received_ms: u64, symbols: &SymbolIndexes) -> HookAction {
     let Some(hook) = Hook::from_name(&payload.hook_event_name) else {
         return HookAction::Nothing;
     };
@@ -234,11 +235,19 @@ fn map_payload(payload: Payload, received_ms: u64) -> HookAction {
         _ => payload.cwd,
     };
     let prompt = payload.prompt.filter(|_| hook == Hook::UserPromptSubmit);
-    if prompt.is_some_and(|prompt| prompt.is_task_notification) {
+    if prompt
+        .as_ref()
+        .is_some_and(|prompt| prompt.is_task_notification)
+    {
         return HookAction::Nothing;
     }
-    let command = prompt.and_then(|prompt| prompt.command);
+    let command = prompt.as_ref().and_then(|prompt| prompt.command);
     let prompt = prompt.map(|prompt| prompt.metrics);
+    // Matched against the Project's file-name index here, then the words
+    // are dropped with the metrics: only the count is kept.
+    let repo_symbol_hits = prompt
+        .as_ref()
+        .and_then(|m| symbols.hits_at(cwd.as_deref(), &m.candidates));
     let tool_name = payload
         .tool_name
         .filter(|_| hook.is_tool_hook())
@@ -263,8 +272,9 @@ fn map_payload(payload: Payload, received_ms: u64) -> HookAction {
         network_class: NetworkClass::CloudApi,
         attribution_source: AttributionSource::HarnessHook,
         metrics_only: MetricsOnly {
-            prompt_char_len: prompt.map(|m| m.prompt_char_len),
-            has_stacktrace: prompt.map(|m| m.has_stacktrace),
+            prompt_char_len: prompt.as_ref().map(|m| m.prompt_char_len),
+            repo_symbol_hits,
+            has_stacktrace: prompt.as_ref().map(|m| m.has_stacktrace),
             tool_name,
             ..MetricsOnly::default()
         },
@@ -307,7 +317,7 @@ mod tests {
             let body = format!(
                 r#"{{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"{prompt}"}}"#
             );
-            let action = map_hook(body.as_bytes(), 1).action;
+            let action = map_hook(body.as_bytes(), 1, &SymbolIndexes::default()).action;
             assert_eq!(action == HookAction::Nothing, ignored, "{prompt}");
         }
     }

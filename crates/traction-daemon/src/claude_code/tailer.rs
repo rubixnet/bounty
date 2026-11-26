@@ -35,6 +35,7 @@
 //! deleting them while they are read. Transcript text never reaches a log
 //! line, and paths only reach SQLite as `transcript_offset.path`.
 
+use crate::clock::now_ms_i64 as now_ms;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -43,13 +44,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::transcript::{self, Line, LineError, ToolNames};
 use crate::log;
 use crate::paths;
 use crate::router::{RouterSender, TailedItem};
 use crate::storage::{TailerStartRow, TailerState, TranscriptOffset};
+use crate::symbol_index::SymbolIndexes;
 use notify::event::EventKind;
 use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher as _};
 
@@ -148,6 +149,7 @@ pub fn start(
     claude_dir: &Path,
     state: TailerState,
     router: RouterSender,
+    symbols: SymbolIndexes,
 ) -> io::Result<TailerThread> {
     let (tx, rx) = mpsc::channel();
     let queued = Arc::new(AtomicUsize::new(0));
@@ -161,6 +163,7 @@ pub fn start(
         projects_watched: false,
         ancestor_watched: None,
         router,
+        symbols,
         files: HashMap::new(),
         announced: HashSet::new(),
         queued,
@@ -225,6 +228,8 @@ fn start_backend(
 }
 
 struct Worker {
+    /// File-name indexes, for `repo_symbol_hits`.
+    symbols: SymbolIndexes,
     /// Canonical Claude config folder.
     claude_dir: PathBuf,
     /// `<claude_dir>/projects`.
@@ -500,7 +505,7 @@ impl Worker {
         if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
-        match transcript::map_line(line, tools) {
+        match transcript::map_line(line, tools, &self.symbols) {
             Ok(None) => {}
             Ok(Some(Line::Pause(pause))) => pending.push(TailedItem::Pause(pause)),
             Ok(Some(Line::Events(mapped))) => {
@@ -593,12 +598,6 @@ fn offset_row(key: &str, identity: &str, offset: u64) -> TranscriptOffset {
         offset: i64::try_from(offset).unwrap_or(i64::MAX),
         updated_ms: now_ms(),
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Opens a transcript for reading without blocking its writer, with its

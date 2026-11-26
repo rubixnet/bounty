@@ -27,12 +27,18 @@ getrandom = { version = "0.4.3", default-features = false }
 subtle = { version = "2.6.1", default-features = false }
 # Core: SHA-256 for Project IDs (and, from Step 3, the hash-chain).
 sha2 = { version = "0.11.1", default-features = false }
+# Core dev-only: the credit-cap property suite (traction-core tests).
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 # Windows-only: the single-instance named mutex (traction-daemon `lock.rs`).
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse"] }
 # Daemon: the file watcher (OS backends only, no polling) and its
 # ignore-file matcher (gitignore semantics).
 notify = { version = "9.0.0", default-features = false, features = ["macos_fsevent"] }
 ignore = { version = "0.4.35", default-features = false }
 # macOS-only: raising the soft open-file limit for FSEvents (watcher.rs).
 libc = { version = "0.2.191", default-features = false }
+# macOS-only: the foreground application's bundle ID (presence backend).
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication"] }
+# Linux-only: X11 presence backend (pure-Rust protocol, no libX11).
+x11rb = { version = "0.14.0", default-features = false, features = ["xinput", "screensaver"] }
 tempfile = { version = "3.27.0", default-features = false }

@@ -33,12 +33,13 @@
 //! copy of the registry and sessions, loaded from SQLite at startup and
 //! updated as it queues writes, and never reads SQLite afterwards.
 
+use crate::clock::now_ms_i64 as now_ms;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::oneshot;
 use traction_core::{
@@ -97,6 +98,9 @@ pub struct RegisteredProject {
 /// registered Project and for every `dir:` Project merged by a migration
 /// (`merged_into` set). The file watcher attaches here.
 pub type ProjectHook = Box<dyn FnMut(&RegisteredProject) + Send>;
+
+/// See [`Router::set_folder_hook`]; runs on the Router thread.
+pub type FolderHook = Box<dyn FnMut(&str, &Path) + Send>;
 
 /// Why `/v1/project` refused a path (answered as `422`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +174,9 @@ pub struct Router {
     /// Which spans of each session its hooks covered (this run and earlier).
     coverage: HookCoverage,
     hooks: Vec<ProjectHook>,
+    /// Told `(project_id, folder)` whenever a folder of a Git Project is
+    /// freshly resolved (the commit observer learns linked worktrees here).
+    folder_hook: Option<FolderHook>,
     /// In-memory attribution windows (never persisted).
     windows: Attribution,
     writer_gone_logged: bool,
@@ -239,6 +246,7 @@ impl Router {
             pauses: Pauses::new(pauses),
             coverage,
             hooks: Vec::new(),
+            folder_hook: None,
             windows: Attribution::new(&WatcherSettings::default()),
             writer_gone_logged: false,
         };
@@ -261,6 +269,12 @@ impl Router {
     /// Adds a hook told about every Project registered from now on.
     pub fn add_project_hook(&mut self, hook: ProjectHook) {
         self.hooks.push(hook);
+    }
+
+    /// Sets the hook told about every freshly resolved folder of a Git
+    /// Project.
+    pub fn set_folder_hook(&mut self, hook: FolderHook) {
+        self.folder_hook = Some(hook);
     }
 
     /// Every registered (non-merged) Project, including those loaded at
@@ -425,6 +439,11 @@ impl Router {
             return entry.resolution.clone();
         }
         let resolution = self.resolve_uncached(folder);
+        if let (Some(found), Some(hook)) = (&resolution, &mut self.folder_hook)
+            && found.kind == ProjectKind::Git
+        {
+            hook(&found.project_id, folder);
+        }
         if self.cache.len() >= CACHE_CAPACITY {
             let ttl = self.ttl;
             self.cache.retain(|_, entry| entry.at.elapsed() < ttl);
@@ -855,12 +874,6 @@ fn pin_key(common_dir: &Path) -> String {
     } else {
         text.into_owned()
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// The answer to a registration, sent back to the waiting bus request.

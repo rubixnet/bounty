@@ -6,10 +6,14 @@
 //! holds a request body. The single writer thread (`writer.rs`) owns the only
 //! read-write connection.
 
+use crate::clock::now_ms_i64 as now_ms;
 use std::path::Path;
 
 use rusqlite::{Connection, params};
-use traction_core::{EndReason, HarnessId, MutationKind, TractionEvent};
+use traction_core::{
+    ActivityRollup, BaselineDay, CommitObservation, EndReason, HarnessId, MutationKind,
+    PresenceMinute, TractionEvent, WorkBucket,
+};
 
 pub const DB_FILE: &str = "traction.db";
 
@@ -41,6 +45,9 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_4,
     MIGRATION_5,
     MIGRATION_6,
+    MIGRATION_7,
+    MIGRATION_8,
+    MIGRATION_9,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -244,6 +251,130 @@ const MIGRATION_6: &str = "
     ) STRICT, WITHOUT ROWID;
 ";
 
+/// Step 2a: device-wide Presence Minutes (counts, ratios and closed enums
+/// only), append-only like `traction_event`. One row per wall-clock minute;
+/// a `NULL` is a field the minute's telemetry tier could not fill.
+const MIGRATION_7: &str = "
+    CREATE TABLE presence_minute (
+        minute_start_ms       INTEGER PRIMARY KEY NOT NULL,
+        key_events            INTEGER,
+        pointer_events        INTEGER,
+        injected_events       INTEGER,
+        active_subslots       INTEGER CHECK (active_subslots BETWEEN 0 AND 6),
+        cadence_entropy_milli INTEGER,
+        category_sec          TEXT,
+        category_switches     INTEGER,
+        idle_sec              INTEGER,
+        telemetry_tier        TEXT NOT NULL
+            CHECK (telemetry_tier IN ('full', 'reduced', 'idle_only', 'none'))
+    ) STRICT;
+
+    CREATE TRIGGER presence_minute_no_update BEFORE UPDATE ON presence_minute
+    BEGIN
+        SELECT RAISE(ABORT, 'presence_minute is append-only');
+    END;
+    CREATE TRIGGER presence_minute_no_delete BEFORE DELETE ON presence_minute
+    BEGIN
+        SELECT RAISE(ABORT, 'presence_minute is append-only');
+    END;
+";
+
+/// Step 2b: Commit Observations and the finalized Three-Clock output.
+///
+/// `commit_observation`, `work_bucket` and `activity_rollup` are append-only
+/// like `traction_event`; a new Ruleset writes new rows under its own ID.
+/// `rollup_cursor` is the finalizer's bookmark (one row per Ruleset, written
+/// in the same transaction as the rows it covers), so a restart resumes
+/// without recomputing quiet minutes and without duplicates. Nothing here
+/// has a slot for a commit message, author, diff or any raw text.
+const MIGRATION_8: &str = "
+    CREATE TABLE commit_observation (
+        project_id  TEXT NOT NULL,
+        commit_oid  TEXT NOT NULL,
+        observed_ms INTEGER NOT NULL,
+        PRIMARY KEY (project_id, commit_oid, observed_ms)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE work_bucket (
+        project_id              TEXT NOT NULL,
+        minute_start_ms         INTEGER NOT NULL,
+        ruleset_id              TEXT NOT NULL,
+        agent_compute_sec       INTEGER NOT NULL CHECK (agent_compute_sec BETWEEN 0 AND 60),
+        idle_autonomous_sec     INTEGER NOT NULL CHECK (idle_autonomous_sec BETWEEN 0 AND 60),
+        human_active_sec        INTEGER NOT NULL CHECK (human_active_sec BETWEEN 0 AND 60),
+        permission_wait_ms      INTEGER NOT NULL,
+        commits_human           INTEGER NOT NULL,
+        commits_agent           INTEGER NOT NULL,
+        injected_hid_detected   INTEGER NOT NULL,
+        auto_approver_suspected INTEGER NOT NULL,
+        telemetry_tier          TEXT NOT NULL
+            CHECK (telemetry_tier IN ('full', 'reduced', 'idle_only', 'none')),
+        tier_limited            INTEGER NOT NULL,
+        PRIMARY KEY (project_id, minute_start_ms, ruleset_id)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE activity_rollup (
+        window_start_ms            INTEGER NOT NULL,
+        ruleset_id                 TEXT NOT NULL,
+        minutes_observed           INTEGER NOT NULL,
+        category_share_milli       TEXT NOT NULL,
+        switch_rate_milli          INTEGER NOT NULL,
+        mean_cadence_entropy_milli INTEGER,
+        injected_ratio_milli       INTEGER,
+        telemetry_tier             TEXT NOT NULL
+            CHECK (telemetry_tier IN ('full', 'reduced', 'idle_only', 'none')),
+        PRIMARY KEY (window_start_ms, ruleset_id)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE rollup_cursor (
+        ruleset_id          TEXT PRIMARY KEY NOT NULL,
+        finalized_through_ms INTEGER NOT NULL
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TRIGGER commit_observation_no_update BEFORE UPDATE ON commit_observation
+    BEGIN SELECT RAISE(ABORT, 'commit_observation is append-only'); END;
+    CREATE TRIGGER commit_observation_no_delete BEFORE DELETE ON commit_observation
+    BEGIN SELECT RAISE(ABORT, 'commit_observation is append-only'); END;
+    CREATE TRIGGER work_bucket_no_update BEFORE UPDATE ON work_bucket
+    BEGIN SELECT RAISE(ABORT, 'work_bucket is append-only'); END;
+    CREATE TRIGGER work_bucket_no_delete BEFORE DELETE ON work_bucket
+    BEGIN SELECT RAISE(ABORT, 'work_bucket is append-only'); END;
+    CREATE TRIGGER activity_rollup_no_update BEFORE UPDATE ON activity_rollup
+    BEGIN SELECT RAISE(ABORT, 'activity_rollup is append-only'); END;
+    CREATE TRIGGER activity_rollup_no_delete BEFORE DELETE ON activity_rollup
+    BEGIN SELECT RAISE(ABORT, 'activity_rollup is append-only'); END;
+";
+
+/// Step 2d: struggle signals on every Work Bucket and the local comfort
+/// baseline.
+///
+/// `work_bucket` keeps its append-only triggers; the new columns are written
+/// with the rest of the row. `struggle_baseline` is the one table exempt from
+/// append-only (`docs/protocol.md` section 2c): one row per UTC day of
+/// histogram counts for the last `baseline_window_days`, upserted as days are
+/// finalized and pruned past the window. It holds counts, never events or
+/// timestamps.
+const MIGRATION_9: &str = "
+    ALTER TABLE work_bucket ADD COLUMN axis_steering INTEGER NOT NULL DEFAULT 0
+        CHECK (axis_steering BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN axis_specificity INTEGER NOT NULL DEFAULT 0
+        CHECK (axis_specificity BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN axis_friction INTEGER NOT NULL DEFAULT 0
+        CHECK (axis_friction BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN axis_comfort_delta INTEGER NOT NULL DEFAULT 0
+        CHECK (axis_comfort_delta BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN verified_struggle INTEGER NOT NULL DEFAULT 0
+        CHECK (verified_struggle BETWEEN 0 AND 1000);
+    ALTER TABLE work_bucket ADD COLUMN struggle_credit_sec INTEGER NOT NULL DEFAULT 0
+        CHECK (struggle_credit_sec BETWEEN 0 AND 60);
+
+    CREATE TABLE struggle_baseline (
+        day              INTEGER PRIMARY KEY NOT NULL,
+        friction_hist    TEXT NOT NULL,
+        specificity_hist TEXT NOT NULL
+    ) STRICT;
+";
+
 /// The alias-aware events view (see [`MIGRATION_3`]).
 pub const PROJECT_EVENT_VIEW: &str = "project_event";
 
@@ -440,6 +571,27 @@ pub enum WriteOp {
     RunStart(RunRow),
     /// A session's first accepted hook event in a run. A repeat is ignored.
     HookRun(HookRunRow),
+    /// Appends one Presence Minute. A repeated `minute_start_ms` (a restart
+    /// inside the same minute) is ignored.
+    Presence(PresenceMinute),
+    /// Appends one observed commit (`commit_observation`).
+    Commit(CommitObservation),
+    /// Appends one finalized range of Work Buckets and Activity Rollups and
+    /// advances the finalizer's cursor, in one transaction.
+    Rollup(Box<RollupBatch>),
+}
+
+/// See [`WriteOp::Rollup`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollupBatch {
+    pub ruleset_id: String,
+    /// Every minute before this is finalized once the batch commits.
+    pub through_ms: u64,
+    pub buckets: Vec<WorkBucket>,
+    pub rollups: Vec<ActivityRollup>,
+    /// The comfort baseline after this batch: stored as is (days not listed
+    /// here are pruned).
+    pub baseline: Vec<BaselineDay>,
 }
 
 impl WriteOp {
@@ -456,7 +608,10 @@ impl WriteOp {
             | Self::PauseEnd(_)
             | Self::TailerStart(_)
             | Self::RunStart(_)
-            | Self::HookRun(_) => 0,
+            | Self::HookRun(_)
+            | Self::Presence(_)
+            | Self::Commit(_)
+            | Self::Rollup(_) => 0,
         }
     }
 }
@@ -796,6 +951,9 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
                 )?
                 .execute(params![run.run_id, run.started_ms])?;
             }
+            WriteOp::Presence(minute) => insert_presence(&tx, minute)?,
+            WriteOp::Commit(commit) => insert_commit(&tx, commit)?,
+            WriteOp::Rollup(batch) => insert_rollup(&tx, batch)?,
             WriteOp::HookRun(hook) => {
                 tx.prepare_cached(
                     "INSERT OR IGNORE INTO session_hook_run
@@ -820,10 +978,178 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
     tx.commit()
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+fn insert_presence(conn: &Connection, minute: &PresenceMinute) -> rusqlite::Result<()> {
+    let category_sec = minute
+        .category_sec
+        .as_ref()
+        .and_then(|sec| serde_json::to_string(sec).ok());
+    let tier = serde_json::to_value(minute.telemetry_tier)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO presence_minute
+             (minute_start_ms, key_events, pointer_events, injected_events,
+              active_subslots, cadence_entropy_milli, category_sec,
+              category_switches, idle_sec, telemetry_tier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?
+    .execute(params![
+        i64::try_from(minute.minute_start_ms).unwrap_or(i64::MAX),
+        minute.key_events,
+        minute.pointer_events,
+        minute.injected_events,
+        minute.active_subslots,
+        minute.cadence_entropy_milli,
+        category_sec,
+        minute.category_switches,
+        minute.idle_sec,
+        tier,
+    ])?;
+    Ok(())
+}
+
+fn insert_commit(conn: &Connection, commit: &CommitObservation) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO commit_observation (project_id, commit_oid, observed_ms)
+         VALUES (?1, ?2, ?3)",
+    )?
+    .execute(params![
+        commit.project_id,
+        commit.commit_oid,
+        i64::try_from(commit.observed_ms).unwrap_or(i64::MAX),
+    ])?;
+    Ok(())
+}
+
+fn tier_str(tier: traction_core::TelemetryTier) -> String {
+    serde_json::to_value(tier)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn to_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Rows are `INSERT OR IGNORE`: a finalized minute is never rewritten, so a
+/// replay after a crash between the write and the cursor is a no-op.
+fn insert_rollup(conn: &Connection, batch: &RollupBatch) -> rusqlite::Result<()> {
+    for b in &batch.buckets {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO work_bucket
+                 (project_id, minute_start_ms, ruleset_id, agent_compute_sec,
+                  idle_autonomous_sec, human_active_sec, permission_wait_ms,
+                  commits_human, commits_agent, injected_hid_detected,
+                  auto_approver_suspected, telemetry_tier, tier_limited,
+                  axis_steering, axis_specificity, axis_friction, axis_comfort_delta,
+                  verified_struggle, struggle_credit_sec)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19)",
+        )?
+        .execute(params![
+            b.project_id,
+            to_i64(b.minute_start_ms),
+            b.ruleset_id,
+            b.agent_compute_sec,
+            b.idle_autonomous_sec,
+            b.human_active_sec,
+            to_i64(b.permission_wait_ms),
+            b.commits_human,
+            b.commits_agent,
+            b.injected_hid_detected,
+            b.auto_approver_suspected,
+            tier_str(b.telemetry_tier),
+            b.tier_limited,
+            b.struggle_axes.steering,
+            b.struggle_axes.specificity,
+            b.struggle_axes.friction,
+            b.struggle_axes.comfort_delta,
+            b.verified_struggle,
+            b.struggle_credit_sec,
+        ])?;
+    }
+    replace_baseline(conn, &batch.baseline)?;
+    for r in &batch.rollups {
+        let share = serde_json::to_string(&r.category_share_milli).unwrap_or_default();
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO activity_rollup
+                 (window_start_ms, ruleset_id, minutes_observed, category_share_milli,
+                  switch_rate_milli, mean_cadence_entropy_milli, injected_ratio_milli,
+                  telemetry_tier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?
+        .execute(params![
+            to_i64(r.window_start_ms),
+            r.ruleset_id,
+            r.minutes_observed,
+            share,
+            r.switch_rate_milli,
+            r.mean_cadence_entropy_milli,
+            r.injected_ratio_milli,
+            tier_str(r.telemetry_tier),
+        ])?;
+    }
+    conn.prepare_cached(
+        "INSERT INTO rollup_cursor (ruleset_id, finalized_through_ms) VALUES (?1, ?2)
+         ON CONFLICT (ruleset_id) DO UPDATE SET
+            finalized_through_ms = max(finalized_through_ms, excluded.finalized_through_ms)",
+    )?
+    .execute(params![batch.ruleset_id, to_i64(batch.through_ms)])?;
+    Ok(())
+}
+
+/// Stores `days` as the whole baseline (upserting each, pruning the rest).
+fn replace_baseline(conn: &Connection, days: &[BaselineDay]) -> rusqlite::Result<()> {
+    let oldest = days.iter().map(|d| d.day).min();
+    for d in days {
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO struggle_baseline (day, friction_hist, specificity_hist)
+             VALUES (?1, ?2, ?3)",
+        )?
+        .execute(params![
+            to_i64(d.day),
+            serde_json::to_string(&d.friction_hist).unwrap_or_default(),
+            serde_json::to_string(&d.specificity_hist).unwrap_or_default(),
+        ])?;
+    }
+    if let Some(oldest) = oldest {
+        conn.prepare_cached("DELETE FROM struggle_baseline WHERE day < ?1")?
+            .execute([to_i64(oldest)])?;
+    }
+    Ok(())
+}
+
+/// The stored comfort baseline, oldest day first.
+pub fn load_baseline(conn: &Connection) -> rusqlite::Result<Vec<BaselineDay>> {
+    let mut stmt = conn.prepare(
+        "SELECT day, friction_hist, specificity_hist FROM struggle_baseline ORDER BY day",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (day, friction, specificity) = row?;
+        let (Ok(day), Ok(friction_hist), Ok(specificity_hist)) = (
+            u64::try_from(day),
+            serde_json::from_str(&friction),
+            serde_json::from_str(&specificity),
+        ) else {
+            continue;
+        };
+        out.push(BaselineDay {
+            day,
+            friction_hist,
+            specificity_hist,
+        });
+    }
+    Ok(out)
 }
 
 fn upsert_offset(conn: &Connection, row: &TranscriptOffset) -> rusqlite::Result<()> {

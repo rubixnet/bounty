@@ -25,15 +25,19 @@ use tokio::sync::oneshot;
 
 use crate::bus::Bus;
 use crate::claude_code::tailer::{self, TailerThread};
+use crate::commits::{self, CommitObserver};
 use crate::config::{DaemonConfig, GLOBAL_IGNORE_FILE};
 use crate::exclusions::Exclusions;
+use crate::finalizer::{self, FinalizerThread};
 use crate::git::Git;
 use crate::http::Listeners;
 use crate::lock::{InstanceLock, LockError};
+use crate::presence::{self, PresenceSensor};
 use crate::router::{self, Router, RouterThread};
 use crate::secret::DeviceSecret;
 #[cfg(unix)]
 use crate::socket::{self, SocketError, SocketFile};
+use crate::symbol_index::SymbolIndexes;
 use crate::token::BusToken;
 use crate::watcher::{self, WatcherThread, Watches};
 use crate::writer::{self, WriterThread};
@@ -47,6 +51,12 @@ pub struct DaemonHandle {
     /// The Claude transcript tailer (absent without a Claude config dir).
     tailer: Option<TailerThread>,
     watcher: Option<WatcherThread>,
+    /// The Presence Sensor (device-wide; unaffected by pause).
+    presence: Option<PresenceSensor>,
+    /// The commit observer (stat-only watch of each worktree's reflog).
+    commits: Option<CommitObserver>,
+    /// The Work Bucket finalizer.
+    finalizer: Option<FinalizerThread>,
     router: Option<RouterThread>,
     writer: Option<WriterThread>,
     #[cfg(unix)]
@@ -112,7 +122,13 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         &config.data_dir.join(GLOBAL_IGNORE_FILE),
     );
     let git = Git::with_program(&config.git_program, exclusions.home());
+    let observer_git = Arc::new(Git::with_program(&config.git_program, exclusions.home()));
+    let symbols = SymbolIndexes::default();
     let (watches, notifications) = Watches::new(exclusions.clone());
+    watches.set_symbol_index(symbols.clone());
+    let presence_writer = writer_sender.clone();
+    let commits_writer = writer_sender.clone();
+    let finalizer_writer = writer_sender.clone();
     let mut router = Router::new(git, exclusions, device_secret, writer_sender, registry);
     router.set_attribution_timing(&config.watcher);
     // Re-attach every stored (non-merged) Project before anything can edit
@@ -120,6 +136,41 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     // they are answered.
     for project in router.projects() {
         watches.attach(project);
+    }
+    // Commit Observations: Git Projects (and every folder resolved in one,
+    // which is how linked worktrees are found) go to the observer.
+    let commit_observer = if config.commits.enabled {
+        match commits::spawn(
+            &traction_core::TRACTION_RULES_1,
+            observer_git,
+            commits_writer,
+            config.commits,
+        ) {
+            Ok(observer) => Some(observer),
+            Err(error) => {
+                log::error("failed to start the commit observer", &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(observer) = &commit_observer {
+        let watch = observer.watch_handle();
+        for project in router.projects() {
+            if project.kind == storage::ProjectKind::Git {
+                watch.watch(&project.project_id, &project.root);
+            }
+        }
+        let hook_watch = watch.clone();
+        router.add_project_hook(Box::new(move |project| {
+            if project.merged_into.is_none() && project.kind == storage::ProjectKind::Git {
+                hook_watch.watch(&project.project_id, &project.root);
+            }
+        }));
+        router.set_folder_hook(Box::new(move |project_id, folder| {
+            watch.watch(project_id, folder);
+        }));
     }
     let hook_watches = watches.clone();
     router.add_project_hook(Box::new(move |project| match &project.merged_into {
@@ -150,7 +201,8 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     };
     let tailer_thread = match &config.claude_config_dir {
         None => None,
-        Some(dir) => match tailer::start(dir, tailer_state, router_sender.clone()) {
+        Some(dir) => match tailer::start(dir, tailer_state, router_sender.clone(), symbols.clone())
+        {
             Ok(thread) => Some(thread),
             Err(error) => {
                 drop(router_sender);
@@ -163,8 +215,11 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     };
 
     let hints = tailer_thread.as_ref().map(TailerThread::hints);
-    let bus =
-        Arc::new(Bus::new(token, router_sender, local_addr.port()).with_transcript_hints(hints));
+    let bus = Arc::new(
+        Bus::new(token, router_sender, local_addr.port())
+            .with_transcript_hints(hints)
+            .with_symbols(symbols),
+    );
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = thread::Builder::new()
         .name("traction-bus".to_owned())
@@ -198,12 +253,46 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         }
     };
 
+    // Presence is best effort: a sensor that cannot start never stops the
+    // daemon (the backend degrades its own tier instead).
+    let presence = if config.presence.enabled {
+        match presence::spawn(
+            &traction_core::TRACTION_RULES_1,
+            presence::detect(),
+            presence_writer,
+            config.presence.subslot,
+        ) {
+            Ok(sensor) => Some(sensor),
+            Err(error) => {
+                log::error("failed to start the presence sensor", &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let finalizer = if config.finalizer.enabled {
+        match finalizer::spawn(&config.data_dir, finalizer_writer, config.finalizer) {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                log::error("failed to start the finalizer", &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(DaemonHandle {
         local_addr,
         shutdown: Some(shutdown_tx),
         server: Some(server),
         tailer: tailer_thread,
         watcher: Some(watcher_thread),
+        presence,
+        commits: commit_observer,
+        finalizer,
         router: Some(router_thread),
         writer: Some(writer_thread),
         #[cfg(unix)]
@@ -255,6 +344,15 @@ impl DaemonHandle {
         &self.socket_path
     }
 
+    /// How many Git worktrees the commit observer has a baseline for; a
+    /// commit made in a worktree before then is never observed. Zero when
+    /// the observer is disabled.
+    pub fn commit_baselined_worktrees(&self) -> usize {
+        self.commits
+            .as_ref()
+            .map_or(0, CommitObserver::baselined_worktrees)
+    }
+
     /// Stops accepting requests, commits every accepted Traction Event and
     /// waits for all daemon threads to finish.
     pub fn shutdown(mut self) -> Result<(), ShutdownError> {
@@ -271,6 +369,16 @@ impl DaemonHandle {
         // Held mutations are decided and handed to the Router while it (and
         // the writer) still run.
         let watcher = self.watcher.take().map(WatcherThread::stop);
+        // Drops the sensor's writer sender before the writer drains.
+        if let Some(Err(_)) = self.presence.take().map(PresenceSensor::stop) {
+            log::warn("the presence sensor thread panicked");
+        }
+        if let Some(Err(_)) = self.finalizer.take().map(FinalizerThread::stop) {
+            log::warn("the finalizer thread panicked");
+        }
+        if let Some(Err(_)) = self.commits.take().map(CommitObserver::stop) {
+            log::warn("the commit observer thread panicked");
+        }
         // The bus is gone, so the Router drains its queue and exits. A writer
         // stuck retrying a full failed batch is told to give up first, so a
         // Router blocked on it is released.
