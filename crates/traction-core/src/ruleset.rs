@@ -5,6 +5,9 @@
 //! integers (milliseconds, seconds or per-mille) so the rollup stays
 //! float-free and byte-exact across machines.
 
+/// One minute in milliseconds: the Work Bucket width. A unit, not a tunable.
+pub const MINUTE_MS: u64 = 60_000;
+
 /// One versioned set of scoring constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ruleset {
@@ -110,6 +113,34 @@ pub struct Ruleset {
     /// Credit kept (per mille) on a `reduced`, `idle_only` or `none` minute:
     /// it weighs less as evidence for the user, never against.
     pub degraded_tier_credit_milli: u32,
+}
+
+impl Ruleset {
+    /// How far before a minute the inputs that decide its Work Bucket reach:
+    /// Outcome Anchors (a drifting minute counts them out to the decay
+    /// span) and the steering neighbours with their anchors, plus the
+    /// anchor's own minute. Derived from the constants, never a literal.
+    pub const fn context_back_ms(&self) -> u64 {
+        max(
+            max(self.anchor_window_ms, self.drift_decay_ms),
+            2 * MINUTE_MS + self.steering_window_ms,
+        ) + MINUTE_MS
+    }
+
+    /// How far after a minute its Work Bucket still depends on later input:
+    /// anchors and steering neighbours as above, a friction loop that
+    /// closes up to `stale_turn_timeout_ms` after it opened, and a
+    /// permission reply up to the latency cap away.
+    pub const fn context_fwd_ms(&self) -> u64 {
+        max(
+            max(self.context_back_ms(), self.stale_turn_timeout_ms),
+            self.permission_latency_cap_ms,
+        ) + MINUTE_MS
+    }
+}
+
+const fn max(a: u64, b: u64) -> u64 {
+    if a > b { a } else { b }
 }
 
 /// The first Ruleset.

@@ -12,9 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::rollup::WorkBucket;
+use crate::MINUTE_MS;
 use crate::{AppCategory, EventType, PresenceMinute, Ruleset, TelemetryTier, TractionEvent};
 
-const MINUTE_MS: u64 = 60_000;
 const DAY_MS: u64 = 86_400_000;
 
 /// Histogram bins per axis per baseline day (each 100 per mille wide). This

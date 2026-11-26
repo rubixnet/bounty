@@ -16,9 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::struggle::{self, BaselineDay, ScoreInput, StruggleAxes};
+use crate::MINUTE_MS;
 use crate::{AppCategory, EventType, PresenceMinute, Ruleset, TelemetryTier, TractionEvent};
 
-const MINUTE_MS: u64 = 60_000;
 /// Fixed-point scale for splitting a second among Projects: divisible by
 /// every share count up to 12, and rounding is always down so the shares of
 /// one second never sum to more than that second.
