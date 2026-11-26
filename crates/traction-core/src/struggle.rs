@@ -133,6 +133,8 @@ pub(crate) struct ScoreInput<'a> {
     /// Events with a Project, sorted by `(timestamp, event_id)`.
     pub sorted: &'a [&'a TractionEvent],
     pub presence: &'a BTreeMap<u64, &'a PresenceMinute>,
+    /// Minutes flagged `injected_hid_detected`.
+    pub flagged_minutes: &'a BTreeSet<u64>,
     /// Approved permissions that earned real-input credit.
     pub permission_anchors: &'a [(u64, String)],
     pub baseline: &'a [BaselineDay],
@@ -201,6 +203,7 @@ pub(crate) fn score(rules: &Ruleset, input: &ScoreInput<'_>, buckets: &mut [Work
     for (session, events) in &by_session {
         session_signals(
             rules,
+            input.flagged_minutes,
             session,
             events,
             &mutations,
@@ -396,6 +399,7 @@ fn steering(
 /// One session's anchors, friction loops and prompt specificity spans.
 fn session_signals(
     rules: &Ruleset,
+    flagged_minutes: &BTreeSet<u64>,
     session: &str,
     events: &[&TractionEvent],
     mutations: &BTreeMap<&str, Vec<&TractionEvent>>,
@@ -419,7 +423,13 @@ fn session_signals(
                 open = true;
                 let (end, diff) = turn_extent(events, i, stale);
                 let value = prompt_specificity(rules, e, diff);
-                prompt_strength = value;
+                // A prompt submitted in a minute of synthetic input is not
+                // known to be human: the edits it launches anchor nothing.
+                prompt_strength = if flagged_minutes.contains(&minute_of(e.timestamp_ms)) {
+                    0
+                } else {
+                    value
+                };
                 spans
                     .entry(project.to_owned())
                     .or_default()
@@ -427,7 +437,8 @@ fn session_signals(
             }
             t if is_closer(t) => open = false,
             // An agent edit is only as strong an anchor as the prompt that
-            // asked for it: a terse "continue" proves nothing.
+            // asked for it (a terse "continue" proves nothing), and only when a
+            // human submitted that prompt.
             EventType::FileMutation if open => anchor(project, e.timestamp_ms, prompt_strength),
             EventType::ToolFail => {
                 if let Some(name) = e.metrics_only.tool_name.as_deref() {

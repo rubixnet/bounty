@@ -241,6 +241,26 @@ fn a_harness_edit_inside_a_human_prompted_turn_is_an_anchor_but_one_outside_is_n
 }
 
 #[test]
+fn an_agent_edit_after_a_prompt_in_an_injected_minute_anchors_nothing() {
+    // The prompt is specific, but the minute it was submitted in was flagged
+    // as synthetic input, so no human is known to have submitted it.
+    let events = vec![
+        prompt(1, T0 + 5_000, 120, 4, false),
+        mutation(2, T0 + MIN + 20_000, false, 4),
+        turn_end(3, T0 + MIN + 40_000),
+    ];
+    let mut presence: Vec<_> = (0..2).map(|i| present(T0 + i * MIN, 40, 20, 0)).collect();
+    let control = run(&events, &presence, &[], 2);
+    assert_eq!(at(&control, 1).struggle_credit_sec, 60);
+    presence[0].injected_events = Some(60);
+    let out = run(&events, &presence, &[], 2);
+    assert!(at(&out, 0).injected_hid_detected);
+    assert_eq!(sum(&out, |b| b.struggle_credit_sec), 0, "{out:#?}");
+    // Its specificity still scores; only the anchor is withheld.
+    assert!(at(&out, 1).struggle_axes.specificity > 0);
+}
+
+#[test]
 fn unanchored_browser_minutes_decay_linearly_while_other_categories_stop_at_the_window() {
     // One manual edit; then minutes of pure browsing.
     // A later prompt keeps the minutes assigned to the Project; it is no

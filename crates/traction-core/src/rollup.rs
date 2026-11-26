@@ -558,11 +558,17 @@ pub fn work_buckets(rules: &Ruleset, input: &RollupInput<'_>) -> Vec<WorkBucket>
             struggle_credit_sec: 0,
         });
     }
+    let flagged_minutes: BTreeSet<u64> = minute_facts
+        .iter()
+        .filter(|(_, f)| f.flagged)
+        .map(|(m, _)| *m)
+        .collect();
     struggle::score(
         rules,
         &ScoreInput {
             sorted: &sorted,
             presence: &presence,
+            flagged_minutes: &flagged_minutes,
             permission_anchors: &permission_anchors,
             baseline: input.baseline,
         },
