@@ -123,6 +123,48 @@ Derived only by the daemon's Router, using the pure functions in `traction-core`
 - `dir:` = `"dir:" || hex(SHA-256(device_secret || 0x00 || canonical_root_utf8))`. `device_secret` is the 32-byte per-device secret, so a `dir:` ID cannot be confirmed from a path alone.
 - **Origin normalization:** trim whitespace; strip the scheme, userinfo and port; lowercase the host (path case is kept); rewrite scp-style `user@host:owner/repo` to `host/owner/repo`; strip any trailing `/` and `.git`. Local paths (`file://`, Windows drive paths) keep only their path. `https://github.com/A/B.git`, `git@github.com:A/B` and `ssh://git@github.com:22/A/B/` all normalize to `github.com/A/B`.
 
+## 2b. Presence Minute (Presence Sensor)
+
+One device-wide record per wall-clock minute, written by the daemon through the single SQLite writer into the append-only `presence_minute` table (no-update/no-delete triggers, like `traction_event`; primary key `minute_start_ms`). It never crosses the Local Ingestion Bus. It holds counts, ratios and closed enums only: no key code, character, pointer position, window title, URL or raw application identifier has a slot.
+
+```json
+{
+  "minute_start_ms": 1795432800000,
+  "key_events": 40,
+  "pointer_events": 120,
+  "injected_events": 0,
+  "active_subslots": 5,
+  "cadence_entropy_milli": 2750,
+  "category_sec": {"ide": 30, "terminal": 20, "browser": 10, "ai_desktop": 0, "other": 0},
+  "category_switches": 3,
+  "idle_sec": 0,
+  "telemetry_tier": "full"
+}
+```
+
+- Unknown fields are rejected. **A field the minute's tier cannot fill is `null`, never `0`.**
+- `telemetry_tier`: `full` (idle, category, real-vs-injected input counts), `reduced` (idle and category; `key_events`, `pointer_events`, `injected_events` and `cadence_entropy_milli` are `null`), `idle_only` (idle only; `category_sec` and `category_switches` are `null`), `none` (everything `null`). A `reduced`/`idle_only` minute is weaker evidence *for* the user and never evidence *against* them.
+- Sampling is per 10 s sub-slot (six per minute): the OS idle timer and the foreground category are read once per sub-slot, so `category_sec` has 10 s resolution and `category_switches` counts changes between sub-slot reads. Input events arrive by OS notification (X11 only) and the sensor sleeps otherwise: with no input it wakes once per sub-slot.
+- `active_subslots` (0 to 6): `full` counts sub-slots with real (non-injected) input. `reduced` and `idle_only` derive it from the idle timer (the timer reset inside the sub-slot), so injected input cannot be told apart there.
+- `idle_sec`: seconds in sub-slots whose idle timer was at or above `IDLE_THRESHOLD_SEC` (30). Constants (`SUBSLOT_SEC` 10, `IDLE_THRESHOLD_SEC` 30, `MIN_CADENCE_SAMPLES` 8) live in `traction-core` and move into the Slice 2 `Ruleset`.
+- `cadence_entropy_milli`: Shannon entropy (bits x 1000) of log2-binned intervals between consecutive real events inside the minute, `null` below `MIN_CADENCE_SAMPLES` intervals. Only a 16-counter histogram is kept; individual intervals are never stored.
+- A minute the sensor joined more than a sub-slot late, or slept through (the clock jumped more than a sub-slot), is dropped. Nothing is written for time the daemon was down. A restart inside one minute keeps the first row. Tray and session pause do not stop presence.
+- Category mapping is one compiled-in table per OS (macOS bundle IDs, Windows executable names, X11 `WM_CLASS`) resolving to `ide | terminal | browser | ai_desktop | other`, in memory. Unknown is `other`. The raw identifier is never stored or logged.
+
+### Backends and spike outcomes
+
+| OS | Foreground | Idle | Injection signal | Tier now |
+|---|---|---|---|---|
+| macOS | `NSWorkspace.frontmostApplication` bundle ID | `CGEventSourceSecondsSinceLastEventType` (combined session state) | none | `reduced` |
+| Windows | `GetForegroundWindow` -> process executable (`QueryFullProcessImageNameW`) | `GetLastInputInfo` + `GetTickCount` | none yet | `reduced` |
+| Linux X11 | `_NET_ACTIVE_WINDOW` -> `WM_CLASS` | XScreenSaver `QueryInfo` | XInput2 raw events; `sourceid` of an XTEST slave = injected. Only the event type and `sourceid` are read. | `full` (lowered on error) |
+| Linux Wayland / no display | none | none yet | none | `none` |
+
+- **macOS spike (run on macOS 26, no Accessibility/Input Monitoring granted): no prompt-free injection signal.** `CGEventPost` from an untrusted process (to the session and HID taps) is dropped by the OS: neither `CGEventSourceCounterForEventType(HIDSystemState, ...)` nor the `CombinedSessionState` counter moved after 40 posted events, so a `HIDSystemState` vs `CombinedSessionState` delta could not be shown to separate injected from hardware input. Showing it for a *trusted* poster would need Accessibility, which the product must not ask for. Decision: macOS is `reduced`; the counter-delta helper stays unit-tested (with a recorded wrap and race shapes) for a future opt-in. Idle and the frontmost bundle ID are readable with no prompt.
+- **Windows spike: not run.** The development host was macOS, and the Raw Input `SendInput` check (`RAWINPUTHEADER.hDevice == NULL`) and the Defender/AV check on an unsigned build need a Windows machine. Decision: Windows ships `reduced` (the specified baseline) and no input hook of any kind exists in the crate (a test scans the sources). Open: run the spike on a Windows host before building the `full` tier.
+- **Linux Wayland idle (`ext-idle-notify-v1`, `org.freedesktop.ScreenSaver`) is not built yet**, so Wayland reports `none`. Open follow-up; the tier model already carries `idle_only`.
+- Wayland wins over an XWayland `DISPLAY`: XWayland only sees X clients.
+
 ## 3. Server Sync Heartbeat (Every 2 Minutes — No PII)
 
 Sent to `POST /v1/anchors` per `project_id`, containing aggregated 60-second `WorkBucket` records plus the rolling chain tip:

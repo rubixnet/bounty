@@ -30,6 +30,7 @@ use crate::exclusions::Exclusions;
 use crate::git::Git;
 use crate::http::Listeners;
 use crate::lock::{InstanceLock, LockError};
+use crate::presence::{self, PresenceSensor};
 use crate::router::{self, Router, RouterThread};
 use crate::secret::DeviceSecret;
 #[cfg(unix)]
@@ -47,6 +48,8 @@ pub struct DaemonHandle {
     /// The Claude transcript tailer (absent without a Claude config dir).
     tailer: Option<TailerThread>,
     watcher: Option<WatcherThread>,
+    /// The Presence Sensor (device-wide; unaffected by pause).
+    presence: Option<PresenceSensor>,
     router: Option<RouterThread>,
     writer: Option<WriterThread>,
     #[cfg(unix)]
@@ -113,6 +116,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     );
     let git = Git::with_program(&config.git_program, exclusions.home());
     let (watches, notifications) = Watches::new(exclusions.clone());
+    let presence_writer = writer_sender.clone();
     let mut router = Router::new(git, exclusions, device_secret, writer_sender, registry);
     router.set_attribution_timing(&config.watcher);
     // Re-attach every stored (non-merged) Project before anything can edit
@@ -198,12 +202,27 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         }
     };
 
+    // Presence is best effort: a sensor that cannot start never stops the
+    // daemon (the backend degrades its own tier instead).
+    let presence = if config.presence.enabled {
+        match presence::spawn(presence::detect(), presence_writer, config.presence.subslot) {
+            Ok(sensor) => Some(sensor),
+            Err(error) => {
+                log::error("failed to start the presence sensor", &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(DaemonHandle {
         local_addr,
         shutdown: Some(shutdown_tx),
         server: Some(server),
         tailer: tailer_thread,
         watcher: Some(watcher_thread),
+        presence,
         router: Some(router_thread),
         writer: Some(writer_thread),
         #[cfg(unix)]
@@ -271,6 +290,10 @@ impl DaemonHandle {
         // Held mutations are decided and handed to the Router while it (and
         // the writer) still run.
         let watcher = self.watcher.take().map(WatcherThread::stop);
+        // Drops the sensor's writer sender before the writer drains.
+        if let Some(Err(_)) = self.presence.take().map(PresenceSensor::stop) {
+            log::warn("the presence sensor thread panicked");
+        }
         // The bus is gone, so the Router drains its queue and exits. A writer
         // stuck retrying a full failed batch is told to give up first, so a
         // Router blocked on it is released.

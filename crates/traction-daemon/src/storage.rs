@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use rusqlite::{Connection, params};
-use traction_core::{EndReason, HarnessId, MutationKind, TractionEvent};
+use traction_core::{EndReason, HarnessId, MutationKind, PresenceMinute, TractionEvent};
 
 pub const DB_FILE: &str = "traction.db";
 
@@ -41,6 +41,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_4,
     MIGRATION_5,
     MIGRATION_6,
+    MIGRATION_7,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -244,6 +245,34 @@ const MIGRATION_6: &str = "
     ) STRICT, WITHOUT ROWID;
 ";
 
+/// Step 2a: device-wide Presence Minutes (counts, ratios and closed enums
+/// only), append-only like `traction_event`. One row per wall-clock minute;
+/// a `NULL` is a field the minute's telemetry tier could not fill.
+const MIGRATION_7: &str = "
+    CREATE TABLE presence_minute (
+        minute_start_ms       INTEGER PRIMARY KEY NOT NULL,
+        key_events            INTEGER,
+        pointer_events        INTEGER,
+        injected_events       INTEGER,
+        active_subslots       INTEGER CHECK (active_subslots BETWEEN 0 AND 6),
+        cadence_entropy_milli INTEGER,
+        category_sec          TEXT,
+        category_switches     INTEGER,
+        idle_sec              INTEGER,
+        telemetry_tier        TEXT NOT NULL
+            CHECK (telemetry_tier IN ('full', 'reduced', 'idle_only', 'none'))
+    ) STRICT;
+
+    CREATE TRIGGER presence_minute_no_update BEFORE UPDATE ON presence_minute
+    BEGIN
+        SELECT RAISE(ABORT, 'presence_minute is append-only');
+    END;
+    CREATE TRIGGER presence_minute_no_delete BEFORE DELETE ON presence_minute
+    BEGIN
+        SELECT RAISE(ABORT, 'presence_minute is append-only');
+    END;
+";
+
 /// The alias-aware events view (see [`MIGRATION_3`]).
 pub const PROJECT_EVENT_VIEW: &str = "project_event";
 
@@ -440,6 +469,9 @@ pub enum WriteOp {
     RunStart(RunRow),
     /// A session's first accepted hook event in a run. A repeat is ignored.
     HookRun(HookRunRow),
+    /// Appends one Presence Minute. A repeated `minute_start_ms` (a restart
+    /// inside the same minute) is ignored.
+    Presence(PresenceMinute),
 }
 
 impl WriteOp {
@@ -456,7 +488,8 @@ impl WriteOp {
             | Self::PauseEnd(_)
             | Self::TailerStart(_)
             | Self::RunStart(_)
-            | Self::HookRun(_) => 0,
+            | Self::HookRun(_)
+            | Self::Presence(_) => 0,
         }
     }
 }
@@ -796,6 +829,7 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
                 )?
                 .execute(params![run.run_id, run.started_ms])?;
             }
+            WriteOp::Presence(minute) => insert_presence(&tx, minute)?,
             WriteOp::HookRun(hook) => {
                 tx.prepare_cached(
                     "INSERT OR IGNORE INTO session_hook_run
@@ -818,6 +852,37 @@ pub fn apply_batch(conn: &mut Connection, ops: &[WriteOp]) -> rusqlite::Result<(
     )?
     .execute([now_ms()])?;
     tx.commit()
+}
+
+fn insert_presence(conn: &Connection, minute: &PresenceMinute) -> rusqlite::Result<()> {
+    let category_sec = minute
+        .category_sec
+        .as_ref()
+        .and_then(|sec| serde_json::to_string(sec).ok());
+    let tier = serde_json::to_value(minute.telemetry_tier)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO presence_minute
+             (minute_start_ms, key_events, pointer_events, injected_events,
+              active_subslots, cadence_entropy_milli, category_sec,
+              category_switches, idle_sec, telemetry_tier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?
+    .execute(params![
+        i64::try_from(minute.minute_start_ms).unwrap_or(i64::MAX),
+        minute.key_events,
+        minute.pointer_events,
+        minute.injected_events,
+        minute.active_subslots,
+        minute.cadence_entropy_milli,
+        category_sec,
+        minute.category_switches,
+        minute.idle_sec,
+        tier,
+    ])?;
+    Ok(())
 }
 
 fn now_ms() -> i64 {

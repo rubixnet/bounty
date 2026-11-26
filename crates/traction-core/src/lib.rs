@@ -5,6 +5,7 @@
 
 mod canonical;
 mod event;
+mod presence;
 mod project_id;
 mod validate;
 
@@ -12,6 +13,10 @@ pub use canonical::{CanonicalJsonError, canonical_json};
 pub use event::{
     AttributionSource, EndReason, EventType, HarnessId, MetricsOnly, MutationKind, NetworkClass,
     SCHEMA_VERSION, TractionEvent,
+};
+pub use presence::{
+    AppCategory, CategorySec, IDLE_THRESHOLD_SEC, MIN_CADENCE_SAMPLES, PresenceError,
+    PresenceMinute, SUBSLOT_SEC, SUBSLOTS_PER_MINUTE, TelemetryTier,
 };
 pub use project_id::{DEVICE_SECRET_LEN, dir_project_id, git_project_id, normalize_origin};
 pub use validate::{
