@@ -65,6 +65,7 @@ use crate::claude_code::tailer::TranscriptHints;
 use crate::log;
 use crate::router::{Pause, RouterSender};
 use crate::storage::EventRow;
+use crate::symbol_index::SymbolIndexes;
 use crate::token::BusToken;
 
 pub const EVENT_PATH: &str = "/v1/event";
@@ -94,6 +95,8 @@ pub struct Bus {
     dropped_hooks: AtomicU64,
     /// Where hook-reported `transcript_path`s go (absent without a tailer).
     transcript_hints: Option<TranscriptHints>,
+    /// File-name indexes, for a hook prompt's `repo_symbol_hits`.
+    symbols: SymbolIndexes,
 }
 
 /// Which listener a request arrived on. Only loopback HTTP checks `Host`: a
@@ -164,7 +167,15 @@ impl Bus {
             port,
             dropped_hooks: AtomicU64::new(0),
             transcript_hints: None,
+            symbols: SymbolIndexes::default(),
         }
+    }
+
+    /// Matches hook prompts against these file-name indexes.
+    #[must_use]
+    pub fn with_symbols(mut self, symbols: SymbolIndexes) -> Self {
+        self.symbols = symbols;
+        self
     }
 
     /// Sends every hook-reported `transcript_path` to the transcript tailer.
@@ -238,7 +249,7 @@ impl Bus {
         }
         if path == HOOK_PATH {
             let body = read_capped_body(body, read, MAX_HOOK_BODY_BYTES).await?;
-            let mapped = hook::map_hook(&body, now_ms());
+            let mapped = hook::map_hook(&body, now_ms(), &self.symbols);
             drop(body);
             if let (Some(path), Some(hints)) = (mapped.transcript_path, &self.transcript_hints) {
                 hints.hint(path);

@@ -37,6 +37,7 @@ use crate::router::{self, Router, RouterThread};
 use crate::secret::DeviceSecret;
 #[cfg(unix)]
 use crate::socket::{self, SocketError, SocketFile};
+use crate::symbol_index::SymbolIndexes;
 use crate::token::BusToken;
 use crate::watcher::{self, WatcherThread, Watches};
 use crate::writer::{self, WriterThread};
@@ -122,7 +123,9 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     );
     let git = Git::with_program(&config.git_program, exclusions.home());
     let observer_git = Arc::new(Git::with_program(&config.git_program, exclusions.home()));
+    let symbols = SymbolIndexes::default();
     let (watches, notifications) = Watches::new(exclusions.clone());
+    watches.set_symbol_index(symbols.clone());
     let presence_writer = writer_sender.clone();
     let commits_writer = writer_sender.clone();
     let finalizer_writer = writer_sender.clone();
@@ -193,7 +196,8 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     };
     let tailer_thread = match &config.claude_config_dir {
         None => None,
-        Some(dir) => match tailer::start(dir, tailer_state, router_sender.clone()) {
+        Some(dir) => match tailer::start(dir, tailer_state, router_sender.clone(), symbols.clone())
+        {
             Ok(thread) => Some(thread),
             Err(error) => {
                 drop(router_sender);
@@ -206,8 +210,11 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     };
 
     let hints = tailer_thread.as_ref().map(TailerThread::hints);
-    let bus =
-        Arc::new(Bus::new(token, router_sender, local_addr.port()).with_transcript_hints(hints));
+    let bus = Arc::new(
+        Bus::new(token, router_sender, local_addr.port())
+            .with_transcript_hints(hints)
+            .with_symbols(symbols),
+    );
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = thread::Builder::new()
         .name("traction-bus".to_owned())

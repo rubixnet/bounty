@@ -4,13 +4,22 @@
 //!
 //! Shared by every Adapter that sees raw text: the Claude Code hooks and the
 //! Claude transcript tailer.
+//!
+//! `repo_symbol_hits` needs the Project, which the text's own payload names
+//! only alongside it. So the text is reduced to [`Candidates`] (capped,
+//! hashed words) that the Adapter matches against the Project's file-name
+//! index, then drops with the rest of the metrics.
+
+use crate::symbol_index::{self, Candidates};
 
 /// What a piece of raw text is reduced to before it is dropped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMetrics {
     /// Length in Unicode scalar values (not bytes).
     pub prompt_char_len: u64,
     pub has_stacktrace: bool,
+    /// Hashed words, to be matched in memory and then dropped; never stored.
+    pub candidates: Candidates,
 }
 
 /// Measures `text`. Linear in its length; allocates nothing.
@@ -18,6 +27,7 @@ pub fn measure(text: &str) -> TextMetrics {
     TextMetrics {
         prompt_char_len: u64::try_from(text.chars().count()).unwrap_or(u64::MAX),
         has_stacktrace: has_stacktrace(text),
+        candidates: symbol_index::candidates(text),
     }
 }
 
