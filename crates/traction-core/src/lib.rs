@@ -11,6 +11,7 @@ mod project_id;
 mod rollup;
 mod ruleset;
 mod struggle;
+pub mod sync;
 mod validate;
 
 pub use canonical::{CanonicalJsonError, canonical_json};

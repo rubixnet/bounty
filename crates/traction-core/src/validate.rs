@@ -280,7 +280,7 @@ fn is_absolute_cwd(value: &str) -> bool {
 }
 
 /// `git:<64 lowercase hex>` or `dir:<64 lowercase hex>`.
-fn is_project_id(value: &str) -> bool {
+pub(crate) fn is_project_id(value: &str) -> bool {
     let Some(hash) = value
         .strip_prefix("git:")
         .or_else(|| value.strip_prefix("dir:"))
