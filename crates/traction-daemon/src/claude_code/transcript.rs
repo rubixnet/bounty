@@ -45,7 +45,6 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
-use std::path::Path;
 
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -531,7 +530,7 @@ fn prompt_metrics(texts: &[PromptText], cwd: Option<&str>, symbols: &SymbolIndex
         let mut total = 0u64;
         let mut known = false;
         for t in texts {
-            if let Some(n) = symbols.hits(Path::new(cwd), &t.metrics.candidates) {
+            if let Some(n) = symbols.hits_at(Some(cwd), &t.metrics.candidates) {
                 known = true;
                 total = total.saturating_add(n);
             }

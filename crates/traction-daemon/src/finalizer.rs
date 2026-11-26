@@ -21,12 +21,12 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, params};
 use traction_core::{
-    CommitObservation, MINUTE_MS, PresenceMinute, RollupInput, Ruleset, TRACTION_RULES_1, TractionEvent,
-    fold_baseline, rollup,
+    CommitObservation, MINUTE_MS, PresenceMinute, RollupInput, Ruleset, TRACTION_RULES_1,
+    TractionEvent, fold_baseline, rollup,
 };
 
+use crate::clock::now_ms;
 use crate::log;
-use crate::presence::now_ms;
 use crate::storage::{self, DB_FILE, RollupBatch, WriteOp};
 use crate::writer::WriterSender;
 

@@ -27,10 +27,10 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-use traction_core::{CommitObservation, TRACTION_RULES_1};
+use traction_core::{CommitObservation, Ruleset};
 
+use crate::clock::now_ms;
 use crate::git::Git;
-use crate::presence::now_ms;
 use crate::storage::WriteOp;
 use crate::writer::WriterSender;
 
@@ -103,6 +103,7 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 }
 
 pub fn spawn(
+    rules: &'static Ruleset,
     git: Arc<Git>,
     writer: WriterSender,
     settings: CommitSettings,
@@ -120,7 +121,7 @@ pub fn spawn(
                     Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                     Err(RecvTimeoutError::Timeout) => {
                         for t in tracked.values_mut() {
-                            if let Some(commit) = poll(&git, t, now_ms())
+                            if let Some(commit) = poll(rules, &git, t, now_ms())
                                 && writer.send(WriteOp::Commit(commit)).is_err()
                             {
                                 return;
@@ -157,7 +158,12 @@ fn track(git: &Git, tracked: &mut HashMap<PathBuf, Tracked>, project_id: String,
 }
 
 /// One poll of one worktree. Returns the commit when all three checks pass.
-fn poll(git: &Git, t: &mut Tracked, observed_ms: u64) -> Option<CommitObservation> {
+fn poll(
+    rules: &Ruleset,
+    git: &Git,
+    t: &mut Tracked,
+    observed_ms: u64,
+) -> Option<CommitObservation> {
     let logs_head = mtime(&t.git_dir.join("logs").join("HEAD"));
     if logs_head == t.logs_head {
         return None;
@@ -196,7 +202,7 @@ fn poll(git: &Git, t: &mut Tracked, observed_ms: u64) -> Option<CommitObservatio
 
     // Check 3: the committer time is fresh.
     let committed_ms = git.head_committer_time(&t.folder).ok()?.checked_mul(1000)?;
-    if committed_ms.abs_diff(observed_ms) > TRACTION_RULES_1.commit_freshness_ms {
+    if committed_ms.abs_diff(observed_ms) > rules.commit_freshness_ms {
         return None;
     }
     Some(CommitObservation {

@@ -140,7 +140,12 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     // Commit Observations: Git Projects (and every folder resolved in one,
     // which is how linked worktrees are found) go to the observer.
     let commit_observer = if config.commits.enabled {
-        match commits::spawn(observer_git, commits_writer, config.commits) {
+        match commits::spawn(
+            &traction_core::TRACTION_RULES_1,
+            observer_git,
+            commits_writer,
+            config.commits,
+        ) {
             Ok(observer) => Some(observer),
             Err(error) => {
                 log::error("failed to start the commit observer", &error);
@@ -251,7 +256,12 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     // Presence is best effort: a sensor that cannot start never stops the
     // daemon (the backend degrades its own tier instead).
     let presence = if config.presence.enabled {
-        match presence::spawn(presence::detect(), presence_writer, config.presence.subslot) {
+        match presence::spawn(
+            &traction_core::TRACTION_RULES_1,
+            presence::detect(),
+            presence_writer,
+            config.presence.subslot,
+        ) {
             Ok(sensor) => Some(sensor),
             Err(error) => {
                 log::error("failed to start the presence sensor", &error);

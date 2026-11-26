@@ -200,6 +200,7 @@ One `Ruleset` struct, one `const TRACTION_RULES_1` (`ruleset_id = "traction-rule
 | `specificity_symbol_milli` / `specificity_stacktrace_milli` | 250 / 400 | Specificity per distinct repo symbol; added by a pasted trace |
 | `terse_prompt_chars` / `large_turn_diff_lines` / `terse_big_turn_keep_milli` | 40 / 30 / 250 | A terse prompt launching a large turn keeps this share of its specificity |
 | `index_max_entries` / `index_max_projects` / `index_max_name_bytes` / `index_max_prompt_candidates` | 4096 / 16 / 64 / 512 | File-name index caps (below) |
+| `index_max_extension_chars` | 8 | Longest file extension stripped to get a stem |
 | `index_min_word_chars` / `index_min_stem_chars` / `index_seed_visit_factor` | 3 / 4 / 8 | Shortest matched word; shortest stem or folder name matched alone; attach-time walk visits at most `index_max_entries x factor` entries |
 | `degraded_idle_max_sec` / `degraded_tier_credit_milli` | 10 / 600 | A tier with no input counts is present when its OS idle timer ran past `idle_threshold_sec` for at most this many seconds of the minute; credit kept on `reduced`/`idle_only`/`none` minutes |
 
@@ -226,7 +227,7 @@ The persona pass marks (`PERSONA_MARKS_1`, per mille of a 60-minute wall clock) 
 
 `(project_id, commit_oid, observed_ms)`. For each tracked Git worktree the daemon watches the `mtime` of `<per-worktree git dir>/logs/HEAD` (never opening it: the reflog holds messages) and records a commit only when all three hold: `COMMIT_EDITMSG` `mtime` moved forward (stat only); `HEAD`'s first parent equals the previous `HEAD` (a root commit with no previous `HEAD` also passes); and `HEAD`'s committer time (`rev-list -1 --no-commit-header --format=%ct HEAD`, the only `--format` the hardened wrapper allows) is within `commit_freshness_ms` of the observation. Any failure or timeout means no commit. A linked worktree is tracked under its own git dir. Message, author and diff are never read.
 
-### Tables (all append-only: no-update/no-delete triggers)
+### Tables (append-only, except `struggle_baseline` and `rollup_cursor`)
 
 - `commit_observation (project_id, commit_oid, observed_ms)`, key `(project_id, commit_oid, observed_ms)`.
 - `work_bucket`, key `(project_id, minute_start_ms, ruleset_id)`, one column per Work Bucket field.

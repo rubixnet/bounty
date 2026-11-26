@@ -72,39 +72,9 @@ impl Backend for MacBackend {
     }
 }
 
-/// How many events of one type the OS counted between two reads of
-/// `CGEventSourceCounterForEventType`, handling the 32-bit wrap.
-#[allow(dead_code, reason = "kept for a future opt-in full tier; unit-tested")]
-fn counter_delta(before: u32, after: u32) -> u32 {
-    after.wrapping_sub(before)
-}
-
-/// Events that reached the session but not the hardware HID state were
-/// posted by software: the injected count for one type over one window.
-#[allow(dead_code, reason = "kept for a future opt-in full tier; unit-tested")]
-fn injected_from_counters(hid_delta: u32, combined_delta: u32) -> u32 {
-    combined_delta.saturating_sub(hid_delta)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn counter_deltas_survive_the_32_bit_wrap() {
-        assert_eq!(counter_delta(10, 25), 15);
-        assert_eq!(counter_delta(u32::MAX - 1, 3), 5);
-    }
-
-    #[test]
-    fn software_posted_events_are_the_session_minus_hid_difference() {
-        // Recorded shape from the spike: hardware typing moves both counters
-        // equally; posted events would move only the session counter.
-        assert_eq!(injected_from_counters(12, 12), 0);
-        assert_eq!(injected_from_counters(12, 32), 20);
-        // HID counted more than the session (a race between the two reads).
-        assert_eq!(injected_from_counters(5, 4), 0);
-    }
 
     #[test]
     fn idle_seconds_convert_and_errors_are_no_reading() {

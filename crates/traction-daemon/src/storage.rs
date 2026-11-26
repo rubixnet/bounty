@@ -6,6 +6,7 @@
 //! holds a request body. The single writer thread (`writer.rs`) owns the only
 //! read-write connection.
 
+use crate::clock::now_ms_i64 as now_ms;
 use std::path::Path;
 
 use rusqlite::{Connection, params};
@@ -1149,12 +1150,6 @@ pub fn load_baseline(conn: &Connection) -> rusqlite::Result<Vec<BaselineDay>> {
         });
     }
     Ok(out)
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn upsert_offset(conn: &Connection, row: &TranscriptOffset) -> rusqlite::Result<()> {

@@ -6,10 +6,12 @@
 //! intervals are never stored, so nothing about them survives the minute.
 
 use traction_core::{
-    AppCategory, CategorySec, PresenceMinute, SUBSLOTS_PER_MINUTE, TRACTION_RULES_1, TelemetryTier,
+    AppCategory, CategorySec, PresenceMinute, Ruleset, SUBSLOTS_PER_MINUTE, TelemetryTier,
 };
 
 const SLOTS: usize = SUBSLOTS_PER_MINUTE as usize;
+/// Width of the stored interval histogram: one counter per power of two of
+/// milliseconds. A storage shape (like `BASELINE_BINS`), not a tuning knob.
 const BINS: usize = 16;
 
 /// One input event, content-free: only its kind and whether the OS flagged
@@ -35,6 +37,7 @@ pub struct Sample {
 }
 
 pub struct Aggregator {
+    rules: &'static Ruleset,
     minute_start_ms: u64,
     slot_ms: u64,
     tier: TelemetryTier,
@@ -58,12 +61,14 @@ impl Aggregator {
     /// `previous_category` is the last foreground category of the minute
     /// before, so a switch across the minute boundary is counted.
     pub fn new(
+        rules: &'static Ruleset,
         minute_start_ms: u64,
         slot_ms: u64,
         tier: TelemetryTier,
         previous_category: Option<AppCategory>,
     ) -> Self {
         Self {
+            rules,
             minute_start_ms,
             slot_ms: slot_ms.max(1),
             tier,
@@ -129,7 +134,7 @@ impl Aggregator {
         }
         if let Some(idle_ms) = sample.idle_ms {
             self.idle_seen = true;
-            if idle_ms >= u64::from(TRACTION_RULES_1.idle_threshold_sec) * 1000 {
+            if idle_ms >= u64::from(self.rules.idle_threshold_sec) * 1000 {
                 self.idle_sec = self.idle_sec.saturating_add(secs);
             }
             // The timer reset inside this sub-slot, so some input happened.
@@ -160,7 +165,7 @@ impl Aggregator {
             active_subslots: (!none && (full || self.idle_seen))
                 .then(|| u8::try_from(active).unwrap_or(SUBSLOTS_PER_MINUTE)),
             cadence_entropy_milli: if full {
-                entropy_milli(&self.bins, self.intervals)
+                entropy_milli(&self.bins, self.intervals, self.rules.min_cadence_samples)
             } else {
                 None
             },
@@ -175,8 +180,8 @@ impl Aggregator {
 
 /// Shannon entropy in bits, times 1000, of the interval histogram; `None`
 /// below `min_cadence_samples`.
-fn entropy_milli(bins: &[u32; BINS], total: u32) -> Option<u32> {
-    if total < TRACTION_RULES_1.min_cadence_samples {
+fn entropy_milli(bins: &[u32; BINS], total: u32, min_samples: u32) -> Option<u32> {
+    if total < min_samples {
         return None;
     }
     let total = f64::from(total);
@@ -195,12 +200,13 @@ fn entropy_milli(bins: &[u32; BINS], total: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use traction_core::TRACTION_RULES_1;
 
     const SLOT: u64 = 10_000;
     const START: u64 = 600_000;
 
     fn full() -> Aggregator {
-        Aggregator::new(START, SLOT, TelemetryTier::Full, None)
+        Aggregator::new(&TRACTION_RULES_1, START, SLOT, TelemetryTier::Full, None)
     }
 
     fn close_all(agg: &mut Aggregator, category: Option<AppCategory>, idle_ms: u64) {
@@ -291,7 +297,7 @@ mod tests {
 
     #[test]
     fn category_seconds_and_switches_follow_the_samples() {
-        let mut agg = Aggregator::new(START, SLOT, TelemetryTier::Reduced, None);
+        let mut agg = Aggregator::new(&TRACTION_RULES_1, START, SLOT, TelemetryTier::Reduced, None);
         let cats = [
             AppCategory::Ide,
             AppCategory::Ide,
@@ -321,14 +327,20 @@ mod tests {
 
     #[test]
     fn a_switch_across_the_minute_boundary_is_counted() {
-        let mut agg = Aggregator::new(START, SLOT, TelemetryTier::Reduced, Some(AppCategory::Ide));
+        let mut agg = Aggregator::new(
+            &TRACTION_RULES_1,
+            START,
+            SLOT,
+            TelemetryTier::Reduced,
+            Some(AppCategory::Ide),
+        );
         close_all(&mut agg, Some(AppCategory::Terminal), 0);
         assert_eq!(agg.finish().0.category_switches, Some(1));
     }
 
     #[test]
     fn reduced_tier_fills_idle_and_category_but_nulls_input_fields() {
-        let mut agg = Aggregator::new(START, SLOT, TelemetryTier::Reduced, None);
+        let mut agg = Aggregator::new(&TRACTION_RULES_1, START, SLOT, TelemetryTier::Reduced, None);
         // A backend would never send input at this tier; it must be ignored.
         agg.input(START, InputKind::Key, false);
         close_all(&mut agg, Some(AppCategory::Ide), 45_000);
@@ -345,7 +357,7 @@ mod tests {
 
     #[test]
     fn reduced_tier_derives_active_subslots_from_the_idle_timer() {
-        let mut agg = Aggregator::new(START, SLOT, TelemetryTier::Reduced, None);
+        let mut agg = Aggregator::new(&TRACTION_RULES_1, START, SLOT, TelemetryTier::Reduced, None);
         for slot in 0..SLOTS {
             let idle_ms = if slot % 2 == 0 { 1_500 } else { 25_000 };
             agg.slot_end(
@@ -365,13 +377,19 @@ mod tests {
 
     #[test]
     fn idle_only_has_no_category_and_none_has_nothing() {
-        let mut agg = Aggregator::new(START, SLOT, TelemetryTier::IdleOnly, None);
+        let mut agg = Aggregator::new(
+            &TRACTION_RULES_1,
+            START,
+            SLOT,
+            TelemetryTier::IdleOnly,
+            None,
+        );
         close_all(&mut agg, None, 90_000);
         let (m, _) = agg.finish();
         assert_eq!(m.idle_sec, Some(60));
         assert_eq!(m.category_sec, None);
 
-        let mut agg = Aggregator::new(START, SLOT, TelemetryTier::None, None);
+        let mut agg = Aggregator::new(&TRACTION_RULES_1, START, SLOT, TelemetryTier::None, None);
         close_all(&mut agg, None, 90_000);
         let (m, _) = agg.finish();
         assert_eq!(m.idle_sec, None);

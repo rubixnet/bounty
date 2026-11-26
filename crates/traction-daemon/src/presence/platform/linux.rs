@@ -31,8 +31,9 @@ use x11rb::rust_connection::RustConnection;
 
 use super::super::aggregate::{InputKind, Sample};
 use super::super::category;
-use super::super::{Backend, Msg, now_ms};
+use super::super::{Backend, Msg};
 use super::Unavailable;
+use crate::clock::now_ms;
 use crate::log;
 
 /// `XIAllMasterDevices`: raw events are delivered per master device and

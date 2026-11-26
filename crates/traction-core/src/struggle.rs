@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::rollup::WorkBucket;
 use crate::MINUTE_MS;
+use crate::rollup::WorkBucket;
 use crate::{AppCategory, EventType, PresenceMinute, Ruleset, TelemetryTier, TractionEvent};
 
 const DAY_MS: u64 = 86_400_000;
@@ -20,7 +20,10 @@ const DAY_MS: u64 = 86_400_000;
 /// Histogram bins per axis per baseline day (each 100 per mille wide). This
 /// is the stored shape of [`BaselineDay`], not a tuning knob.
 pub const BASELINE_BINS: usize = 10;
-const BIN_WIDTH: u32 = 100;
+/// Width of one histogram bin (per mille): `1000 / BASELINE_BINS`. Part of the
+/// stored baseline shape, not a tuning knob; changing it needs a new storage
+/// format, not a new Ruleset.
+const BIN_WIDTH: u32 = 1000 / BASELINE_BINS as u32;
 
 /// The four axes of one Work Bucket, each 0 to 1000.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,11 +205,13 @@ pub(crate) fn score(rules: &Ruleset, input: &ScoreInput<'_>, buckets: &mut [Work
 
     for (session, events) in &by_session {
         session_signals(
-            rules,
-            input.flagged_minutes,
+            &SessionEnv {
+                rules,
+                flagged_minutes: input.flagged_minutes,
+                mutations: &mutations,
+            },
             session,
             events,
-            &mutations,
             &mut anchor,
             &mut loops,
             &mut spans,
@@ -396,17 +401,28 @@ fn steering(
     (interleaved * 1000).checked_div(total).unwrap_or(0)
 }
 
+/// What every session's scan reads besides its own events.
+struct SessionEnv<'a> {
+    rules: &'a Ruleset,
+    /// Minutes flagged `injected_hid_detected`.
+    flagged_minutes: &'a BTreeSet<u64>,
+    mutations: &'a BTreeMap<&'a str, Vec<&'a TractionEvent>>,
+}
+
 /// One session's anchors, friction loops and prompt specificity spans.
 fn session_signals(
-    rules: &Ruleset,
-    flagged_minutes: &BTreeSet<u64>,
+    env: &SessionEnv<'_>,
     session: &str,
     events: &[&TractionEvent],
-    mutations: &BTreeMap<&str, Vec<&TractionEvent>>,
     anchor: &mut impl FnMut(&str, u64, u32),
     loops: &mut BTreeMap<String, Vec<Loop>>,
     spans: &mut BTreeMap<String, Vec<(u64, u64, u32)>>,
 ) {
+    let SessionEnv {
+        rules,
+        flagged_minutes,
+        mutations,
+    } = *env;
     let stale = rules.stale_turn_timeout_ms;
     let mut open = false;
     let mut last = 0u64;

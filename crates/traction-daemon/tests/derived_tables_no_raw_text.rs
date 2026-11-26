@@ -37,7 +37,9 @@ fn data_folder_bytes(dir: &std::path::Path) -> Vec<u8> {
 }
 
 fn has(haystack: &[u8], needle: &str) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle.as_bytes())
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
 }
 
 #[test]

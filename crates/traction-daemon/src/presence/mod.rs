@@ -25,10 +25,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use traction_core::{AppCategory, PresenceMinute, SUBSLOT_SEC, SUBSLOTS_PER_MINUTE, TelemetryTier};
+use traction_core::{
+    AppCategory, PresenceMinute, Ruleset, SUBSLOT_SEC, SUBSLOTS_PER_MINUTE, TelemetryTier,
+};
 
+use crate::clock::now_ms;
 use crate::storage::WriteOp;
 use crate::writer::WriterSender;
 use aggregate::{Aggregator, InputKind, Sample};
@@ -104,16 +107,11 @@ impl PresenceSensor {
     }
 }
 
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
 /// The sensor's clock-free state machine: sub-slots close on a fixed grid
 /// from the minute start, whatever time the caller wakes up at, and a stall
 /// closes the sub-slots and minutes it covered instead of dropping them.
 struct Tracker {
+    rules: &'static Ruleset,
     slot_ms: u64,
     minute_ms: u64,
     minute_start: u64,
@@ -126,6 +124,7 @@ struct Tracker {
 
 impl Tracker {
     fn new(
+        rules: &'static Ruleset,
         slot_ms: u64,
         now: u64,
         previous: Option<AppCategory>,
@@ -135,13 +134,14 @@ impl Tracker {
         let minute_start = now / minute_ms * minute_ms;
         let into = now - minute_start;
         Self {
+            rules,
             slot_ms,
             minute_ms,
             minute_start,
             next_slot: usize::try_from(into / slot_ms).unwrap_or(0),
             // Joined more than a sub-slot late: a partial minute.
             partial: into > slot_ms,
-            agg: Aggregator::new(minute_start, slot_ms, backend.tier(), previous),
+            agg: Aggregator::new(rules, minute_start, slot_ms, backend.tier(), previous),
         }
     }
 
@@ -178,7 +178,7 @@ impl Tracker {
                 let next_start = self.minute_start + self.minute_ms;
                 let finished = std::mem::replace(
                     &mut self.agg,
-                    Aggregator::new(next_start, self.slot_ms, backend.tier(), None),
+                    Aggregator::new(self.rules, next_start, self.slot_ms, backend.tier(), None),
                 );
                 let observed = finished.observed();
                 let (minute, last) = finished.finish();
@@ -189,7 +189,8 @@ impl Tracker {
                         unobserved_minutes += 1;
                     }
                 }
-                self.agg = Aggregator::new(next_start, self.slot_ms, backend.tier(), last);
+                self.agg =
+                    Aggregator::new(self.rules, next_start, self.slot_ms, backend.tier(), last);
                 self.minute_start = next_start;
                 self.next_slot = 0;
                 self.partial = false;
@@ -204,6 +205,7 @@ impl Tracker {
 }
 
 pub fn spawn(
+    rules: &'static Ruleset,
     mut backend: Box<dyn Backend>,
     writer: WriterSender,
     subslot: Duration,
@@ -218,7 +220,7 @@ pub fn spawn(
     let handle = thread::Builder::new()
         .name("traction-presence".to_owned())
         .spawn(move || {
-            let mut tracker = Tracker::new(slot_ms, now_ms(), None, backend.as_ref());
+            let mut tracker = Tracker::new(rules, slot_ms, now_ms(), None, backend.as_ref());
             let mut ready = Vec::new();
             loop {
                 let now = now_ms();
@@ -365,7 +367,13 @@ mod tests {
         let (backend, reads, _) = fake(TelemetryTier::Reduced);
         let slot = Duration::from_millis(40);
         let started = now_ms();
-        let sensor = spawn(Box::new(backend), sender, slot).unwrap();
+        let sensor = spawn(
+            &traction_core::TRACTION_RULES_1,
+            Box::new(backend),
+            sender,
+            slot,
+        )
+        .unwrap();
         wait_for_rows(&db, 3);
         let wakeups = sensor.wakeups();
         let elapsed_slots = (now_ms() - started) / 40;
@@ -394,7 +402,7 @@ mod tests {
     const START: u64 = 1_000_000 * MINUTE;
 
     fn tracker(now: u64, backend: &Fake) -> Tracker {
-        Tracker::new(SLOT, now, None, backend)
+        Tracker::new(&traction_core::TRACTION_RULES_1, SLOT, now, None, backend)
     }
 
     #[test]
@@ -460,7 +468,13 @@ mod tests {
         let (dir, db, sender, writer_thread) = open();
         let (backend, _, input_tx) = fake(TelemetryTier::Full);
         let slot = Duration::from_millis(50);
-        let sensor = spawn(Box::new(backend), sender, slot).unwrap();
+        let sensor = spawn(
+            &traction_core::TRACTION_RULES_1,
+            Box::new(backend),
+            sender,
+            slot,
+        )
+        .unwrap();
         let tx = input_tx.lock().unwrap().clone().unwrap();
         // Send input for ~2.5 minutes of 300 ms, alternating real/injected.
         let end = now_ms() + 750;
@@ -517,7 +531,13 @@ mod tests {
         };
         thread::sleep(Duration::from_millis(wait));
         let first_minute_start = now_ms() / minute * minute;
-        let sensor = spawn(Box::new(backend), sender, slot).unwrap();
+        let sensor = spawn(
+            &traction_core::TRACTION_RULES_1,
+            Box::new(backend),
+            sender,
+            slot,
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(minute + 300));
         sensor.stop().unwrap();
         writer_thread.join().unwrap();

@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use traction_core::{
-    AttributionSource, BaselineDay, CategorySec, CommitObservation, EndReason, EventType, HarnessId,
-    MetricsOnly, MutationKind, NetworkClass, PresenceMinute, RollupInput, RollupOutput,
+    AttributionSource, BaselineDay, CategorySec, CommitObservation, EndReason, EventType,
+    HarnessId, MetricsOnly, MutationKind, NetworkClass, PresenceMinute, RollupInput, RollupOutput,
     SCHEMA_VERSION, TRACTION_RULES_1, TelemetryTier, TractionEvent, canonical_json, rollup,
 };
 
@@ -436,7 +436,12 @@ fn a_flood_at_one_timestamp_cannot_mint_time() {
         })
         .collect();
     let ev = build(&raw);
-    let d = Data { events: &ev, presence: &[], commits: &[], baseline: &[] };
+    let d = Data {
+        events: &ev,
+        presence: &[],
+        commits: &[],
+        baseline: &[],
+    };
     let (from, to) = (T0, T0 + SPAN_MIN * MIN);
     let out = run(&d, from, to);
     let agent: u32 = out.work_buckets.iter().map(|b| b.agent_compute_sec).sum();

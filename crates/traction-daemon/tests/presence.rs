@@ -274,7 +274,10 @@ fn a_restart_leaves_no_rows_for_the_minutes_the_daemon_was_down() {
     let db = second.shutdown_and_open_db();
     let rows = rows(&db);
     drop(db);
-    assert!(rows.iter().any(|r| r.minute_start_ms + MINUTE_MS <= down_from));
+    assert!(
+        rows.iter()
+            .any(|r| r.minute_start_ms + MINUTE_MS <= down_from)
+    );
     // No row starts while the daemon was down, except a minute it joined
     // within its first sub-slot.
     let slot = i64::try_from(SUBSLOT.as_millis()).unwrap();
