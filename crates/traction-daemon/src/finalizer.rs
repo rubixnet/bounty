@@ -134,6 +134,24 @@ pub fn spawn(
     Ok(FinalizerThread { stop, handle })
 }
 
+/// Finalizes everything settled at `now_ms` in the database under
+/// `data_dir`, batch by batch, returning how many batches were written.
+/// For a stopped daemon only (it opens its own writing connection): the
+/// catch-up pass the integration tests use to inspect derived tables.
+#[doc(hidden)]
+pub fn finalize_settled(data_dir: &Path, now_ms: u64) -> rusqlite::Result<usize> {
+    let rules = &TRACTION_RULES_1;
+    let mut conn = storage::open(data_dir)?;
+    let mut cursor = read_cursor(&conn, rules)?;
+    let mut batches = 0;
+    while let Some(batch) = finalize_range(&conn, rules, cursor, now_ms, rules.bucket_settle_ms)? {
+        cursor = Some(batch.through_ms);
+        storage::apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(batch))])?;
+        batches += 1;
+    }
+    Ok(batches)
+}
+
 fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
