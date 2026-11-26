@@ -4,8 +4,8 @@
 //!
 //! - A **hook window** (`harness_hook` / `harness_plugin`) opens on a
 //!   `TOOL_PRE` while the session's turn is open, and closes on the next
-//!   `TOOL_POST` / `TOOL_FAIL` / `TOOL_PRE` or on turn end (`TURN_END`,
-//!   `STOP_FAILURE`, `SESSION_END`).
+//!   `TOOL_POST` / `TOOL_FAIL` / `TOOL_PRE` / `PERMISSION_REQUEST` or on
+//!   turn end (`TURN_END`, `STOP_FAILURE`, `SESSION_END`).
 //! - A **log-tailed turn window** (`harness_log` / `harness_db_poll`) opens
 //!   on a `PROMPT_SUBMIT` and closes on the next turn end or prompt.
 //! - A **trailing fallback window** covers a log-tailed session that has
@@ -179,7 +179,12 @@ impl Attribution {
                     state.open(Kind::Hook, ts);
                 }
             }
-            EventType::ToolPost | EventType::ToolFail if hook => state.close(Kind::Hook, ts),
+            // While a permission prompt waits, and after a refusal (which
+            // may send no further hook), edits are the user's. No hook
+            // reports an approval, so the window does not reopen.
+            EventType::ToolPost | EventType::ToolFail | EventType::PermissionRequest if hook => {
+                state.close(Kind::Hook, ts)
+            }
             _ => {}
         }
         if log {

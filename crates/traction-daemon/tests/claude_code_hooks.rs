@@ -248,6 +248,46 @@ fn replay(scenario: &str) -> (Vec<Row>, String, PathBuf) {
     (rows, session, repo)
 }
 
+/// `PROMPT_SUBMIT`s a tailer-only daemon stores from `scenario`'s
+/// transcript.
+fn transcript_prompt_count(scenario: &str) -> usize {
+    let mut daemon = TestDaemon::start_with(|config| {
+        config.writer.commit_interval = Duration::from_millis(50);
+    });
+    let folder = daemon.home().join(".claude/projects/-repo");
+    fs::create_dir_all(&folder).expect("projects folder");
+    let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/claude-code")
+        .join(scenario)
+        .join("transcript.jsonl");
+    let repo = serde_json::to_string(common::path_str(&daemon.home())).expect("JSON");
+    let text = fs::read_to_string(file)
+        .expect("fixture transcript")
+        .replace("<REPO>", repo.trim_matches('"'));
+    fs::write(folder.join("parity.jsonl"), &text).expect("transcript");
+    // The last record that maps is stored once the whole file was read.
+    let db = daemon.live_db();
+    common::poll_until(Duration::from_secs(30), "tailed rows", || {
+        let tools: i64 = db
+            .query_row(
+                "SELECT count(*) FROM traction_event WHERE event_type = 'TOOL_POST'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        (tools > 0).then_some(())
+    });
+    let db = daemon.shutdown_and_open_db();
+    db.query_row(
+        "SELECT count(*) FROM traction_event WHERE event_type = 'PROMPT_SUBMIT'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("count")
+    .try_into()
+    .expect("count fits")
+}
+
 // --- Mapping, with the captured payloads ----------------------------------
 
 #[test]
@@ -319,12 +359,16 @@ fn subagent_hooks_map_to_subagent_start_and_stop() {
         shape("TOOL_POST", Some("Read")),
         shape("TURN_END", None),
         shape("SUBAGENT_STOP", None),
-        shape("PROMPT_SUBMIT", None),
         shape("TURN_END", None),
         shape("SESSION_END", None),
     ];
     expected.sort();
     assert_eq!(shapes(&rows), expected);
+    // Parity with the transcript of the same session: the user typed one
+    // prompt; the task notification is none on either path.
+    assert_eq!(transcript_prompt_count("subagent"), 1);
+    let hook_prompts = rows.iter().filter(|r| r.event_type == "PROMPT_SUBMIT");
+    assert_eq!(hook_prompts.count(), 1);
 }
 
 #[test]

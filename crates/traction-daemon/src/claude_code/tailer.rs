@@ -18,6 +18,9 @@
 //! - **First sight.** At the tailer's first-ever start (recorded once),
 //!   every existing transcript starts at its end; any file seen later with
 //!   no stored offset was created after that and starts at 0.
+//! - **Pauses.** A recorded `/stop-track` or `/resume-track` goes to the
+//!   Router in order with the events around it, so a pause typed while no
+//!   hook could handle it is honoured on backfill.
 //! - **Lines.** Only complete lines (up to the last `\n`) are read. A
 //!   malformed line is skipped and logged by reason code only; a line
 //!   longer than [`MAX_LINE_BYTES`] is skipped without being buffered.
@@ -42,15 +45,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use notify::event::EventKind;
-use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher as _};
-use traction_core::TractionEvent;
-
-use super::transcript::{self, LineError, ToolNames};
+use super::transcript::{self, Line, LineError, ToolNames};
 use crate::log;
 use crate::paths;
-use crate::router::RouterSender;
+use crate::router::{RouterSender, TailedItem};
 use crate::storage::{TailerStartRow, TailerState, TranscriptOffset};
+use notify::event::EventKind;
+use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 /// The folder under the Claude config folder that holds transcripts.
 pub const PROJECTS_DIR: &str = "projects";
@@ -446,7 +447,7 @@ impl Worker {
             return;
         }
         let mut reader = BufReader::with_capacity(64 * 1024, file.take(len - state.offset));
-        let mut pending: Vec<TractionEvent> = Vec::new();
+        let mut pending: Vec<TailedItem> = Vec::new();
         let mut line: Vec<u8> = Vec::new();
         let mut skipping = false;
         let mut position = state.offset;
@@ -495,23 +496,26 @@ impl Worker {
         state.offset = committed;
     }
 
-    fn map_line(&mut self, line: &[u8], tools: &mut ToolNames, pending: &mut Vec<TractionEvent>) {
+    fn map_line(&mut self, line: &[u8], tools: &mut ToolNames, pending: &mut Vec<TailedItem>) {
         if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
         match transcript::map_line(line, tools) {
             Ok(None) => {}
-            Ok(Some(mapped)) => {
+            Ok(Some(Line::Pause(pause))) => pending.push(TailedItem::Pause(pause)),
+            Ok(Some(Line::Events(mapped))) => {
                 let first = &mapped.events[0];
                 let session = first.session_id.clone().unwrap_or_default();
                 if !self.announced.contains(&session) {
                     if self.announced.len() >= MAX_ANNOUNCED_SESSIONS {
                         self.announced.clear();
                     }
-                    pending.push(transcript::session_start(first, &mapped.record_uuid));
+                    let start = transcript::session_start(first, &mapped.record_uuid);
+                    pending.push(TailedItem::Event(Box::new(start)));
                     self.announced.insert(session);
                 }
-                pending.extend(mapped.events);
+                let events = mapped.events.into_iter().map(Box::new);
+                pending.extend(events.map(TailedItem::Event));
             }
             Err(error) => self.skipped(match error {
                 LineError::InvalidJson => {
@@ -532,11 +536,11 @@ impl Worker {
         log::warn_counted(message, self.malformed);
     }
 
-    fn flush(&mut self, key: &str, identity: &str, offset: u64, pending: &mut Vec<TractionEvent>) {
-        let events = std::mem::take(pending);
+    fn flush(&mut self, key: &str, identity: &str, offset: u64, pending: &mut Vec<TailedItem>) {
+        let items = std::mem::take(pending);
         if self
             .router
-            .send_tailed(events, offset_row(key, identity, offset))
+            .send_tailed(items, offset_row(key, identity, offset))
             .is_err()
         {
             self.router_gone = true;

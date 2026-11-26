@@ -424,7 +424,8 @@ pub enum WriteOp {
     Session(SessionRow),
     /// Alias-only `dir:` -> `git:` migration, in the batch's transaction.
     Migration(MigrationRow),
-    /// Opens a pause span (`to_ms` unset). Ignored when the session
+    /// Inserts a pause span: open (`to_ms` unset), or already closed when
+    /// backfilled before a later span. Ignored when the session
     /// already has an open span.
     PauseStart(PauseSpanRow),
     /// Closes the session's open span starting at `from_ms` at `to_ms`.
@@ -904,12 +905,13 @@ fn migrate_project(conn: &Connection, row: &MigrationRow) -> rusqlite::Result<()
 fn start_pause(conn: &Connection, row: &PauseSpanRow) -> rusqlite::Result<()> {
     conn.prepare_cached(
         "INSERT OR IGNORE INTO session_pause (harness_id, session_id, from_ms, to_ms)
-         VALUES (?1, ?2, ?3, NULL)",
+         VALUES (?1, ?2, ?3, ?4)",
     )?
     .execute(params![
         row.harness_id.as_str(),
         row.session_id,
-        row.from_ms
+        row.from_ms,
+        row.to_ms,
     ])?;
     Ok(())
 }

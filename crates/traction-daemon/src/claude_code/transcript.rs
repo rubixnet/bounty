@@ -10,11 +10,22 @@
 //!
 //! Mapping, decided from the real fixtures in `tests/data/claude-code/`
 //! (Claude Code 2.1.332):
-//! - `user` record with prompt text (not a tool result, not `isMeta`, not a
-//!   slash-command wrapper) → `PROMPT_SUBMIT`;
+//! - `user` record with prompt text (not a tool result, not a slash-command
+//!   wrapper, not a task notification) → `PROMPT_SUBMIT`. With no `origin`,
+//!   text starting like injected output ([`INJECTED_PREFIXES`]) is not a
+//!   prompt either;
+//! - `user` record marked `isMeta`, `isCompactSummary`,
+//!   `isVisibleInTranscriptOnly` or `isVirtual`, or whose `origin.kind` is
+//!   `task-notification` → nothing;
+//! - `user` record that is exactly the wrapper of `/stop-track` or
+//!   `/resume-track` → no event, but a Session Pause command
+//!   ([`Line::Pause`]): Claude Code writes one only when no hook blocked
+//!   the command (daemon down, no token);
 //! - `tool_use` block of an `assistant` record → `TOOL_PRE` (`tool_name`);
 //! - `tool_result` block of a `user` record → `TOOL_POST`, or `TOOL_FAIL`
-//!   when `is_error` is true (`tool_name` from the matching `tool_use`);
+//!   when `is_error` is true (`tool_name` from the matching `tool_use`).
+//!   A record with `toolDenialKind` (the call was refused or interrupted)
+//!   maps to nothing, as the hooks report no result for it either;
 //! - `assistant` record with `isApiErrorMessage: true` → `STOP_FAILURE`;
 //! - nothing maps to `TURN_END`: the only per-turn record,
 //!   `system`/`stop_hook_summary`, exists only when a `Stop` hook is
@@ -43,9 +54,11 @@ use traction_core::{
     TractionEvent,
 };
 
-use super::hook::capped_identifier;
+use super::hook::{capped_identifier, is_task_notification};
+use super::pause::Command;
 use crate::content_metrics::{self, TextMetrics};
 use crate::event_id::derived_event_id;
+use crate::router::Pause;
 
 /// `tool_use` IDs remembered per transcript (for the `tool_name` of their
 /// results) before the table is cleared: bounded memory.
@@ -53,6 +66,17 @@ const MAX_OPEN_TOOL_USES: usize = 1024;
 
 /// Text that starts a slash-command wrapper record, not a typed prompt.
 const COMMAND_MARKERS: [&str; 3] = ["<command-name>", "<command-message>", "<local-command-"];
+
+/// Text Claude Code injects as a `user` record. Checked only on records
+/// without an `origin`, which cannot be told apart otherwise.
+const INJECTED_PREFIXES: [&str; 6] = [
+    "This session is being continued",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "Caveat:",
+];
 
 /// Why a transcript line was skipped. Logged by code only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,9 +114,17 @@ pub struct Mapped {
     pub events: Vec<TractionEvent>,
 }
 
+/// What one record asks of the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Line {
+    Events(Mapped),
+    /// A recorded `/stop-track` or `/resume-track`.
+    Pause(Pause),
+}
+
 /// Maps one transcript line (without its `\n`). `Ok(None)` for a record
 /// that maps to nothing.
-pub fn map_line(line: &[u8], tools: &mut ToolNames) -> Result<Option<Mapped>, LineError> {
+pub fn map_line(line: &[u8], tools: &mut ToolNames) -> Result<Option<Line>, LineError> {
     let record: Record = serde_json::from_slice(line).map_err(|error| {
         if error.is_data() {
             LineError::UnexpectedShape
@@ -137,9 +169,28 @@ struct Record {
     is_sidechain: Option<bool>,
     #[serde(rename = "isApiErrorMessage", default)]
     is_api_error: Option<bool>,
+    #[serde(rename = "isCompactSummary", default)]
+    is_compact_summary: Option<bool>,
+    #[serde(rename = "isVisibleInTranscriptOnly", default)]
+    is_transcript_only: Option<bool>,
+    #[serde(rename = "isVirtual", default)]
+    is_virtual: Option<bool>,
+    /// Who produced a `user` record; absent on many.
+    #[serde(default)]
+    origin: Option<Lenient<Origin>>,
+    /// Set on the `user` record of a refused or interrupted tool call. Only
+    /// its presence matters.
+    #[serde(rename = "toolDenialKind", default)]
+    tool_denial: Option<IgnoredAny>,
     /// Any non-object `message` (other record types) is skipped.
     #[serde(default)]
     message: Lenient<Message>,
+}
+
+#[derive(Deserialize)]
+struct Origin {
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,14 +214,28 @@ struct PromptText {
     metrics: TextMetrics,
     /// Starts with a slash-command wrapper tag.
     is_command: bool,
+    /// Starts like one of [`INJECTED_PREFIXES`].
+    looks_injected: bool,
+    is_task_notification: bool,
+    /// The Session Pause command this text is the wrapper of.
+    pause: Option<Command>,
 }
 
 impl PromptText {
     fn of(text: &str) -> Self {
+        let trimmed = text.trim_start();
         Self {
             metrics: content_metrics::measure(text),
             is_command: COMMAND_MARKERS.iter().any(|m| text.starts_with(m)),
+            looks_injected: INJECTED_PREFIXES.iter().any(|p| trimmed.starts_with(p)),
+            is_task_notification: is_task_notification(text),
+            pause: Command::matching_wrapper(text),
         }
+    }
+
+    /// Whether the user typed this as a prompt.
+    fn is_typed(&self, has_origin: bool) -> bool {
+        !(self.is_command || self.is_task_notification || (!has_origin && self.looks_injected))
     }
 }
 
@@ -290,7 +355,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Lenient<T> {
     }
 }
 
-fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Mapped>, LineError> {
+fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Line>, LineError> {
     let is_user = match record.kind.as_deref() {
         Some("user") => true,
         Some("assistant") => false,
@@ -305,31 +370,53 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Mapped>, L
     let content = record.message.0.map(|m| m.content).unwrap_or_default();
     // (block index, event type, metrics) before the timestamp is needed.
     let mut planned: Vec<(usize, EventType, MetricsOnly)> = Vec::new();
+    let mut pause = None;
     if is_user {
-        if record.is_meta == Some(true) {
+        let synthetic = [
+            record.is_meta,
+            record.is_compact_summary,
+            record.is_transcript_only,
+            record.is_virtual,
+        ]
+        .contains(&Some(true));
+        let has_origin = record.origin.is_some();
+        let from_task = record
+            .origin
+            .and_then(|origin| origin.0?.kind)
+            .is_some_and(|kind| kind == "task-notification");
+        if synthetic || from_task {
             return Ok(None);
         }
         match content {
             Content::None => {}
             Content::Text(text) => {
-                if !text.is_command {
+                if let Some(command) = text.pause {
+                    pause = Some(command);
+                } else if text.is_typed(has_origin) {
                     planned.push((0, EventType::PromptSubmit, prompt_metrics(&[text])));
                 }
             }
             Content::Blocks(blocks) => {
                 let blocks: Vec<Block> = blocks.into_iter().filter_map(|b| b.0).collect();
+                let denied = record.tool_denial.is_some();
                 let mut texts = Vec::new();
                 let mut has_image = false;
+                let mut has_result = false;
                 for (index, block) in blocks.iter().enumerate() {
                     match block.kind.as_deref() {
                         Some("tool_result") => {
+                            has_result = true;
+                            let tool_name = tools.close(block.tool_use_id.as_deref());
+                            if denied {
+                                continue;
+                            }
                             let event_type = if block.is_error == Some(true) {
                                 EventType::ToolFail
                             } else {
                                 EventType::ToolPost
                             };
                             let metrics = MetricsOnly {
-                                tool_name: tools.close(block.tool_use_id.as_deref()),
+                                tool_name,
                                 ..MetricsOnly::default()
                             };
                             planned.push((index, event_type, metrics));
@@ -339,9 +426,14 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Mapped>, L
                         _ => {}
                     }
                 }
-                let typed = texts.iter().any(|t| !t.is_command);
-                if planned.is_empty() && (typed || (has_image && texts.is_empty())) {
-                    planned.push((0, EventType::PromptSubmit, prompt_metrics(&texts)));
+                // Text beside a tool result (such as an interrupt notice)
+                // is never a prompt.
+                if !has_result && !denied {
+                    pause = texts.iter().find_map(|t| t.pause);
+                    let typed = texts.iter().any(|t| t.is_typed(has_origin));
+                    if typed || (has_image && texts.is_empty()) {
+                        planned.push((0, EventType::PromptSubmit, prompt_metrics(&texts)));
+                    }
                 }
             }
         }
@@ -364,7 +456,7 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Mapped>, L
             planned.push((index, EventType::ToolPre, metrics));
         }
     }
-    if planned.is_empty() {
+    if planned.is_empty() && pause.is_none() {
         return Ok(None);
     }
     let timestamp_ms = record
@@ -372,6 +464,25 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Mapped>, L
         .as_deref()
         .and_then(parse_timestamp_ms)
         .ok_or(LineError::BadTimestamp)?;
+    if let Some(command) = pause {
+        // Validated as the prompt's event would be, so a pause is keyed by
+        // a safe session ID; the event itself is dropped.
+        let probe = event(
+            &session_id,
+            &uuid,
+            0,
+            EventType::PromptSubmit,
+            timestamp_ms,
+            None,
+            MetricsOnly::default(),
+        );
+        return Ok(probe.validate().is_ok().then_some(Line::Pause(Pause {
+            action: command.action,
+            harness: HarnessId::ClaudeCode,
+            session_id,
+            at_ms: timestamp_ms,
+        })));
+    }
     let events: Vec<TractionEvent> = planned
         .into_iter()
         .map(|(index, event_type, metrics)| {
@@ -387,10 +498,10 @@ fn map_record(record: Record, tools: &mut ToolNames) -> Result<Option<Mapped>, L
         })
         .filter(|event| event.validate().is_ok())
         .collect();
-    Ok((!events.is_empty()).then_some(Mapped {
+    Ok((!events.is_empty()).then_some(Line::Events(Mapped {
         record_uuid: uuid,
         events,
-    }))
+    })))
 }
 
 /// `PROMPT_SUBMIT` metrics of one prompt made of `texts`.
@@ -527,7 +638,10 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
+    use crate::claude_code::pause::PauseAction;
 
     #[test]
     fn rfc3339_timestamps_parse_to_unix_millis() {
@@ -555,6 +669,154 @@ mod tests {
             "2026-11-25T16:36:30.382Zjunk",
         ] {
             assert_eq!(parse_timestamp_ms(bad), None, "{bad:?}");
+        }
+    }
+
+    /// A synthetic `user` record with `content`, plus `extra` fields.
+    fn user_record(content: Value, extra: Value) -> String {
+        let mut record = json!({
+            "type": "user",
+            "sessionId": "s",
+            "uuid": "00000000-0000-4000-8000-000000000001",
+            "timestamp": "2026-11-25T16:36:30.382Z",
+            "cwd": "/code/app",
+            "message": { "role": "user", "content": content },
+        });
+        for (key, value) in extra.as_object().expect("object") {
+            record[key] = value.clone();
+        }
+        record.to_string()
+    }
+
+    /// The event types `line` maps to.
+    fn types_of(line: &str, tools: &mut ToolNames) -> Vec<EventType> {
+        match map_line(line.as_bytes(), tools).expect("a readable line") {
+            Some(Line::Events(mapped)) => mapped.events.iter().map(|e| e.event_type).collect(),
+            Some(Line::Pause(pause)) => panic!("unexpected pause: {pause:?}"),
+            None => vec![],
+        }
+    }
+
+    // No events means no turn window: windows open only on events.
+    #[test]
+    fn compact_summaries_and_other_synthetic_user_records_map_to_nothing() {
+        let summary = "This session is being continued from a previous conversation \
+                       that ran out of context. Summary: fix the build.";
+        let flags = [
+            json!({"isCompactSummary": true, "isVisibleInTranscriptOnly": true}),
+            json!({"isCompactSummary": true}),
+            json!({"isVisibleInTranscriptOnly": true}),
+            json!({"isVirtual": true}),
+        ];
+        for flag in flags {
+            for content in [json!(summary), json!([{"type": "text", "text": "plain"}])] {
+                let line = user_record(content, flag.clone());
+                assert_eq!(types_of(&line, &mut ToolNames::default()), vec![], "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn injected_text_without_an_origin_is_not_a_prompt() {
+        for prefix in [
+            "This session is being continued",
+            "<local-command-stdout>",
+            "<local-command-stderr>",
+            "<bash-stdout>",
+            "<bash-stderr>",
+            "Caveat:",
+        ] {
+            let text = format!("{prefix} and more");
+            for content in [json!(text), json!([{"type": "text", "text": text}])] {
+                let line = user_record(content, json!({}));
+                assert_eq!(types_of(&line, &mut ToolNames::default()), vec![], "{line}");
+            }
+        }
+        // With a human origin the same words were typed.
+        let line = user_record(json!("Caveat: typed"), json!({"origin": {"kind": "human"}}));
+        assert_eq!(
+            types_of(&line, &mut ToolNames::default()),
+            vec![EventType::PromptSubmit]
+        );
+    }
+
+    #[test]
+    fn task_notifications_are_not_prompts() {
+        for line in [
+            user_record(
+                json!("a background task finished"),
+                json!({"origin": {"kind": "task-notification"}}),
+            ),
+            user_record(
+                json!("<task-notification>\n<task-id>a</task-id>"),
+                json!({}),
+            ),
+            user_record(
+                json!([{"type": "text", "text": "<task-notification>x"}]),
+                json!({}),
+            ),
+        ] {
+            assert_eq!(types_of(&line, &mut ToolNames::default()), vec![], "{line}");
+        }
+    }
+
+    #[test]
+    fn a_denied_tool_result_is_neither_a_failure_nor_a_prompt() {
+        for kind in [
+            "user-rejected",
+            "permission-rule",
+            "automode-unavailable",
+            "interrupted",
+        ] {
+            let mut tools = ToolNames::default();
+            tools.open("toolu_1".to_owned(), "Bash".to_owned());
+            let line = user_record(
+                json!([
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true,
+                     "content": "The user doesn't want to proceed with this tool use."},
+                    {"type": "text", "text": "[Request interrupted by user for tool use]"},
+                ]),
+                json!({"toolDenialKind": kind}),
+            );
+            assert_eq!(types_of(&line, &mut tools), vec![], "{kind}");
+            assert_eq!(tools.close(Some("toolu_1")), None, "the call is closed");
+        }
+    }
+
+    #[test]
+    fn only_an_exact_command_wrapper_is_a_pause() {
+        let pause_of = |text: &str| {
+            let line = user_record(json!(text), json!({}));
+            match map_line(line.as_bytes(), &mut ToolNames::default()).expect("readable") {
+                Some(Line::Pause(pause)) => Some((pause.action, pause.session_id, pause.at_ms)),
+                Some(Line::Events(mapped)) => panic!("stored as events: {mapped:?}"),
+                None => None,
+            }
+        };
+        let at = |action| Some((action, "s".to_owned(), 1_795_624_590_382));
+        for text in [
+            "<command-name>/stop-track</command-name>",
+            "<command-message>stop-track</command-message>\n<command-name>/stop-track</command-name>",
+            "<command-name>/stop-track</command-name>\n            <command-message>stop-track</command-message>\n            <command-args></command-args>",
+            "  <command-name> /stop-track </command-name>\n",
+        ] {
+            assert_eq!(pause_of(text), at(PauseAction::Stop), "{text:?}");
+        }
+        assert_eq!(
+            pause_of(
+                "<command-message>resume-track</command-message>\n<command-name>/resume-track</command-name>"
+            ),
+            at(PauseAction::Resume)
+        );
+        for text in [
+            "<command-name>/stop-tracking</command-name>",
+            "<command-name>stop-track</command-name>",
+            "<command-name>/clear</command-name>",
+            "<command-name>/stop-track</command-name><command-args>please</command-args>",
+            "<command-name>/stop-track</command-name> and then some",
+            "<command-message>/stop-track</command-message>",
+        ] {
+            assert_eq!(pause_of(text), None, "{text:?}");
         }
     }
 

@@ -277,7 +277,7 @@ fn records_map_to_tool_failures_api_errors_and_nothing_for_a_blocked_prompt() {
     )
     .expect("copy subagent transcript");
 
-    let rows = wait_for_events(&daemon, 14);
+    let rows = wait_for_events(&daemon, 13);
     let of = |session: &str| -> Vec<(String, Option<String>)> {
         let rows: Vec<Tailed> = rows
             .iter()
@@ -308,8 +308,8 @@ fn records_map_to_tool_failures_api_errors_and_nothing_for_a_blocked_prompt() {
     );
     // A `/stop-track` block writes only `system` records: no prompt.
     assert_eq!(of(&sessions[2]), vec![]);
-    // The main transcript only; the task notification is a prompt (its
-    // `UserPromptSubmit` hook fires too).
+    // The main transcript only; the task notification is not a prompt (nor
+    // is its `UserPromptSubmit` hook).
     assert_eq!(
         of(&sessions[3]),
         vec![
@@ -317,6 +317,35 @@ fn records_map_to_tool_failures_api_errors_and_nothing_for_a_blocked_prompt() {
             shape("PROMPT_SUBMIT", None),
             shape("TOOL_PRE", Some("Agent")),
             shape("TOOL_POST", Some("Agent")),
+        ]
+    );
+    daemon.shutdown();
+}
+
+/// The captured refusal carries `toolDenialKind: "user-rejected"`; its
+/// hooks end at `PermissionRequest` and `Stop`, with no tool result.
+#[test]
+fn a_captured_user_rejected_tool_call_has_no_tool_fail() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    let mut lines = transcript_lines("permission-request", &repo, &home);
+    let session = session_of(&lines);
+    // A later record shows the whole file was read.
+    let other = transcript_lines("api-error-stop", &repo, &home);
+    let mut last: Value = serde_json::from_str(&other[prompt_index(&other)]).expect("JSON");
+    last["sessionId"] = Value::String(session.clone());
+    lines.push(last.to_string());
+    append_lines(&transcript_path(&claude, &repo, &session), &lines);
+
+    let rows = wait_for_events(&daemon, 4);
+    assert_eq!(
+        shapes(&rows),
+        vec![
+            shape("SESSION_START", None),
+            shape("PROMPT_SUBMIT", None),
+            shape("TOOL_PRE", Some("Bash")),
             shape("PROMPT_SUBMIT", None),
         ]
     );
@@ -498,6 +527,83 @@ fn a_restart_resumes_from_saved_offsets_with_nothing_lost_or_duplicated() {
     assert_eq!(stored, vec![(path_str(&path).to_owned(), size)]);
 }
 
+/// A synthetic record of session `s` at second `second`.
+fn synthetic(kind: &str, n: u32, second: u32, repo: &Path, content: Value) -> String {
+    serde_json::json!({
+        "type": kind,
+        "sessionId": "paused-while-down",
+        "uuid": format!("00000000-0000-4000-8000-{n:012}"),
+        "timestamp": format!("2026-11-25T16:00:{second:02}.000Z"),
+        "cwd": path_str(repo),
+        "message": { "role": kind, "content": content },
+    })
+    .to_string()
+}
+
+fn wrapper(n: u32, second: u32, repo: &Path, command: &str) -> String {
+    let text = format!(
+        "<command-message>{command}</command-message>\n<command-name>/{command}</command-name>"
+    );
+    synthetic("user", n, second, repo, Value::String(text))
+}
+
+#[test]
+fn a_pause_typed_while_the_daemon_was_down_is_honoured_on_backfill() {
+    let mut daemon = TestDaemon::start_with(fast);
+    let home = daemon.home();
+    let claude = claude_dir(&home);
+    let repo = repo_under(&home);
+    let path = transcript_path(&claude, &repo, "paused-while-down");
+    let prompt = |n, second, text: &str| synthetic("user", n, second, &repo, text.into());
+    let tool = |n, second, name: &str| {
+        let block = serde_json::json!([{"type": "tool_use", "id": name, "name": name}]);
+        synthetic("assistant", n, second, &repo, block)
+    };
+    daemon.shutdown();
+    let lines = [
+        prompt(1, 1, "before the pause"),
+        wrapper(2, 2, &repo, "stop-track"),
+        prompt(3, 3, "secret work"),
+        tool(4, 4, "Bash"),
+        wrapper(5, 5, &repo, "resume-track"),
+        prompt(6, 6, "after the pause"),
+        tool(7, 7, "Read"),
+    ];
+    append_lines(&path, &lines);
+    let daemon = daemon.restart_with(fast);
+
+    let expected = vec![
+        shape("SESSION_START", None),
+        shape("PROMPT_SUBMIT", None),
+        shape("PROMPT_SUBMIT", None),
+        shape("TOOL_PRE", Some("Read")),
+    ];
+    let rows = wait_for_events(&daemon, 4);
+    assert_eq!(shapes(&rows), expected);
+
+    // A reread from 0 (a replaced file) changes neither events nor spans.
+    let replacement = path.with_extension("tmp");
+    append_lines(&replacement, &lines);
+    append_lines(&replacement, &[tool(8, 8, "Write")]);
+    fs::rename(&replacement, &path).expect("replace transcript");
+    wait_for_events(&daemon, 5);
+
+    let mut daemon = daemon;
+    let db = daemon.shutdown_and_open_db();
+    let spans: Vec<(i64, Option<i64>)> = db
+        .prepare("SELECT from_ms, to_ms FROM session_pause")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect()
+        })
+        .expect("spans");
+    assert_eq!(
+        spans,
+        // 16:00:02 to 16:00:05 on 2026-11-25, by the records' clock.
+        vec![(1_795_622_402_000, Some(1_795_622_405_000))]
+    );
+}
+
 #[test]
 fn no_transcript_text_reaches_sqlite() {
     let mut daemon = TestDaemon::start_with(fast);
@@ -520,7 +626,7 @@ fn no_transcript_text_reaches_sqlite() {
             &lines,
         );
     }
-    wait_for_events(&daemon, 40);
+    wait_for_events(&daemon, 38);
 
     let db = daemon.shutdown_and_open_db();
     assert_eq!(
