@@ -46,7 +46,7 @@ pub struct Ruleset {
     /// Fewer real inter-event intervals than this and cadence entropy is
     /// `null`.
     pub min_cadence_samples: u32,
-    // Slots Slice 3 (struggle signals and credit) fills.
+    // Struggle signals and credit (Slice 3).
     /// Outcome Anchor window, either side of a minute.
     pub anchor_window_ms: u64,
     /// Unanchored `browser`/`other` presence decays to 0 over this long.
@@ -55,6 +55,45 @@ pub struct Ruleset {
     pub baseline_min_days: u32,
     /// Lowest comfort weight (per mille); it never reaches zero.
     pub comfort_floor_milli: u32,
+    /// Days of per-axis histograms the local baseline keeps.
+    pub baseline_window_days: u32,
+    /// A minute with specificity below this (per mille) counts as
+    /// low-specificity for comfort-delta.
+    pub comfort_low_specificity_milli: u32,
+    /// Steering looks for interleaved switching this close to an anchor.
+    pub steering_window_ms: u64,
+    /// `verified_struggle` is the weighted mean of the four axes; these
+    /// weights (per mille) sum to 1000.
+    pub weight_steering_milli: u32,
+    pub weight_specificity_milli: u32,
+    pub weight_friction_milli: u32,
+    pub weight_comfort_milli: u32,
+    /// A `verified_struggle` at or above this (per mille) is "high".
+    pub verified_struggle_bar_milli: u32,
+    /// Friction of a minute holding Manual Work that follows Harness churn.
+    pub friction_revert_milli: u32,
+    /// Manual Work this soon after a Harness `FILE_MUTATION` in the same
+    /// Project counts as reverting churn.
+    pub churn_revert_window_ms: u64,
+    /// Specificity per distinct `repo_symbol_hits` (per mille).
+    pub specificity_symbol_milli: u32,
+    /// Specificity added by a pasted stack trace (per mille).
+    pub specificity_stacktrace_milli: u32,
+    /// A prompt shorter than this many characters is terse.
+    pub terse_prompt_chars: u64,
+    /// An agent turn changing at least this many lines is large.
+    pub large_turn_diff_lines: u64,
+    /// Share of its specificity (per mille) a terse prompt keeps when its
+    /// turn is large.
+    pub terse_big_turn_keep_milli: u32,
+    /// Most entries one Project's file-name index holds.
+    pub index_max_entries: u32,
+    /// Most Projects with an index at once (least recently used goes).
+    pub index_max_projects: u32,
+    /// Longer file or folder names are not indexed.
+    pub index_max_name_bytes: u32,
+    /// Most distinct candidate words kept from one prompt while matching.
+    pub index_max_prompt_candidates: u32,
 }
 
 /// The first Ruleset.
@@ -79,4 +118,23 @@ pub const TRACTION_RULES_1: Ruleset = Ruleset {
     drift_decay_ms: 10 * 60_000,
     baseline_min_days: 3,
     comfort_floor_milli: 500,
+    baseline_window_days: 30,
+    comfort_low_specificity_milli: 300,
+    steering_window_ms: 120_000,
+    weight_steering_milli: 150,
+    weight_specificity_milli: 250,
+    weight_friction_milli: 400,
+    weight_comfort_milli: 200,
+    verified_struggle_bar_milli: 600,
+    friction_revert_milli: 500,
+    churn_revert_window_ms: 120_000,
+    specificity_symbol_milli: 250,
+    specificity_stacktrace_milli: 400,
+    terse_prompt_chars: 40,
+    large_turn_diff_lines: 30,
+    terse_big_turn_keep_milli: 250,
+    index_max_entries: 4096,
+    index_max_projects: 16,
+    index_max_name_bytes: 64,
+    index_max_prompt_candidates: 512,
 };

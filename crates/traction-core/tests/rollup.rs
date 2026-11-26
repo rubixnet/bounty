@@ -61,6 +61,7 @@ fn input<'a>(
         events,
         presence,
         commits,
+        baseline: &[],
         from_ms: from,
         to_ms: to,
     }

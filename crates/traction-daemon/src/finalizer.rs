@@ -197,6 +197,7 @@ pub fn finalize_range(
             events: &events,
             presence: &presence,
             commits: &commits,
+            baseline: &[],
             from_ms: from,
             to_ms: to,
         },

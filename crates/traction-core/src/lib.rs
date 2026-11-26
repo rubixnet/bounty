@@ -9,6 +9,7 @@ mod presence;
 mod project_id;
 mod rollup;
 mod ruleset;
+mod struggle;
 mod validate;
 
 pub use canonical::{CanonicalJsonError, canonical_json};
@@ -26,6 +27,7 @@ pub use rollup::{
     activity_rollups, rollup, work_buckets,
 };
 pub use ruleset::{Ruleset, TRACTION_RULES_1};
+pub use struggle::{BASELINE_BINS, BaselineDay, StruggleAxes, fold_baseline};
 pub use validate::{
     EventError, MAX_CWD_LEN, MAX_IDENTIFIER_LEN, MAX_SESSION_ID_LEN, ValidationError, uuid_v7,
 };
