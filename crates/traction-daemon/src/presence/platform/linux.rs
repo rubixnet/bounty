@@ -101,8 +101,10 @@ impl X11Backend {
     fn connect(display: &str) -> Result<Self, ()> {
         let (conn, screen) = RustConnection::connect(Some(display)).map_err(|_| ())?;
         let root = conn.setup().roots.get(screen).ok_or(())?.root;
+        // Created if missing: the daemon may start before the window manager,
+        // and until one sets the property there is just no active window.
         let active_window =
-            x11rb::protocol::xproto::intern_atom(&conn, true, b"_NET_ACTIVE_WINDOW")
+            x11rb::protocol::xproto::intern_atom(&conn, false, b"_NET_ACTIVE_WINDOW")
                 .map_err(|_| ())?
                 .reply()
                 .map_err(|_| ())?
