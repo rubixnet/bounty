@@ -4,7 +4,7 @@
 
 **Blocked by:** 01
 
-**Status:** closed
+**Status:** ready-for-human
 
 Acceptance:
 
@@ -15,7 +15,7 @@ Acceptance:
 - [x] Each present device-minute is assigned to exactly one Project (the most recent Outcome Anchor or Harness event within `PRESENCE_PROJECT_LOOKBACK`; ties go to the most recent event; otherwise none). Device-wide agent time per minute is the union across Projects, split evenly. Unit tests with two Projects show Σ `human_active_sec` ≤ 60 and Σ `agent_compute_sec` ≤ 60 per minute.
 - [x] `permission_wait_ms`: `PERMISSION_REQUEST` → the session's next `TOOL_POST` / `TOOL_FAIL` / `PROMPT_SUBMIT` / turn close, clamped to `[0, PERMISSION_LATENCY_CAP]`. It counts toward `human_active_sec` only when the span holds real input. Approvals with no real input, or repeatedly under `PERMISSION_LATENCY_FLOOR`, set `auto_approver_suspected` and earn nothing.
 - [x] **Commit Observations (daemon):** watch the per-worktree `rev-parse --git-dir` `logs/HEAD` by mtime only. Record a commit only when all three hold: `COMMIT_EDITMSG` mtime moved forward (stat only, never opened); the new HEAD's first parent (`rev-parse HEAD^`) equals the previous HEAD, or it is a root commit with no previous HEAD; and the committer time (`rev-list -1 --no-commit-header --format=%ct HEAD`) is within `COMMIT_FRESHNESS` of the observation. All Git calls go through the hardened wrapper, which only accepts `--format=%ct`. Any failure or timeout means no commit. Rows go in an append-only `commit_observation (project_id, commit_oid, observed_ms)` table.
-- [x] Real Git tests on all 3 OSes: `git commit` → 1 observation; `checkout`/`switch`, fast-forward `pull` from a second clone, `reset --hard HEAD~1` and `commit --amend` → 0. A commit in a linked worktree is observed for that worktree only. A canary commit message never reaches SQLite or the log.
+- [ ] Real Git tests on all 3 OSes: `git commit` → 1 observation; `checkout`/`switch`, fast-forward `pull` from a second clone, `reset --hard HEAD~1` and `commit --amend` → 0. A commit in a linked worktree is observed for that worktree only. A canary commit message never reaches SQLite or the log.
 - [x] The engine applies the **60 s agent-quiet rule**: a commit with no open turn and no Harness event in its Project in the prior `AGENT_QUIET` is `commits_human`; otherwise `commits_agent`. Tests: commit 30 s after a `TOOL_POST` → agent; 90 s after `TURN_END` → human.
 - [x] Activity Rollups (120 s, aligned to the 2-minute Anchor cadence): per-category share, switch rate, mean cadence entropy, injected ratio, tier, `ruleset_id`.
 - [x] **Finalizer (daemon):** each minute older than `BUCKET_SETTLE` is computed once and written to append-only `work_bucket` (key `(project_id, minute_start_ms, ruleset_id)`) and `activity_rollup` tables. Later events never rewrite it. Daemon-down minutes filled in by the tailer have no Presence Minute → `telemetry_tier: none`, 0 Human Active Time. A restart resumes finalizing from the last written minute without duplicates.
@@ -24,3 +24,10 @@ Acceptance:
 - [x] `docs/protocol.md` §3 documents the Work Bucket and Activity Rollup fields, the Ruleset and the three new tables.
 
 ## Comments
+
+- Built test-first. Core engine: `crates/traction-core/src/{ruleset,rollup}.rs`, tests in `crates/traction-core/tests/rollup.rs`. Daemon: `commits.rs` (observer), `finalizer.rs` (finalizer, unit tests on a real SQLite file), wrapper queries `GitDir`/`Head`/`HeadParent`/`HeadCommitterTime`, migration 8, `tests/commit_observation.rs` (real repos, real linked worktree, canary message grep over `traction.db` and `-wal`).
+- Open gap: the real-Git observation tests ran on macOS only. Windows and Linux are unverified here (no C cross toolchain for the bundled SQLite; `traction-core` was clippy-checked for both targets). Tick that box once 3-OS CI is green, then close.
+- The canary check covers SQLite only; the daemon log is not captured by a test (the observer never reads a message and logs no commit data).
+- `IDLE_THRESHOLD_SEC` and `MIN_CADENCE_SAMPLES` moved into the Ruleset (`idle_threshold_sec`, `min_cadence_samples`); the daemon's `STALE_TURN_TIMEOUT` now derives from `stale_turn_timeout_ms`.
+- Chosen constants not fixed by the spec: `injected_ratio_flag_milli` 500, `robotic_entropy_max_milli` 500, `auto_approver_min_fast` 2. An unflagged `PROMPT_SUBMIT` counts as a presence instant for the 90 s rule (needed for the gate's 510 s).
+- `presence::tests::a_full_tier_minute_carries_the_input_counts_and_injection` (ticket 01) failed once under full-workspace load and passes alone and on rerun: wall-clock sensitive.
