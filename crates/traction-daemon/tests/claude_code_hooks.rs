@@ -439,7 +439,12 @@ fn cwd_changed_maps_to_cwd_change_and_moves_later_events_to_the_new_project() {
         "hooks sent: {sent:?}"
     );
     let change = rows.iter().find(|r| r.event_type == "CWD_CHANGE").unwrap();
-    assert_eq!(change.cwd.as_deref(), Some(path_str(&repo.join("sub"))));
+    // Compared as paths: the reported string is kept, and the captured
+    // `<REPO>/sub` mixes separators on Windows.
+    assert_eq!(
+        change.cwd.as_deref().map(Path::new),
+        Some(&*repo.join("sub"))
+    );
 }
 
 #[test]
