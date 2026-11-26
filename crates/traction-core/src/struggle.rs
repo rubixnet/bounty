@@ -322,8 +322,8 @@ fn nearest(list: &[u64], m: u64) -> Option<u64> {
 
 /// The anchor weight (per mille) of a present minute: the strongest anchor
 /// within `anchor_window_ms`, each scaled by its own strength. A `browser` /
-/// `other` minute holding no anchor of its own decays linearly to 0 over
-/// `drift_decay_ms`.
+/// `other` minute holding no anchor of its own decays linearly from 1 to 0
+/// over `drift_decay_ms` of distance, and keeps counting anchors that far.
 fn anchor_weight(
     rules: &Ruleset,
     presence: Option<&PresenceMinute>,
@@ -341,7 +341,14 @@ fn anchor_weight(
         } else {
             ts.saturating_sub(m + MINUTE_MS - 1)
         };
-        if d > rules.anchor_window_ms {
+        // A drifting minute decays over the whole `drift_decay_ms`; any
+        // other minute counts anchors only inside `anchor_window_ms`.
+        let reach = if drifting {
+            rules.drift_decay_ms.max(rules.anchor_window_ms)
+        } else {
+            rules.anchor_window_ms
+        };
+        if d > reach {
             continue;
         }
         let mut w = *strength;
