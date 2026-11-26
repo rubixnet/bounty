@@ -137,6 +137,12 @@ impl Aggregator {
         }
     }
 
+    /// Whether anything was observed this minute: a sample or an input
+    /// event. A minute nothing was observed in carries no information.
+    pub fn observed(&self) -> bool {
+        self.category_seen || self.idle_seen || self.keys > 0 || self.pointers > 0
+    }
+
     /// The minute's record and the last foreground category seen.
     pub fn finish(self) -> (PresenceMinute, Option<AppCategory>) {
         let full = self.tier == TelemetryTier::Full;
