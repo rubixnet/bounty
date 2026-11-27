@@ -293,3 +293,187 @@ async fn only_the_users_own_projects_can_be_merged() {
         .unwrap();
     assert_eq!(aliases, 0);
 }
+
+// ---- GitHub linking -------------------------------------------------------
+
+use common::github::{self as gh, FakeGithub};
+
+struct GhRig {
+    server: TestServer,
+    fake: FakeGithub,
+    token: String,
+    _key: tempfile::TempDir,
+}
+
+async fn gh_rig(url: &str) -> GhRig {
+    let fake = gh::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("app.pem");
+    std::fs::write(&key_path, gh::APP_KEY_PEM).unwrap();
+    let mut config = config_trusting_ci();
+    config.github.api_base_url = fake.base.clone();
+    config.github.app_id = gh::APP_ID.into();
+    config.github.private_key_file = Some(key_path.to_string_lossy().into_owned());
+    config.github.per_page = 2;
+    let now = T0 + 400_000;
+    let server = start(url, config, Some(fixed_clock(now))).await;
+    let key = device_key(1);
+    let (token, _) = pair(&server, &key, None).await;
+    let request = heartbeat_in(&key, 0, 'a', T0, now, PROJECT);
+    assert_eq!(send_heartbeat(&server, &token, &request).await.status, 200);
+    GhRig {
+        server,
+        fake,
+        token,
+        _key: dir,
+    }
+}
+
+async fn link(rig: &GhRig, user_token: &str, repo: &str) -> Reply {
+    post_json(
+        format!("{}/v1/github/link", rig.server.base),
+        Some(rig.token.clone()),
+        json!({ "project_id": PROJECT, "repo": repo, "user_token": user_token }).to_string(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn linking_needs_push_access_then_stores_only_oids_and_timestamps() {
+    let Some(url) = database_url() else { return };
+    let rig = gh_rig(&url).await;
+
+    // A read-only user cannot link; nothing is stored.
+    let refused = link(&rig, gh::READONLY_USER_TOKEN, gh::REPO).await;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(parse(&refused)["error"], "no_push_access");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM linked_repos")
+        .fetch_one(&rig.server.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    // A bad token and a malformed repo name are refused too.
+    assert_eq!(link(&rig, "ghu_wrong", gh::REPO).await.status, 401);
+    assert_eq!(link(&rig, gh::USER_TOKEN, "../etc").await.status, 400);
+
+    // With push access: linked, commits fetched across both pages.
+    let linked = link(&rig, gh::USER_TOKEN, gh::REPO).await;
+    assert_eq!(linked.status, 201, "{}", linked.body);
+    assert_eq!(parse(&linked)["commits_stored"], 3);
+    let stored: Vec<(String, i64, bool)> = sqlx::query_as(
+        "SELECT oid, committed_at_ms, author_match FROM project_commits ORDER BY committed_at_ms DESC",
+    )
+    .fetch_all(&rig.server.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            (
+                "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d".into(),
+                1_331_075_210_000,
+                true
+            ),
+            (
+                "762941318ee16e59dabbacb1b4049eec22f0d303".into(),
+                1_315_975_361_000,
+                false
+            ),
+            (
+                "553c2077f0edc3d5dc5d17262f6aa498e69d6f8e".into(),
+                1_296_068_768_000,
+                false
+            ),
+        ]
+    );
+    let linked_repo: Option<String> =
+        sqlx::query_scalar("SELECT linked_repo FROM projects WHERE project_id = $1")
+            .bind(PROJECT)
+            .fetch_one(&rig.server.pool)
+            .await
+            .unwrap();
+    assert_eq!(linked_repo.as_deref(), Some(gh::REPO));
+
+    // No commit message, e-mail, name, diff or token reached any table.
+    let mut dump = String::new();
+    for table in ["project_commits", "linked_repos", "github_accounts", "projects"] {
+        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT t::text FROM {table} t"
+        )))
+        .fetch_all(&rig.server.pool)
+        .await
+        .unwrap();
+        dump.push_str(&rows.join("\n"));
+    }
+    for forbidden in [
+        "Merge pull request",
+        "New line at end of file",
+        "first commit",
+        "octocat@nowhere.com",
+        "ghu_user_with_push",
+        "ghs_installation_token",
+    ] {
+        assert!(!dump.contains(forbidden), "{forbidden} was stored");
+    }
+    // The user token proved access; the installation token fetched commits.
+    let tokens = rig.fake.state.recorded.lock().unwrap().tokens.clone();
+    assert!(tokens.iter().any(|t| t == gh::USER_TOKEN));
+    assert!(tokens.iter().any(|t| t == gh::INSTALLATION_TOKEN));
+
+    // Linking is removable: unlink forgets the commits.
+    let unlink = http(
+        "DELETE",
+        format!("{}/v1/github/projects/{PROJECT}", rig.server.base),
+        Some(rig.token.clone()),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(unlink.status, 204);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM project_commits")
+        .fetch_one(&rig.server.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn a_missing_app_install_and_an_unowned_project_are_refused() {
+    let Some(url) = database_url() else { return };
+    let rig = gh_rig(&url).await;
+    *rig.fake.state.installed.lock().unwrap() = false;
+    let reply = link(&rig, gh::USER_TOKEN, gh::REPO).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(parse(&reply)["error"], "app_not_installed");
+
+    let reply = post_json(
+        format!("{}/v1/github/link", rig.server.base),
+        Some(rig.token.clone()),
+        json!({ "project_id": PROJECT_B, "repo": gh::REPO, "user_token": gh::USER_TOKEN })
+            .to_string(),
+    )
+    .await;
+    assert_eq!(reply.status, 404);
+}
+
+#[tokio::test]
+async fn a_rate_limited_first_fetch_keeps_the_link_and_a_later_sync_fills_it() {
+    let Some(url) = database_url() else { return };
+    let rig = gh_rig(&url).await;
+    *rig.fake.state.rate_limit_commits.lock().unwrap() = 1;
+    *rig.fake.state.reset_at.lock().unwrap() = (T0 + 400_000) / 1000 + 90;
+    let linked = link(&rig, gh::USER_TOKEN, gh::REPO).await;
+    assert_eq!(linked.status, 201, "{}", linked.body);
+    let body = parse(&linked);
+    assert_eq!(body["commits_pending"], true);
+    assert_eq!(body["retry_after_sec"], 90);
+
+    let synced = post_json(
+        format!("{}/v1/github/projects/{PROJECT}/sync", rig.server.base),
+        Some(rig.token.clone()),
+        "{}".into(),
+    )
+    .await;
+    assert_eq!(synced.status, 200, "{}", synced.body);
+    assert_eq!(parse(&synced)["commits_stored"], 3);
+}
