@@ -638,15 +638,42 @@ mod tests {
         assert_eq!(config.auth.provider, "dev");
     }
 
+    /// The body of the first fenced ```` ```toml ```` block in a Markdown
+    /// document, with line endings normalised to `\n`.
+    fn first_toml_fence(text: &str) -> Option<String> {
+        let mut lines = text.lines().skip_while(|l| l.trim_end() != "```toml");
+        lines.next()?;
+        let mut body = String::new();
+        for line in lines {
+            if line.trim_start().starts_with("```") {
+                return Some(body);
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        None
+    }
+
+    /// A Windows checkout (`core.autocrlf`) hands the test CRLF line endings.
+    #[test]
+    fn a_crlf_deploy_guide_still_yields_its_toml_block() {
+        let lf = "# Deploy\n\n```toml\n[blob]\nprovider = \"r2\"\n```\n\nafter\n";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(
+            first_toml_fence(&crlf).as_deref(),
+            Some("[blob]\nprovider = \"r2\"\n")
+        );
+        assert_eq!(first_toml_fence(lf), first_toml_fence(&crlf));
+    }
+
     #[test]
     fn the_deploy_guide_config_parses_and_the_s3b_sections_are_public_keys_and_references() {
         let text = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/deploy.md"),
         )
         .unwrap();
-        let start = text.find("```toml\n").unwrap() + 8;
-        let toml_text = &text[start..start + text[start..].find("```").unwrap()];
-        let config = Config::parse(toml_text).expect("docs/deploy.md example parses");
+        let toml_text = first_toml_fence(&text).expect("docs/deploy.md has a toml block");
+        let config = Config::parse(&toml_text).expect("docs/deploy.md example parses");
         assert_eq!(config.blob.provider, "r2");
         assert_eq!(config.github.app_id, "<numeric app id>");
         assert_eq!(config.provenance.ci_public_keys.len(), 1);
