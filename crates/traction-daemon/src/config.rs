@@ -92,6 +92,9 @@ pub struct DaemonConfig {
     /// Server sync client tuning. It does nothing until `traction login`
     /// has written `server.url` and `server.token` (or both are injected).
     pub sync: crate::sync::SyncSettings,
+    /// Visual Proof Mode scheduler tuning (it captures nothing until
+    /// `traction-daemon visual-proof enable`).
+    pub capture: crate::capture::scheduler::CaptureSettings,
     /// Claude Code's config folder, whose `projects/` the transcript tailer
     /// watches. Default: [`crate::claude_code::config_dir::claude_config_dir`]
     /// (the installer's rule). `None` turns the tailer off. Tests point it at a
@@ -124,6 +127,7 @@ impl DaemonConfig {
             commits: crate::commits::CommitSettings::default(),
             finalizer: crate::finalizer::FinalizerSettings::default(),
             sync: crate::sync::SyncSettings::default(),
+            capture: crate::capture::scheduler::CaptureSettings::default(),
         }
     }
 

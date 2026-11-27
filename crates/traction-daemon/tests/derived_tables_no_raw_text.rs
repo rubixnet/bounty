@@ -162,3 +162,112 @@ fn chain_tables_text(data_dir: &std::path::Path) -> String {
     }
     text
 }
+
+/// Step 3b S1: Frame Records and the `capture-frame` child's stdout hold ids,
+/// hashes, numbers and closed enums only. The data folder's path carries a
+/// canary; neither the `frame` table nor the child's line may name it.
+#[test]
+fn frame_records_and_the_child_line_carry_no_text() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join(FILE_STEM);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut daemon = TestDaemon::start_with(|c| c.data_dir = dir.clone());
+    daemon.shutdown();
+    traction_daemon::enable_visual_proof(&dir).unwrap();
+    let key = traction_daemon::VaultKey::load(&dir).unwrap().unwrap();
+
+    // The post-grab pipeline on a real screen-sized image, then the writer.
+    let image = traction_daemon::Bgra {
+        width: 1920,
+        height: 1080,
+        pixels: (0..1920u32 * 1080 * 4).map(|i| (i % 251) as u8).collect(),
+    };
+    let report = traction_daemon::store_frame(&dir, &key, &image, None, 1_800_000_000_123, 15.0);
+    let line = serde_json::to_string(&report).unwrap();
+    assert!(!line.contains(FILE_STEM), "{line}");
+    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let allowed = [
+        "status",
+        "frame_id",
+        "frame_hash",
+        "dhash",
+        "captured_at_ms",
+        "width",
+        "height",
+    ];
+    for (k, v) in value.as_object().unwrap() {
+        assert!(allowed.contains(&k.as_str()), "unexpected key {k}");
+        let ok = v.is_u64()
+            || v.as_str().is_some_and(|s| {
+                s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                    || [
+                        "written",
+                        "duplicate",
+                        "permission_denied",
+                        "unsupported",
+                        "focus_changed",
+                        "error",
+                    ]
+                    .contains(&s)
+            });
+        assert!(ok, "{k}={v} is not an id, hash, number or status");
+    }
+    let traction_daemon::ChildReport::Written {
+        frame_id,
+        frame_hash,
+        captured_at_ms,
+        width,
+        height,
+        ..
+    } = report
+    else {
+        panic!("{line}")
+    };
+    let row = traction_daemon::FrameRow {
+        record: traction_core::FrameRecord {
+            frame_id: frame_id.clone(),
+            frame_hash,
+            captured_at_ms,
+            trigger: traction_core::FrameTrigger::Scheduled,
+            scheduled_at_ms: Some(captured_at_ms - 5),
+            nonce_id: None,
+        },
+        width,
+        height,
+        vault_file: traction_daemon::frame_path(&dir, &frame_id),
+    };
+    assert!(traction_daemon::record_frame(&dir, row).unwrap());
+
+    let db = common::open_db_read_only(&dir);
+    let mut stmt = db
+        .prepare(
+            "SELECT frame_id, window_start_ms, captured_at_ms, frame_hash, trigger,
+                    scheduled_at_ms, nonce_id, width, height, pixels_state FROM frame",
+        )
+        .unwrap();
+    let rows: Vec<Vec<rusqlite::types::Value>> = stmt
+        .query_map([], |r| (0..10).map(|i| r.get(i)).collect())
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 1);
+    for value in &rows[0] {
+        use rusqlite::types::Value;
+        match value {
+            Value::Integer(_) | Value::Null => {}
+            Value::Text(text) => {
+                assert!(!text.contains(FILE_STEM));
+                assert!(
+                    traction_core::parse_frame_id(text).is_some()
+                        || (text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()))
+                        || ["scheduled", "present"].contains(&text.as_str()),
+                    "{text} is not an id, hash or enum"
+                );
+            }
+            other => panic!("unexpected column {other:?}"),
+        }
+    }
+    // The Vault file is ciphertext: the canary path is not in it either.
+    let bin = std::fs::read(traction_daemon::frame_path(&dir, &frame_id)).unwrap();
+    assert!(!has(&bin, FILE_STEM));
+}

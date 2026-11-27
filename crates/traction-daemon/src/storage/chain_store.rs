@@ -14,9 +14,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use traction_core::{
     ActivityRollup, CategoryShareMilli, ChainError, ChainLink, ChainReport, CommitObservation,
-    DeviceSigningKey, KeyId, KeyedChain, LinkHeader, LinkPayload, ProjectWindowRows, RowScope,
-    RowSet, StruggleAxes, Supersedes, TRACTION_RULES_1, TelemetryTier, VerifyPolicy,
-    VerifyingKeyHex, WorkBucket, canonical_json, fold_baseline, verify_chains,
+    DeviceSigningKey, FrameRecord, FrameTrigger, KeyId, KeyedChain, LinkHeader, LinkPayload,
+    ProjectWindowRows, RowScope, RowSet, StruggleAxes, Supersedes, TRACTION_RULES_1, TelemetryTier,
+    VerifyPolicy, VerifyingKeyHex, WorkBucket, canonical_json, fold_baseline, verify_chains,
 };
 
 use super::{RollupBatch, load_baseline, to_i64};
@@ -181,6 +181,12 @@ impl Sealer {
                 .push(oid);
         }
         drop(stmt);
+        // Frame Records too: a window holding only Frames is still sealed,
+        // so no recorded Frame is ever left outside the chain.
+        for frame in load_frames(conn, batch.from_ms, batch.through_ms)? {
+            let window = frame.captured_at_ms / width * width;
+            windows.entry(window).or_default().frames.push(frame);
+        }
         if windows.is_empty() {
             return Ok(());
         }
@@ -212,7 +218,8 @@ impl Sealer {
                     None
                 },
             )
-            .map_err(user_error)?;
+            .map_err(user_error)?
+            .with_frames(&rows.frames);
             let link = self
                 .key
                 .seal(tip.as_ref(), payload, batch.sealed_at_ms)
@@ -251,6 +258,7 @@ struct WindowRows<'a> {
     rollup: Option<&'a ActivityRollup>,
     /// Per Project: its Work Buckets and commit object ids in the window.
     projects: BTreeMap<String, ProjectRows>,
+    frames: Vec<FrameRecord>,
 }
 
 #[derive(Default)]
@@ -464,12 +472,40 @@ pub fn load_sealed_rows(conn: &Connection, from: u64, to: u64) -> rusqlite::Resu
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let frames = load_frames(conn, from, to)?;
     Ok(RowSet {
         scope: RowScope::AllProjects,
         work_buckets,
         commits,
         rollups,
+        frames: Some(frames),
     })
+}
+
+/// The Frame Records captured in `[from, to)`, as the signed type.
+pub fn load_frames(conn: &Connection, from: u64, to: u64) -> rusqlite::Result<Vec<FrameRecord>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT frame_id, frame_hash, captured_at_ms, trigger, scheduled_at_ms, nonce_id
+         FROM frame WHERE captured_at_ms >= ?1 AND captured_at_ms < ?2
+         ORDER BY frame_id",
+    )?;
+    stmt.query_map(params![to_i64(from), to_i64(to)], |row| {
+        let trigger: String = row.get(3)?;
+        let scheduled: Option<i64> = row.get(4)?;
+        Ok(FrameRecord {
+            frame_id: row.get(0)?,
+            frame_hash: row.get(1)?,
+            captured_at_ms: u64_at(row, 2)?,
+            trigger: FrameTrigger::parse(&trigger)
+                .ok_or_else(|| user_error(io::Error::other("unknown frame trigger")))?,
+            scheduled_at_ms: scheduled
+                .map(u64::try_from)
+                .transpose()
+                .map_err(user_error)?,
+            nonce_id: row.get(5)?,
+        })
+    })?
+    .collect()
 }
 
 fn u64_at(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {

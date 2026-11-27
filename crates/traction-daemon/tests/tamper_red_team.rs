@@ -1016,3 +1016,105 @@ fn an_untouched_bundle_prints_one_ok_line_and_exits_zero() {
         "{first}"
     );
 }
+
+// Frame rows (Step 3b S1, Gate 1 records): the window's Frame Records are
+// sealed into its link's `frame_digest`, so an edited, deleted or inserted
+// record fails as `payload_hash_mismatch part=frames`.
+
+fn frames_error() -> ChainError {
+    ChainError::PayloadHashMismatch {
+        seq: K,
+        part: PayloadPart::Frames,
+    }
+}
+
+fn assert_frames_fail(device: &Device) {
+    assert_db_fails(device, frames_error(), "payload_hash_mismatch");
+    let out = cli(&args(&["--data-dir", device.dir().to_str().unwrap()]));
+    assert!(out.stdout.contains(" part=frames"), "{}", out.stdout);
+}
+
+#[test]
+fn frame_rows_are_sealed_and_an_honest_device_verifies() {
+    let device = Device::sealed(WINDOWS);
+    assert!(verify_database(device.dir()).is_ok());
+    let db = device.attacker(&[]);
+    let sealed: Vec<String> = db
+        .prepare("SELECT payload_json FROM chain_link ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let digest = |seq: usize| {
+        serde_json::from_str::<Value>(&sealed[seq]).unwrap()["frame_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(digest(2), traction_core::FRAME_DIGEST_NONE);
+    assert_ne!(digest(5), traction_core::FRAME_DIGEST_NONE);
+    assert_eq!(
+        digest(3),
+        traction_core::FRAME_DIGEST_NONE,
+        "no Frames, zero digest"
+    );
+    // Redaction and expiry are outside the digest.
+    drop(db);
+    let db = device.attacker(&[]);
+    db.execute("UPDATE frame SET pixels_state = 'redacted'", [])
+        .unwrap();
+    drop(db);
+    assert!(verify_database(device.dir()).is_ok());
+}
+
+#[test]
+fn frame_row_an_edited_frame_record_fails_part_frames() {
+    let device = Device::sealed(WINDOWS);
+    let db = device.attacker(&["frame_pixels_state_only"]);
+    let changed = db
+        .execute(
+            "UPDATE frame SET frame_hash = ?1 WHERE window_start_ms = ?2 AND captured_at_ms % 120000 = 75000",
+            rusqlite::params!["ee".repeat(32), i64::try_from(Device::window(K)).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(db);
+    assert_frames_fail(&device);
+}
+
+#[test]
+fn frame_row_a_deleted_frame_record_fails_part_frames() {
+    let device = Device::sealed(WINDOWS);
+    let db = device.attacker(&["frame_no_delete"]);
+    let changed = db
+        .execute(
+            "DELETE FROM frame WHERE captured_at_ms = ?1",
+            [i64::try_from(Device::window(K) + 15_000).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(db);
+    assert_frames_fail(&device);
+}
+
+#[test]
+fn frame_row_an_inserted_frame_record_fails_part_frames() {
+    let device = Device::sealed(WINDOWS);
+    let db = device.attacker(&[]);
+    let at = Device::window(K) + 100_000;
+    db.execute(
+        "INSERT INTO frame (frame_id, window_start_ms, captured_at_ms, frame_hash, trigger,
+                            scheduled_at_ms, nonce_id, width, height, pixels_state)
+         VALUES (?1, ?2, ?3, ?4, 'tool_fail', NULL, NULL, 1280, 720, 'present')",
+        rusqlite::params![
+            format!("{at}-00"),
+            i64::try_from(Device::window(K)).unwrap(),
+            i64::try_from(at).unwrap(),
+            "ab".repeat(32)
+        ],
+    )
+    .unwrap();
+    drop(db);
+    assert_frames_fail(&device);
+}

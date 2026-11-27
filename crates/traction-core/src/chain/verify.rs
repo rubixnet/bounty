@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{ActivityRollup, CommitObservation, TRACTION_RULES_1, WorkBucket};
 
+use super::FrameRecord;
+
 use super::{
     ChainError, ChainLink, GENESIS_PREV_HASH, KeyId, PayloadPart, ProjectWindowRows, RowSet,
     TAG_LINK, TAG_SIG_LINK, VerifyingKeyHex, device_rows_digest, digest_hex, hex,
@@ -106,6 +108,9 @@ struct RowIndex<'a> {
     buckets: BTreeMap<(u64, &'a str), Vec<&'a WorkBucket>>,
     commits: BTreeMap<(u64, &'a str), Vec<&'a CommitObservation>>,
     rollups: BTreeMap<u64, Vec<&'a ActivityRollup>>,
+    /// `Some` when the caller supplied Frame Records (then every window,
+    /// even one with none, is checked).
+    frames: Option<BTreeMap<u64, Vec<FrameRecord>>>,
 }
 
 impl<'a> RowIndex<'a> {
@@ -115,7 +120,14 @@ impl<'a> RowIndex<'a> {
             buckets: BTreeMap::new(),
             commits: BTreeMap::new(),
             rollups: BTreeMap::new(),
+            frames: rows.frames.as_ref().map(|_| BTreeMap::new()),
         };
+        if let (Some(frames), Some(map)) = (&rows.frames, index.frames.as_mut()) {
+            for frame in frames {
+                let window = frame.captured_at_ms / size * size;
+                map.entry(window).or_default().push(frame.clone());
+            }
+        }
         for bucket in &rows.work_buckets {
             if rows.in_scope(&bucket.project_id) {
                 let window = bucket.minute_start_ms / size * size;
@@ -173,6 +185,9 @@ impl<'a> RowIndex<'a> {
         for (w, rows) in &self.rollups {
             *counts.entry(*w).or_insert(0) += rows.len();
         }
+        for (w, frames) in self.frames.iter().flatten() {
+            *counts.entry(*w).or_insert(0) += frames.len();
+        }
         counts
     }
 }
@@ -210,6 +225,15 @@ fn check_payload_and_rows(
     };
     if device != payload.device_rows_digest {
         return Err(mismatch(seq, PayloadPart::DeviceRows));
+    }
+
+    if let Some(frames) = &index.frames {
+        let records = frames.get(&window).map(Vec::as_slice).unwrap_or_default();
+        if records.iter().any(|r| r.validate().is_err())
+            || super::frame_digest(records) != payload.frame_digest
+        {
+            return Err(mismatch(seq, PayloadPart::Frames));
+        }
     }
 
     let mut projects = index.projects_in(window);

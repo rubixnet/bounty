@@ -9,6 +9,7 @@
 
 mod bundle;
 mod error;
+mod frames;
 mod hex;
 mod keys;
 mod manifest;
@@ -22,6 +23,10 @@ pub use bundle::{
     build_bundle, verify_bundle,
 };
 pub use error::{ChainError, PayloadPart, SealError};
+pub use frames::{
+    FRAME_SALT_LEN, FrameRecord, FrameRecordError, FrameTrigger, TAG_FRAME, frame_digest,
+    frame_hash, frame_hash_hex, frame_id, parse_frame_id,
+};
 pub use keys::{DeviceSigningKey, VerifyingKeyHex};
 pub use manifest::{manifest_digest, sign_manifest, verify_manifest};
 pub use rows::{ProjectWindowRows, RowScope, RowSet, RowsError};
@@ -53,7 +58,7 @@ pub const TAG_SIG_LINK: &[u8] = b"traction/v1/sig/link\0";
 pub const TAG_MANIFEST: &[u8] = b"traction/v1/manifest\0";
 /// Domain tag: what a manifest signature covers (the manifest digest).
 pub const TAG_SIG_MANIFEST: &[u8] = b"traction/v1/sig/manifest\0";
-/// Domain tag reserved for the snapshot-frame digest (Step 3b).
+/// Domain tag: one window's sorted Frame Records (the `frame_digest`).
 pub const TAG_FRAMES: &[u8] = b"traction/v1/frames\0";
 
 /// `SHA-256(tag || bytes)`.

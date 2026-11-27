@@ -22,6 +22,11 @@
 //!   or `verify --data-dir <path> ...` checks a bundle or the local database
 //!   offline. Exit 0 = verified (one chain), 2 = verified with more than one
 //!   chain (key discontinuity), 1 = failed or unreadable.
+//! - `visual-proof enable|disable|status [--data-dir <path>]` turns Visual
+//!   Proof Mode (scheduled, encrypted screen Frames sealed into the chain)
+//!   on or off, or prints `on`/`off`. Off by default.
+//! - `capture-frame ...` is internal: the child the daemon runs for one Frame
+//!   (it prints one JSON status line).
 //! - `login --server <url> [--data-dir <path>] [--no-browser]` pairs this
 //!   device with the server (opens the approval page, then stores the device
 //!   token in `<data dir>/server.token`, owner-only).
@@ -80,6 +85,15 @@ fn run() -> Result<(), String> {
         Some("verify") => {
             args.next();
             return finish(traction_daemon::run_verify(args)?);
+        }
+        Some("visual-proof") => {
+            args.next();
+            return finish(traction_daemon::run_visual_proof(args)?);
+        }
+        // Internal: the daemon's short-lived capture child (one Frame).
+        Some("capture-frame") => {
+            args.next();
+            return finish(traction_daemon::run_capture_frame(args)?);
         }
         _ => {}
     }

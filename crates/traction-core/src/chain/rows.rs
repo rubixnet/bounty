@@ -94,6 +94,10 @@ pub struct RowSet {
     pub work_buckets: Vec<WorkBucket>,
     pub commits: Vec<CommitObservation>,
     pub rollups: Vec<ActivityRollup>,
+    /// The device's Frame Records. `None` leaves every `frame_digest`
+    /// unchecked (a frame-less bundle, schema 1); `Some` must be complete
+    /// for every window it covers.
+    pub frames: Option<Vec<super::FrameRecord>>,
 }
 
 impl RowSet {
@@ -104,6 +108,7 @@ impl RowSet {
             work_buckets: Vec::new(),
             commits: Vec::new(),
             rollups: Vec::new(),
+            frames: None,
         }
     }
 

@@ -78,6 +78,7 @@ pub fn spawn(
     data_dir: &Path,
     writer: WriterSender,
     settings: FinalizerSettings,
+    in_flight: crate::capture::scheduler::InFlight,
 ) -> io::Result<FinalizerThread> {
     let (stop, rx) = mpsc::channel();
     let db_path = data_dir.join(DB_FILE);
@@ -114,6 +115,11 @@ pub fn spawn(
                 let mut current = current;
                 loop {
                     match finalize_range(&conn, rules, current, now_ms(), settle_ms) {
+                        // A capture child still running for a window in this
+                        // batch: wait for its Frame (bounded by its timeout).
+                        Ok(Some(batch)) if !in_flight.allows_sealing_through(batch.through_ms) => {
+                            break;
+                        }
                         Ok(Some(batch)) => {
                             current = Some(batch.through_ms);
                             cursor = Some(current);

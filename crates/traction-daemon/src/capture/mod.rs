@@ -1,62 +1,64 @@
-//! Visual Proof Mode (Step 3b). Everything that touches pixels runs in the
-//! short-lived `traction-daemon capture-frame` child; the daemon only
-//! schedules it.
-//!
-//! This first commit only proves the native crates build and work on stock
-//! runners (spec addition 3); the pipeline that uses them follows.
-#![allow(dead_code)]
+//! Visual Proof Mode (Step 3b, S1). Everything that touches pixels runs in
+//! the short-lived `traction-daemon capture-frame` child ([`child`]); the
+//! daemon only schedules it ([`scheduler`]), reads its one JSON line
+//! ([`runner`]) and hands the Frame Record to the single writer.
 
+use std::time::Duration;
+
+pub mod child;
 pub mod grab;
+pub mod image;
+pub mod runner;
+pub mod scheduler;
+pub mod settings;
+pub mod vault;
+
+/// A new screen whose dHash is within this many bits of the previous
+/// Frame's is a duplicate: skipped before encoding.
+pub const DHASH_SKIP_DISTANCE: u32 = 3;
+
+/// The daemon kills a `capture-frame` child after this long.
+pub const CAPTURE_CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Scheduled captures happen only while a Project had activity this recently
+/// (S2 refines the policy).
+pub const CAPTURE_ACTIVE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Shortest scheduled interval, and the jitter span above it:
+/// `interval = 60_000 + (u64::from_be_bytes(r[..8]) % 30_000)` ms.
+pub const SCHEDULE_BASE_MS: u64 = 60_000;
+/// See [`SCHEDULE_BASE_MS`].
+pub const SCHEDULE_JITTER_MS: u64 = 30_000;
+
+/// Lossy WebP quality (0–100). Measured on 720p frames: see the ticket's
+/// comment and `docs/protocol.md` section 4.
+pub const DEFAULT_WEBP_QUALITY: f32 = 15.0;
+
+/// The local-jitter interval for the 32 random bytes `r` (S1; before any
+/// Capture Nonce).
+pub fn local_jitter_interval_ms(r: &[u8; 32]) -> u64 {
+    let head: [u8; 8] = r[..8].try_into().expect("8 bytes");
+    SCHEDULE_BASE_MS + u64::from_be_bytes(head) % SCHEDULE_JITTER_MS
+}
 
 #[cfg(test)]
 mod tests {
-    /// Addition 3 smoke: libwebp (bundled, built by `cc`) encodes lossy,
-    /// XChaCha20-Poly1305 round-trips, HMAC-SHA256 computes.
+    use super::*;
+
     #[test]
-    fn webp_aead_and_hmac_build_and_run_here() {
-        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-        use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-        use hmac::{Hmac, Mac};
-
-        let rgb = vec![128u8; 64 * 48 * 3];
-        let webp = webp::Encoder::from_rgb(&rgb, 64, 48).encode(70.0);
-        assert_eq!((&webp[..4], &webp[8..12]), (&b"RIFF"[..], &b"WEBP"[..]));
-
-        let cipher = XChaCha20Poly1305::new_from_slice(&[1u8; 32]).unwrap();
-        let nonce = XNonce::from([2u8; 24]);
-        let sealed = cipher
-            .encrypt(
-                &nonce,
-                Payload {
-                    msg: &webp,
-                    aad: b"id",
-                },
-            )
-            .unwrap();
-        let opened = cipher
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: &sealed,
-                    aad: b"id",
-                },
-            )
-            .unwrap();
-        assert_eq!(opened, &webp[..]);
-        assert!(
-            cipher
-                .decrypt(
-                    &nonce,
-                    Payload {
-                        msg: &sealed,
-                        aad: b"other"
-                    }
-                )
-                .is_err()
+    fn local_jitter_stays_in_60_to_90_seconds() {
+        let mut r = [0u8; 32];
+        assert_eq!(local_jitter_interval_ms(&r), 60_000);
+        r[..8].copy_from_slice(&29_999u64.to_be_bytes());
+        assert_eq!(local_jitter_interval_ms(&r), 89_999);
+        r[..8].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(local_jitter_interval_ms(&r), 60_000 + u64::MAX % 30_000);
+        r[8..].fill(0xFF);
+        r[..8].fill(0);
+        assert_eq!(
+            local_jitter_interval_ms(&r),
+            60_000,
+            "only the first 8 bytes"
         );
-
-        let mut mac = <Hmac<sha2::Sha256> as hmac::KeyInit>::new_from_slice(&[0u8; 32]).unwrap();
-        mac.update(&0u64.to_be_bytes());
-        assert_eq!(mac.finalize().into_bytes().len(), 32);
     }
 }

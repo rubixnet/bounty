@@ -60,6 +60,8 @@ pub struct DaemonHandle {
     commits: Option<CommitObserver>,
     /// The Work Bucket finalizer.
     finalizer: Option<FinalizerThread>,
+    /// The Visual Proof Mode scheduler.
+    capture: Option<crate::capture::scheduler::CaptureThread>,
     sync: Option<SyncThread>,
     router: Option<RouterThread>,
     writer: Option<WriterThread>,
@@ -88,6 +90,11 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let signing_key =
         signing_key::load_or_create(&config.data_dir).map_err(StartError::SigningKey)?;
     let sealer = Sealer::open(&conn, signing_key).map_err(StartError::Database)?;
+    // A killed child or an uncommitted record leaves a Vault file (or temp
+    // file) with no Frame Record: removed before anything else runs.
+    if let Err(error) = storage::remove_vault_orphans(&conn, &config.data_dir) {
+        log::error("cannot clean the Vault", &error);
+    }
     let registry = storage::load_registry(&conn).map_err(StartError::Database)?;
     let tailer_state = storage::load_tailer_state(&conn).map_err(StartError::Database)?;
 
@@ -137,6 +144,8 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let commits_writer = writer_sender.clone();
     let finalizer_writer = writer_sender.clone();
     let sync_writer = writer_sender.clone();
+    let capture_writer = writer_sender.clone();
+    let in_flight = crate::capture::scheduler::InFlight::new();
     let mut router = Router::new(git, exclusions, device_secret, writer_sender, registry);
     router.set_attribution_timing(&config.watcher);
     // Re-attach every stored (non-merged) Project before anything can edit
@@ -281,7 +290,12 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     };
 
     let finalizer = if config.finalizer.enabled {
-        match finalizer::spawn(&config.data_dir, finalizer_writer, config.finalizer) {
+        match finalizer::spawn(
+            &config.data_dir,
+            finalizer_writer,
+            config.finalizer,
+            in_flight.clone(),
+        ) {
             Ok(thread) => Some(thread),
             Err(error) => {
                 log::error("failed to start the finalizer", &error);
@@ -289,6 +303,24 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
             }
         }
     } else {
+        None
+    };
+
+    let capture = if config.capture.enabled {
+        match crate::capture::scheduler::spawn(
+            &config.data_dir,
+            capture_writer,
+            in_flight,
+            config.capture.clone(),
+        ) {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                log::error("failed to start the capture scheduler", &error);
+                None
+            }
+        }
+    } else {
+        drop(capture_writer);
         None
     };
 
@@ -313,6 +345,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         presence,
         commits: commit_observer,
         finalizer,
+        capture,
         sync: sync_thread,
         router: Some(router_thread),
         writer: Some(writer_thread),
@@ -396,6 +429,15 @@ impl DaemonHandle {
         }
         if let Some(Err(_)) = self.sync.take().map(SyncThread::stop) {
             log::warn("the sync client thread panicked");
+        }
+        // Before the finalizer: a running child finishes (or is killed)
+        // and its Frame reaches the writer first.
+        if let Some(Err(_)) = self
+            .capture
+            .take()
+            .map(crate::capture::scheduler::CaptureThread::stop)
+        {
+            log::warn("the capture scheduler thread panicked");
         }
         if let Some(Err(_)) = self.finalizer.take().map(FinalizerThread::stop) {
             log::warn("the finalizer thread panicked");

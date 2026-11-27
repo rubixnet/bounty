@@ -10,7 +10,8 @@ use crate::ActivityRollup;
 pub const GENESIS_PREV_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// The `frame_digest` of every payload until Step 3b fills it in.
+/// The `frame_digest` of a window with no Frames (Visual Proof Mode off, or
+/// nothing captured), and of every 3a payload.
 pub const FRAME_DIGEST_NONE: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -63,7 +64,7 @@ pub struct LinkPayload {
     pub device_rows_digest: String,
     /// Sorted by `project_id`, unique.
     pub projects: Vec<ProjectDigest>,
-    /// [`FRAME_DIGEST_NONE`] until Step 3b.
+    /// [`super::frame_digest`] of the window's Frame Records.
     pub frame_digest: String,
     /// `Some` only on the genesis link of a successor chain.
     pub supersedes: Option<Supersedes>,
@@ -90,8 +91,8 @@ pub fn device_rows_digest(rollup: Option<&ActivityRollup>) -> String {
 }
 
 impl LinkPayload {
-    /// Build a payload for one window. `frame_digest` is
-    /// [`FRAME_DIGEST_NONE`] until Step 3b.
+    /// Build a payload for one window with no Frames
+    /// ([`FRAME_DIGEST_NONE`]); see [`LinkPayload::with_frames`].
     pub fn new(
         window_start_ms: u64,
         ruleset_id: &str,
@@ -121,6 +122,12 @@ impl LinkPayload {
             frame_digest: FRAME_DIGEST_NONE.to_owned(),
             supersedes,
         })
+    }
+
+    /// The same payload committing to the window's Frame Records.
+    pub fn with_frames(mut self, frames: &[super::FrameRecord]) -> Self {
+        self.frame_digest = super::frame_digest(frames);
+        self
     }
 
     /// `SHA-256(TAG_PAYLOAD || canonical_json(self))`, in hex.

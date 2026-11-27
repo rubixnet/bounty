@@ -116,7 +116,7 @@ impl Device {
     }
 }
 
-fn event(db: &Connection, n: u64, project: &str, timestamp_ms: u64) {
+pub fn event(db: &Connection, n: u64, project: &str, timestamp_ms: u64) {
     db.execute(
         "INSERT INTO traction_event
              (event_id, schema_version, timestamp_ms, harness_id, session_id,
@@ -130,6 +130,27 @@ fn event(db: &Connection, n: u64, project: &str, timestamp_ms: u64) {
             i64::try_from(timestamp_ms).unwrap(),
             format!("/code/{}", &project[4..]),
             project,
+        ],
+    )
+    .unwrap();
+}
+
+/// `(window index, offset in the window)` of every seeded Frame.
+pub const FRAMES: [(u64, u64); 3] = [(2, 40_000), (5, 15_000), (5, 75_000)];
+
+/// One Frame Record (no Vault file: local verification covers the records).
+fn frame(db: &Connection, captured_at_ms: u64, n: usize) {
+    let width = WINDOW;
+    db.execute(
+        "INSERT INTO frame
+             (frame_id, window_start_ms, captured_at_ms, frame_hash, trigger,
+              scheduled_at_ms, nonce_id, width, height, pixels_state)
+         VALUES (?1, ?2, ?3, ?4, 'scheduled', ?3, NULL, 1280, 720, 'present')",
+        rusqlite::params![
+            format!("{captured_at_ms}-00"),
+            i64::try_from(captured_at_ms / width * width).unwrap(),
+            i64::try_from(captured_at_ms).unwrap(),
+            format!("{:02x}", n + 1).repeat(32),
         ],
     )
     .unwrap();
@@ -157,6 +178,15 @@ fn seed(dir: &Path, t0: u64, first_window: u64, count: u64) {
             .unwrap();
         }
         event(&db, window * 10, ALPHA, start + 10_000);
+        // Frame Records (Visual Proof Mode): one in window 2, two in window 5.
+        for (n, offset) in FRAMES
+            .iter()
+            .filter(|(w, _)| *w == window)
+            .map(|(_, o)| o)
+            .enumerate()
+        {
+            frame(&db, start + offset, n);
+        }
         if window % 2 == 1 {
             event(&db, window * 10 + 1, BETA, start + MIN + 10_000);
         }

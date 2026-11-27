@@ -366,6 +366,8 @@ pub fn verify_bundle(
         work_buckets: bundle.project_rows.work_buckets.clone(),
         commits,
         rollups: bundle.device_rows.activity_rollups.clone(),
+        // Schema 1 bundles carry no Frames (S3 adds them).
+        frames: None,
     };
 
     // 4. The chains against the rows, pinned to the manifest tip.

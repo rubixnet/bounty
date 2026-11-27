@@ -12,6 +12,8 @@ pub enum PayloadPart {
     DeviceRows,
     /// One Project's rows in the window.
     Project(String),
+    /// The window's Frame Records (`frame_digest`).
+    Frames,
 }
 
 /// Why a chain, a bundle manifest or a key failed verification.

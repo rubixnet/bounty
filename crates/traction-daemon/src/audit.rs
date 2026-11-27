@@ -325,6 +325,7 @@ fn render_failure(error: &ChainError, links: &[(KeyId, u64)]) -> Outcome {
             PayloadPart::Payload => " part=payload".to_owned(),
             PayloadPart::DeviceRows => " part=device_rows".to_owned(),
             PayloadPart::Project(id) => format!(" part=project:{id}"),
+            PayloadPart::Frames => " part=frames".to_owned(),
         },
         ChainError::UnanchoredRow { window_start_ms } => format!(" window={window_start_ms}"),
         _ => String::new(),

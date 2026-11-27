@@ -61,6 +61,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_10,
     MIGRATION_11,
     MIGRATION_12,
+    MIGRATION_13,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -462,6 +463,41 @@ const MIGRATION_12: &str = "
     ) STRICT, WITHOUT ROWID;
 ";
 
+/// Step 3b (S1): Frame Records (spec Q8). One row per Frame the
+/// `capture-frame` child wrote to the Vault, inserted by the single writer.
+/// The signed part (`FrameRecord`: id, hash, capture time, trigger, schedule
+/// slot, nonce id) is sealed into its window's `frame_digest`; `width`,
+/// `height` and `window_start_ms` are local context. Append-only except
+/// `pixels_state` (`present` → `redacted`/`expired`), which Redaction and
+/// retention change after sealing and which no digest covers. No text: ids,
+/// hashes, numbers and closed enums only.
+const MIGRATION_13: &str = "
+    CREATE TABLE frame (
+        frame_id        TEXT PRIMARY KEY NOT NULL,
+        window_start_ms INTEGER NOT NULL,
+        captured_at_ms  INTEGER NOT NULL,
+        frame_hash      TEXT NOT NULL,
+        trigger         TEXT NOT NULL
+            CHECK (trigger IN ('scheduled', 'turn_start', 'tool_fail', 'focus_shift')),
+        scheduled_at_ms INTEGER,
+        nonce_id        TEXT,
+        width           INTEGER NOT NULL,
+        height          INTEGER NOT NULL,
+        pixels_state    TEXT NOT NULL CHECK (pixels_state IN ('present', 'redacted', 'expired'))
+    ) STRICT, WITHOUT ROWID;
+    CREATE INDEX frame_by_capture ON frame (captured_at_ms);
+
+    CREATE TRIGGER frame_no_delete BEFORE DELETE ON frame
+    BEGIN SELECT RAISE(ABORT, 'frame is append-only'); END;
+    CREATE TRIGGER frame_pixels_state_only BEFORE UPDATE ON frame
+    WHEN NEW.frame_id IS NOT OLD.frame_id OR NEW.window_start_ms IS NOT OLD.window_start_ms
+      OR NEW.captured_at_ms IS NOT OLD.captured_at_ms OR NEW.frame_hash IS NOT OLD.frame_hash
+      OR NEW.trigger IS NOT OLD.trigger OR NEW.scheduled_at_ms IS NOT OLD.scheduled_at_ms
+      OR NEW.nonce_id IS NOT OLD.nonce_id OR NEW.width IS NOT OLD.width
+      OR NEW.height IS NOT OLD.height OR OLD.pixels_state != 'present'
+    BEGIN SELECT RAISE(ABORT, 'frame records are append-only'); END;
+";
+
 /// The alias-aware events view (see [`MIGRATION_3`]).
 pub const PROJECT_EVENT_VIEW: &str = "project_event";
 
@@ -668,6 +704,20 @@ pub enum WriteOp {
     Rollup(Box<RollupBatch>),
     /// Moves the server sync cursor (`sync_cursor`).
     SyncCursor(SyncCursorRow),
+    /// Records one Frame the `capture-frame` child wrote. A Frame whose
+    /// window was already sealed is discarded: its Vault file is deleted and
+    /// no record is written (it is never re-sealed).
+    Frame(Box<FrameRow>),
+}
+
+/// One Frame Record plus its local context (see [`MIGRATION_13`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameRow {
+    pub record: traction_core::FrameRecord,
+    pub width: u32,
+    pub height: u32,
+    /// The Frame's Vault file, deleted when the Frame is discarded.
+    pub vault_file: std::path::PathBuf,
 }
 
 /// The `sync_cursor` row. `terminal_rejections` is the running total.
@@ -718,7 +768,8 @@ impl WriteOp {
             | Self::Presence(_)
             | Self::Commit(_)
             | Self::Rollup(_)
-            | Self::SyncCursor(_) => 0,
+            | Self::SyncCursor(_)
+            | Self::Frame(_) => 0,
         }
     }
 }
@@ -1094,6 +1145,9 @@ pub fn apply_batch_with(
                     to_i64(cursor.updated_at_ms),
                 ])?;
             }
+            WriteOp::Frame(frame) => {
+                insert_frame(&tx, frame)?;
+            }
             WriteOp::HookRun(hook) => {
                 tx.prepare_cached(
                     "INSERT OR IGNORE INTO session_hook_run
@@ -1116,6 +1170,67 @@ pub fn apply_batch_with(
     )?
     .execute([now_ms()])?;
     tx.commit()
+}
+
+/// Records one `written` capture report for a stopped daemon, through the
+/// writer's own insert (tests drive the post-grab path with it).
+#[doc(hidden)]
+pub fn record_frame(data_dir: &Path, frame: FrameRow) -> rusqlite::Result<bool> {
+    let mut conn = open(data_dir)?;
+    let tx = conn.transaction()?;
+    let inserted = insert_frame(&tx, &frame)?;
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// Removes Vault files that no Frame Record names (see
+/// [`crate::capture::vault::remove_orphans`]).
+pub fn remove_vault_orphans(conn: &Connection, data_dir: &Path) -> std::io::Result<usize> {
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM frame WHERE frame_id = ?1")
+        .map_err(std::io::Error::other)?;
+    crate::capture::vault::remove_orphans(data_dir, |id| stmt.exists([id]).unwrap_or(true))
+}
+
+/// Inserts a Frame Record unless its window is already finalized (then the
+/// Frame is discarded and its Vault file deleted). Returns whether it was
+/// recorded.
+fn insert_frame(conn: &Connection, frame: &FrameRow) -> rusqlite::Result<bool> {
+    let record = &frame.record;
+    let width = traction_core::TRACTION_RULES_1.activity_rollup_ms;
+    let window = record.captured_at_ms / width * width;
+    let finalized: Option<i64> = conn.query_row(
+        "SELECT max(finalized_through_ms) FROM rollup_cursor",
+        [],
+        |row| row.get(0),
+    )?;
+    let sealed = finalized.is_some_and(|through| to_i64(window) < through);
+    let inserted = !sealed
+        && record.validate().is_ok()
+        && conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO frame
+                     (frame_id, window_start_ms, captured_at_ms, frame_hash, trigger,
+                      scheduled_at_ms, nonce_id, width, height, pixels_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'present')",
+            )?
+            .execute(params![
+                record.frame_id,
+                to_i64(window),
+                to_i64(record.captured_at_ms),
+                record.frame_hash,
+                record.trigger.as_str(),
+                record.scheduled_at_ms.map(to_i64),
+                record.nonce_id,
+                frame.width,
+                frame.height,
+            ])?
+            == 1;
+    if !inserted {
+        let _ = std::fs::remove_file(&frame.vault_file);
+        crate::log::warn("discarded a Frame that reported after its window was sealed");
+    }
+    Ok(inserted)
 }
 
 fn insert_presence(conn: &Connection, minute: &PresenceMinute) -> rusqlite::Result<()> {

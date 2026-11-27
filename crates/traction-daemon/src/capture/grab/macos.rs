@@ -184,6 +184,19 @@ mod tests {
     fn macos_real_screencapturekit_grab() {
         let image = grab(&CGMainDisplayID().to_string()).expect("real grab");
         assert!(image.width >= 640 && image.height >= 480);
+        // The WebP quality measurement (ticket 01): sizes at 720p on this
+        // real screen. Nothing is written to disk.
+        let scaled = crate::capture::image::downscale(&image);
+        for quality in [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 60.0, 80.0] {
+            let webp = webp::Encoder::from_rgb(&scaled.pixels, scaled.width, scaled.height)
+                .encode(quality);
+            eprintln!(
+                "{}x{} q{quality}: {} bytes",
+                scaled.width,
+                scaled.height,
+                webp.len()
+            );
+        }
         assert!(
             image
                 .pixels
