@@ -3,7 +3,7 @@
 //! The permission check is `CGPreflightScreenCaptureAccess`, which never
 //! prompts. Without access the grab stops there with `permission_denied`,
 //! before any ScreenCaptureKit call that could show the system prompt. The
-//! only prompting call (`CGRequestScreenCaptureAccess`) belongs to
+//! only prompting call (the Screen Recording access request) belongs to
 //! `visual-proof enable` (S2); a source scan keeps it everywhere else out.
 //!
 //! `--display` is a `CGDirectDisplayID`. The focus is the frontmost
