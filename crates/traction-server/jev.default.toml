@@ -1,0 +1,118 @@
+# The default `[jev]` section of traction-server.toml (spec S4, ticket 05).
+#
+# Every question, criterion, colour mapping and threshold JevEngine uses lives
+# here, never in Rust source. A `[jev]` key in traction-server.toml overrides
+# the matching key below; an array (`nouls`, `choices`, `scores`,
+# `frame_nouls`) is replaced as a whole.
+#
+# Placeholders: `{window}` becomes the path of one 15-minute window in the
+# state, for example `windows.w03`; `{frame}` becomes `frames.f1`.
+#
+# Colours are `green`, `yellow` or `red`. Jev only ever escalates the
+# HeuristicEngine colour (max severity); it never downgrades and never bans.
+
+# Off by default: a self-hoster runs HeuristicEngine with no network calls.
+enabled = false
+# Any `v1/systemone`-compatible server works by changing these two.
+base_url = "https://api.typesafe.ai"
+# Pinned, never a moving alias such as `jev-latest`.
+model = "jev-1.14.0"
+# The TypeSafe API key comes only from this variable or `api_key_file`.
+api_key_env = "TYPESAFE_API_KEY"
+# Per request; a timeout falls back to HeuristicEngine.
+timeout_ms = 10000
+# Recorded with each decision; bump when a question or mapping changes.
+rubric_version = "jev-rubric/1"
+
+# Noul thresholds: at or above `noul_yes` reads as yes, at or below `noul_no`
+# as no, and the band between is "unsettled", which has its own colour.
+noul_yes = 0.7
+noul_no = 0.3
+
+# Spend. Output tokens are free; input tokens cost this much (TypeSafe models
+# page, 2026-11-27). The limit is hard: a submission whose upper-bound
+# estimate would cross it is not sent, and triage falls back to Heuristic.
+monthly_spend_limit_usd = 40.0
+price_usd_per_million_input_tokens = 0.042
+# Upper bound used to estimate one image's input tokens before sending
+# (TypeSafe publishes no estimate yet; a 1568 x 1568 image is ~3.1k patches
+# of 28 px). Text is estimated at one token per UTF-8 byte.
+image_token_ceiling = 4096
+# Where the month's spend is kept across restarts.
+spend_ledger_file = "traction-jev-spend.json"
+
+# Windows. At most `max_windows` 15-minute windows of a submission are asked
+# about (the ones with the most Human Active Time), `windows_per_request` per
+# request.
+max_windows = 96
+windows_per_request = 24
+
+# Frames (submitted or flagged bundles only). At most `max_frames` usable
+# frames are sent. If the bundle has frames and the share skipped (under
+# 280 px, or undecodable) reaches `frame_skip_yellow_share`, the decision is
+# at least yellow, so tiny frames cannot dodge visual review.
+max_frames = 4
+frame_skip_yellow_share = 1.0
+
+# Per-window qualitative questions. Arithmetic and numeric thresholds stay in
+# HeuristicEngine; these ask what a person would see in the pattern.
+
+[[nouls]]
+name = "scripted_input"
+instructions = "Does the activity in {window} look like a script or bot producing input, rather than a person working?"
+criteria_true = "Input time keeps accruing while nothing is made or tried: no file edits, no AI turns, no tool failures and no commits, in an even pattern across neighbouring windows."
+criteria_false = "Input time comes with things being made or tried, such as file edits, AI turns, tool failures or commits, in the uneven pattern of a person building or debugging."
+colour_yes = "yellow"
+colour_unsettled = "green"
+colour_no = "green"
+
+[[choices]]
+name = "work_pattern"
+instructions = "Which kind of work does {window} show?"
+fits_instructions = "Does {window} show one of these: a person building code, a person debugging, a person directing an AI agent, or input time with nothing made?"
+fits_true = "The window clearly shows one of these four kinds of work."
+fits_false = "The window shows some other kind of activity than these four."
+colour_nothing_fits = "yellow"
+colour_fit_unsettled = "yellow"
+
+[choices.options]
+building = "A person writing new code: manual or AI file edits, often with commits, and few tool failures."
+debugging = "A person fixing a problem: tool failures followed by file edits or new AI turns."
+directing_ai = "A person steering an AI agent: AI turns and AI file edits, with the person's input time between turns."
+presence_without_output = "Input time with no file edits, no AI turns, no tool failures and no commits."
+
+[choices.option_colours]
+building = "green"
+debugging = "green"
+directing_ai = "green"
+presence_without_output = "yellow"
+
+[[scores]]
+name = "visible_effort"
+instructions = "How much of a person's own effort does {window} show?"
+levels = [
+  "No sign of a person's effort: input time with nothing made or tried.",
+  "A little effort: a few file edits, AI turns or tool runs.",
+  "Steady effort: regular file edits, AI turns, tool failures being worked through, or commits.",
+]
+
+# A rule fires when the probability mass on `levels` reaches `min_mass`. The
+# full distribution is read, never the average: 50% on "no effort" and 50% on
+# "steady effort" fires this rule, while 100% on "a little effort" (the same
+# mean) does not.
+[[scores.rules]]
+levels = [0]
+min_mass = 0.5
+colour = "yellow"
+reason = "no_visible_effort"
+
+# Per-frame questions. Images are a secondary reviewer hint only: an answer
+# adds an informational reason code and never changes the colour.
+
+[[frame_nouls]]
+name = "frame_shows_software_work"
+instructions = "Does {frame} show a code editor, a terminal, or a browser being used for software work?"
+criteria_true = "A code editor, terminal, documentation page or similar development tool is on screen and in use."
+criteria_false = "A desktop, a video, a game, a chat app, or another screen with no software work on it."
+hint_if_no = "jev_frame_hint_no_software_work"
+hint_if_unsettled = "jev_frame_hint_unclear"

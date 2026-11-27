@@ -7,10 +7,13 @@
 //! `_env` or `_file` reference makes loading fail, so the server refuses to
 //! start with a secret written inline. Public keys may be inline.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
 use serde::Deserialize;
+
+use crate::decision::Verdict;
 
 /// Words that mark a key as holding a secret.
 const SECRET_WORDS: [&str; 6] = [
@@ -161,10 +164,218 @@ impl Default for Heuristic {
     }
 }
 
-/// Filled by S4.
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct Jev {}
+/// The default `[jev]` section: every question, criterion, colour mapping and
+/// threshold of `JevEngine` lives in this TOML file, never in Rust source.
+pub const JEV_DEFAULT_TOML: &str = include_str!("../jev.default.toml");
+
+/// Option names that would be a catch-all; refused (a companion `noul` asks
+/// whether any option fits instead).
+const CATCH_ALL_OPTIONS: [&str; 5] = ["other", "none", "none_of_the_above", "unknown", "else"];
+
+/// `JevEngine` (spec S4, ticket 05). Defaults come from [`JEV_DEFAULT_TOML`];
+/// a `[jev]` key in the config file overrides its default key by key (an
+/// array is replaced whole). The API key comes only from `api_key_env` or
+/// `api_key_file`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Jev {
+    pub enabled: bool,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: String,
+    #[serde(default)]
+    pub api_key_file: Option<String>,
+    pub timeout_ms: u64,
+    pub rubric_version: String,
+    pub noul_yes: f64,
+    pub noul_no: f64,
+    pub monthly_spend_limit_usd: f64,
+    pub price_usd_per_million_input_tokens: f64,
+    pub image_token_ceiling: u64,
+    pub spend_ledger_file: String,
+    pub max_windows: usize,
+    pub windows_per_request: usize,
+    pub max_frames: usize,
+    pub frame_skip_yellow_share: f64,
+    pub nouls: Vec<NoulRubric>,
+    pub choices: Vec<ChoiceRubric>,
+    pub scores: Vec<ScoreRubric>,
+    pub frame_nouls: Vec<FrameNoulRubric>,
+}
+
+/// A per-window yes/no question and the colour of each band.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NoulRubric {
+    pub name: String,
+    pub instructions: String,
+    pub criteria_true: String,
+    pub criteria_false: String,
+    pub colour_yes: Verdict,
+    pub colour_unsettled: Verdict,
+    pub colour_no: Verdict,
+}
+
+/// A per-window choice, its options' colours and its companion "does any
+/// option fit?" `noul` (asked as `<name>_fits`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceRubric {
+    pub name: String,
+    pub instructions: String,
+    pub options: BTreeMap<String, String>,
+    pub option_colours: BTreeMap<String, Verdict>,
+    pub fits_instructions: String,
+    pub fits_true: String,
+    pub fits_false: String,
+    /// The companion `noul` says no option fits.
+    pub colour_nothing_fits: Verdict,
+    /// The companion `noul` is between the thresholds.
+    pub colour_fit_unsettled: Verdict,
+}
+
+/// A per-window score; its rules read the full level distribution.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScoreRubric {
+    pub name: String,
+    pub instructions: String,
+    pub levels: Vec<String>,
+    pub rules: Vec<ScoreRule>,
+}
+
+/// Fires when the probability mass on `levels` reaches `min_mass`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScoreRule {
+    pub levels: Vec<usize>,
+    pub min_mass: f64,
+    pub colour: Verdict,
+    pub reason: String,
+}
+
+/// A per-frame yes/no question: a reviewer hint only, never a colour.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FrameNoulRubric {
+    pub name: String,
+    pub instructions: String,
+    pub criteria_true: String,
+    pub criteria_false: String,
+    #[serde(default)]
+    pub hint_if_yes: Option<String>,
+    #[serde(default)]
+    pub hint_if_unsettled: Option<String>,
+    #[serde(default)]
+    pub hint_if_no: Option<String>,
+}
+
+impl Default for Jev {
+    fn default() -> Self {
+        toml::from_str(JEV_DEFAULT_TOML).expect("jev.default.toml is a complete [jev] section")
+    }
+}
+
+impl Jev {
+    /// The TypeSafe API key from its file or environment variable.
+    pub fn api_key(&self, env: impl Fn(&str) -> Option<String>) -> Result<String, ConfigError> {
+        if let Some(path) = &self.api_key_file {
+            let text = std::fs::read_to_string(path)
+                .map_err(|_| ConfigError::MissingSecret("api_key_file".into()))?;
+            return Ok(text.trim().to_owned());
+        }
+        env(&self.api_key_env)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ConfigError::MissingSecret(self.api_key_env.clone()))
+    }
+
+    /// Checks the rubric: thresholds in order, no catch-all option, a colour
+    /// for every option, score rules on real levels, unique names.
+    pub fn validate(&self) -> Result<(), String> {
+        let unit = |v: f64| (0.0..=1.0).contains(&v);
+        if !(unit(self.noul_no) && unit(self.noul_yes) && self.noul_no < self.noul_yes) {
+            return Err("`jev.noul_no` must be below `jev.noul_yes`, both in 0..=1".into());
+        }
+        if !unit(self.frame_skip_yellow_share) {
+            return Err("`jev.frame_skip_yellow_share` must be in 0..=1".into());
+        }
+        if !(self.monthly_spend_limit_usd >= 0.0 && self.price_usd_per_million_input_tokens > 0.0) {
+            return Err("`jev` spend limit and price must be positive".into());
+        }
+        if self.windows_per_request == 0 || self.max_windows == 0 {
+            return Err("`jev.windows_per_request` and `jev.max_windows` must be positive".into());
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut name_ok = |name: &str| -> Result<(), String> {
+            let valid = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                && !name.contains("__");
+            if !valid || !names.insert(name.to_owned()) {
+                return Err(format!(
+                    "jev question name `{name}` must be unique snake_case without `__`"
+                ));
+            }
+            Ok(())
+        };
+        for noul in &self.nouls {
+            name_ok(&noul.name)?;
+        }
+        for choice in &self.choices {
+            name_ok(&choice.name)?;
+            name_ok(&format!("{}_fits", choice.name))?;
+            if choice.options.is_empty() || choice.options.len() > 255 {
+                return Err(format!("choice `{}` needs 1 to 255 options", choice.name));
+            }
+            for option in choice.options.keys() {
+                if CATCH_ALL_OPTIONS.contains(&option.to_ascii_lowercase().as_str()) {
+                    return Err(format!(
+                        "choice `{}` has a catch-all option `{option}`; the companion `fits` \
+                         noul replaces `other`",
+                        choice.name
+                    ));
+                }
+                if !choice.option_colours.contains_key(option) {
+                    return Err(format!(
+                        "choice `{}` option `{option}` has no colour",
+                        choice.name
+                    ));
+                }
+            }
+            if choice.option_colours.len() != choice.options.len() {
+                return Err(format!(
+                    "choice `{}` colours an unknown option",
+                    choice.name
+                ));
+            }
+        }
+        for score in &self.scores {
+            name_ok(&score.name)?;
+            if score.levels.is_empty() || score.levels.len() > 10 {
+                return Err(format!("score `{}` needs 1 to 10 levels", score.name));
+            }
+            for rule in &score.rules {
+                if rule.levels.is_empty()
+                    || rule.levels.iter().any(|&l| l >= score.levels.len())
+                    || !unit(rule.min_mass)
+                {
+                    return Err(format!(
+                        "score `{}` has a rule on no real level",
+                        score.name
+                    ));
+                }
+            }
+        }
+        for frame in &self.frame_nouls {
+            name_ok(&frame.name)?;
+        }
+        if self.nouls.is_empty() && self.choices.is_empty() && self.scores.is_empty() {
+            return Err("`jev` asks no per-window question".into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -352,7 +563,18 @@ impl Config {
         if let Some(key) = find_inline_secret(&table, "") {
             return Err(ConfigError::InlineSecret(key));
         }
-        toml::from_str(text).map_err(|e| ConfigError::Parse(e.message().to_owned()))
+        let mut table = table;
+        if let Some(user) = table.remove("jev") {
+            let toml::Value::Table(user) = user else {
+                return Err(ConfigError::Parse("`jev` must be a table".into()));
+            };
+            let mut jev: toml::Table = JEV_DEFAULT_TOML.parse().expect("jev.default.toml parses");
+            jev.extend(user);
+            table.insert("jev".into(), toml::Value::Table(jev));
+        }
+        table
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::Parse(e.message().to_owned()))
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -489,6 +711,86 @@ mod tests {
             );
         }
         assert!(Config::parse("[blob]\nr2_secret_access_key_env = \"X\"\n").is_ok());
+    }
+
+    #[test]
+    fn the_jev_defaults_are_the_pinned_model_and_the_documented_policy() {
+        let jev = Config::parse("").unwrap().jev;
+        assert!(!jev.enabled, "self-hosters run Heuristic only by default");
+        assert_eq!(jev.base_url, "https://api.typesafe.ai");
+        assert_eq!(jev.model, "jev-1.14.0", "pinned, never an alias");
+        assert_eq!((jev.noul_yes, jev.noul_no), (0.7, 0.3), "spec Q22");
+        assert_eq!(jev.price_usd_per_million_input_tokens, 0.042);
+        assert_eq!(jev.monthly_spend_limit_usd, 40.0, "docs/cost-model.md");
+        assert_eq!(jev.frame_skip_yellow_share, 1.0);
+        assert_eq!(jev.api_key_env, "TYPESAFE_API_KEY");
+        assert!(!jev.nouls.is_empty() && !jev.choices.is_empty() && !jev.scores.is_empty());
+        assert!(!jev.frame_nouls.is_empty());
+        jev.validate().expect("the shipped rubric is valid");
+    }
+
+    #[test]
+    fn jev_keys_override_the_defaults_one_by_one() {
+        let jev = Config::parse(
+            "[jev]\nbase_url = \"http://127.0.0.1:9\"\nmodel = \"jev-1.13.0\"\n\
+             monthly_spend_limit_usd = 5.0\n",
+        )
+        .unwrap()
+        .jev;
+        assert_eq!(jev.base_url, "http://127.0.0.1:9");
+        assert_eq!(jev.model, "jev-1.13.0");
+        assert_eq!(jev.monthly_spend_limit_usd, 5.0);
+        assert_eq!(jev.noul_yes, 0.7, "untouched keys keep their default");
+        assert!(!jev.choices.is_empty());
+        assert!(matches!(
+            Config::parse("[jev]\nno_such_key = 1\n"),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn the_jev_api_key_comes_only_from_the_environment_or_a_file() {
+        assert!(matches!(
+            Config::parse("[jev]\napi_key = \"ts_live\"\n"),
+            Err(ConfigError::InlineSecret(_))
+        ));
+        let jev = Config::parse("[jev]\napi_key_env = \"MY_TS_KEY\"\n")
+            .unwrap()
+            .jev;
+        let key = jev
+            .api_key(|name| (name == "MY_TS_KEY").then(|| "k".into()))
+            .unwrap();
+        assert_eq!(key, "k");
+        assert!(matches!(
+            jev.api_key(|_| None),
+            Err(ConfigError::MissingSecret(_))
+        ));
+    }
+
+    #[test]
+    fn a_catch_all_other_option_is_refused() {
+        let mut jev = Config::parse("").unwrap().jev;
+        let choice = &mut jev.choices[0];
+        choice
+            .options
+            .insert("other".into(), "Anything else".into());
+        choice
+            .option_colours
+            .insert("other".into(), Verdict::Yellow);
+        assert!(jev.validate().unwrap_err().contains("other"));
+    }
+
+    #[test]
+    fn every_choice_option_needs_a_colour_and_a_score_rule_real_levels() {
+        let mut jev = Config::parse("").unwrap().jev;
+        jev.choices[0].option_colours.clear();
+        assert!(jev.validate().is_err());
+        let mut jev = Config::parse("").unwrap().jev;
+        jev.scores[0].rules[0].levels = vec![99];
+        assert!(jev.validate().is_err());
+        let mut jev = Config::parse("").unwrap().jev;
+        jev.noul_yes = 0.2;
+        assert!(jev.validate().is_err(), "noul_no must sit below noul_yes");
     }
 
     #[test]
