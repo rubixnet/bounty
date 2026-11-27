@@ -42,7 +42,9 @@ use traction_core::{
 
 use crate::app::{AppState, Device, authenticate};
 use crate::blob::BlobError;
-use crate::decision::{AnchorFlags, SLOT_MS, Slot, TriageInput, VerificationSummary, decide};
+use crate::decision::{
+    AnchorFlags, ReviewContext, SLOT_MS, Slot, TriageInput, VerificationSummary, decide,
+};
 use crate::error::ApiError;
 use crate::merge::{ShareRow, merge_rows};
 use crate::store;
@@ -228,6 +230,8 @@ fn failed(code: &str, submission_ref: String) -> TriageInput {
         },
         flags: AnchorFlags::default(),
         slots: Vec::new(),
+        review: ReviewContext::Submitted,
+        frames: Vec::new(),
     }
 }
 
@@ -498,6 +502,8 @@ pub async fn evaluate(
         },
         flags,
         slots: slots.into_values().collect(),
+        review: ReviewContext::Submitted,
+        frames: Vec::new(),
     })
 }
 

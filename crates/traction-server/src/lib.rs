@@ -23,6 +23,7 @@ pub mod fanout;
 pub mod github;
 pub mod github_api;
 pub mod heuristic;
+pub mod jev;
 pub mod live;
 pub mod merge;
 pub mod oidc;

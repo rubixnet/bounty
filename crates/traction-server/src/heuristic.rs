@@ -230,6 +230,8 @@ mod tests {
                 ..AnchorFlags::default()
             },
             slots: (0..3).map(honest_slot).collect(),
+            review: crate::decision::ReviewContext::Submitted,
+            frames: Vec::new(),
         }
     }
 

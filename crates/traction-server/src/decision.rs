@@ -40,6 +40,37 @@ pub mod reasons {
     pub const TIER_LIMITED_SHARE: &str = "tier_limited_share";
     /// Yellow: the engine itself failed; a human looks.
     pub const ENGINE_ERROR: &str = "engine_error";
+    /// Informational (S4): Jev was not used and `HeuristicEngine` decided,
+    /// because the monthly spend limit would be crossed.
+    pub const JEV_FALLBACK_SPEND_LIMIT: &str = "jev_fallback_spend_limit";
+    /// Informational (S4): Jev answered with an error or a malformed reply.
+    pub const JEV_FALLBACK_ERROR: &str = "jev_fallback_error";
+    /// Informational (S4): Jev did not answer in time.
+    pub const JEV_FALLBACK_TIMEOUT: &str = "jev_fallback_timeout";
+    /// Informational (S4): a frame was under 280 px on a side and not sent.
+    pub const FRAME_TOO_SMALL_SKIPPED: &str = "frame_too_small_skipped";
+    /// Informational (S4): a frame could not be decoded and was not sent.
+    pub const FRAME_UNDECODABLE: &str = "frame_undecodable";
+    /// Yellow (S4): the share of skipped frames reached
+    /// `[jev].frame_skip_yellow_share`.
+    pub const FRAME_SKIP_SHARE: &str = "frame_skip_share";
+}
+
+/// Why the bundle is being triaged; images go to Jev only for `Submitted`
+/// or `Flagged` bundles (spec S4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewContext {
+    #[default]
+    Routine,
+    Submitted,
+    Flagged,
+}
+
+impl ReviewContext {
+    pub fn allows_images(self) -> bool {
+        matches!(self, ReviewContext::Submitted | ReviewContext::Flagged)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -161,6 +192,13 @@ pub struct TriageInput {
     pub verification: VerificationSummary,
     pub flags: AnchorFlags,
     pub slots: Vec<Slot>,
+    #[serde(default)]
+    pub review: ReviewContext,
+    /// Sampled WebP frames (visual proof, Step 3b). Never serialized, so
+    /// never stored with the decision; until 3b ships frames this is empty
+    /// outside tests.
+    #[serde(skip)]
+    pub frames: Vec<Vec<u8>>,
 }
 
 impl TriageInput {
@@ -247,6 +285,8 @@ mod tests {
             },
             flags: AnchorFlags::default(),
             slots: vec![],
+            review: ReviewContext::Submitted,
+            frames: vec![],
         }
     }
 

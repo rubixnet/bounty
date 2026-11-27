@@ -75,6 +75,17 @@ pub fn target_size(width: u32, height: u32) -> Result<(u32, u32), FrameSkip> {
     Ok((w, h))
 }
 
+/// Reads only a frame's header: the size it would be sent at, or why it
+/// would be skipped. Cheap enough to run on every frame of a bundle.
+pub fn probe(webp: &[u8]) -> Result<(u32, u32), FrameSkip> {
+    let decoder = WebPDecoder::new(Cursor::new(webp)).map_err(|_| FrameSkip::Undecodable)?;
+    let (width, height) = decoder.dimensions();
+    if decoder.is_animated() || u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS {
+        return Err(FrameSkip::Undecodable);
+    }
+    target_size(width, height)
+}
+
 /// Transcodes one WebP frame, in memory.
 pub fn webp_to_baseline_jpeg(webp: &[u8]) -> Result<Jpeg, FrameSkip> {
     let mut decoder = WebPDecoder::new(Cursor::new(webp)).map_err(|_| FrameSkip::Undecodable)?;
