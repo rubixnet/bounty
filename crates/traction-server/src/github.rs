@@ -23,7 +23,7 @@ use rsa::{Pkcs1v15Sign, PrivateKey};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::config::{Github, ConfigError};
+use crate::config::{ConfigError, Github};
 
 /// Why a GitHub call failed. Values never echo a token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +145,12 @@ pub fn parse_rfc3339_ms(text: &str) -> Option<i64> {
     };
     let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
     let mut rest = &text[19..];
@@ -182,7 +187,8 @@ pub fn parse_rfc3339_ms(text: &str) -> Option<i64> {
 /// Parses one page of the commit list. Entries with an unreadable date are
 /// skipped rather than failing the page.
 pub fn parse_commit_page(body: &[u8]) -> Result<Vec<CommitRecord>, GithubError> {
-    let items: Vec<CommitWire> = serde_json::from_slice(body).map_err(|_| GithubError::Malformed)?;
+    let items: Vec<CommitWire> =
+        serde_json::from_slice(body).map_err(|_| GithubError::Malformed)?;
     Ok(items
         .into_iter()
         .filter_map(|c| {
@@ -349,9 +355,8 @@ impl GithubClient {
                 let remaining = header("x-ratelimit-remaining");
                 let retry_after = header("retry-after").and_then(|v| v.parse::<u64>().ok());
                 let reset = header("x-ratelimit-reset").and_then(|v| v.parse::<u64>().ok());
-                let limited = status == 429
-                    || retry_after.is_some()
-                    || remaining.as_deref() == Some("0");
+                let limited =
+                    status == 429 || retry_after.is_some() || remaining.as_deref() == Some("0");
                 if limited {
                     let wait = retry_after
                         .or_else(|| reset.map(|at| at.saturating_sub(now_sec)))
@@ -404,9 +409,16 @@ impl GithubClient {
     }
 
     /// `POST /app/installations/{id}/access_tokens` with the App JWT.
-    pub fn installation_token(&self, installation: i64, now_sec: u64) -> Result<String, GithubError> {
+    pub fn installation_token(
+        &self,
+        installation: i64,
+        now_sec: u64,
+    ) -> Result<String, GithubError> {
         let jwt = self.app_jwt(now_sec)?;
-        let url = format!("{}/app/installations/{installation}/access_tokens", self.base);
+        let url = format!(
+            "{}/app/installations/{installation}/access_tokens",
+            self.base
+        );
         let (body, _) = self.call("POST", &url, &jwt, now_sec)?;
         serde_json::from_slice::<TokenWire>(&body)
             .map(|t| t.token)
@@ -447,7 +459,9 @@ impl GithubClient {
 
 fn is_loopback_http(base: &str) -> bool {
     base.strip_prefix("http://").is_some_and(|rest| {
-        rest.starts_with("127.0.0.1:") || rest.starts_with("localhost:") || rest.starts_with("[::1]:")
+        rest.starts_with("127.0.0.1:")
+            || rest.starts_with("localhost:")
+            || rest.starts_with("[::1]:")
     })
 }
 
@@ -481,14 +495,26 @@ mod tests {
     fn rfc3339_timestamps_parse_to_unix_milliseconds() {
         // Independent known values (checked with `date -u -d`).
         assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_rfc3339_ms("2012-03-06T23:06:50Z"), Some(1_331_075_210_000));
-        assert_eq!(parse_rfc3339_ms("2024-02-29T12:00:00Z"), Some(1_709_208_000_000));
+        assert_eq!(
+            parse_rfc3339_ms("2012-03-06T23:06:50Z"),
+            Some(1_331_075_210_000)
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2024-02-29T12:00:00Z"),
+            Some(1_709_208_000_000)
+        );
         // A numeric offset is subtracted; fractions are ignored.
         assert_eq!(
             parse_rfc3339_ms("2012-03-07T00:06:50.123+01:00"),
             Some(1_331_075_210_000)
         );
-        for bad in ["", "2012-03-06", "2012-13-06T23:06:50Z", "2012-03-06T23:06:50", "x"] {
+        for bad in [
+            "",
+            "2012-03-06",
+            "2012-13-06T23:06:50Z",
+            "2012-03-06T23:06:50",
+            "x",
+        ] {
             assert_eq!(parse_rfc3339_ms(bad), None, "{bad}");
         }
     }
@@ -504,7 +530,10 @@ mod tests {
     fn the_next_page_is_taken_from_the_link_header() {
         let header = "<https://api.github.com/r?page=2>; rel=\"next\", \
                       <https://api.github.com/r?page=9>; rel=\"last\"";
-        assert_eq!(next_link(header).as_deref(), Some("https://api.github.com/r?page=2"));
+        assert_eq!(
+            next_link(header).as_deref(),
+            Some("https://api.github.com/r?page=2")
+        );
         let last = "<https://api.github.com/r?page=1>; rel=\"first\", <https://api.github.com/r?page=1>; rel=\"prev\"";
         assert_eq!(next_link(last), None);
     }
@@ -513,7 +542,9 @@ mod tests {
     fn repo_names_are_validated_before_they_reach_a_url() {
         assert!(valid_repo_name("octocat/Hello-World"));
         assert!(valid_repo_name("a/b.c_d"));
-        for bad in ["", "a", "a/", "/b", "a/b/c", "a/../b", "a b/c", "a/b?x=1", "../x"] {
+        for bad in [
+            "", "a", "a/", "/b", "a/b/c", "a/../b", "a b/c", "a/b?x=1", "../x",
+        ] {
             assert!(!valid_repo_name(bad), "{bad}");
         }
     }
@@ -526,6 +557,9 @@ mod tests {
         let debug = format!("{records:?}");
         assert!(!debug.contains("secret"));
         assert_eq!(records[0].author_login.as_deref(), Some("octocat"));
-        assert_eq!(records[0].committed_at_ms - records[0].authored_at_ms, 3_190_000);
+        assert_eq!(
+            records[0].committed_at_ms - records[0].authored_at_ms,
+            3_190_000
+        );
     }
 }

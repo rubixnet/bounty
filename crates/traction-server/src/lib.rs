@@ -21,6 +21,7 @@ pub mod decision;
 pub mod error;
 pub mod fanout;
 pub mod github;
+pub mod github_api;
 pub mod heuristic;
 pub mod live;
 pub mod merge;

@@ -7,6 +7,7 @@
 //! missing URL into a failure so CI can never skip silently.
 #![allow(dead_code)]
 
+pub mod github;
 pub mod idp;
 
 use std::io::{BufRead, BufReader, Read, Write};

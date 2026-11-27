@@ -19,7 +19,7 @@ use crate::fanout::LiveFanout;
 use crate::partition::Month;
 use crate::rate_limit::RateLimiter;
 use crate::token::{bearer, hash_secret};
-use crate::{aliases, anchors, live, pairing, submission, views};
+use crate::{aliases, anchors, github_api, live, pairing, submission, views};
 
 /// Microseconds since the Unix epoch. Injectable so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -86,6 +86,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/live", get(live::stream))
         .route("/v1/bundles", post(submission::start))
         .route("/v1/bundles/{id}/complete", post(submission::complete))
+        .route("/v1/github/link", post(github_api::link))
+        .route(
+            "/v1/github/projects/{project_id}/sync",
+            post(github_api::sync),
+        )
+        .route(
+            "/v1/github/projects/{project_id}",
+            delete(github_api::unlink),
+        )
         .route("/v1/projects/merge", post(aliases::merge))
         .route("/v1/projects/merge/{from_id}", delete(aliases::unmerge))
         .route("/v1/me", get(views::get_me).delete(views::delete_me))
