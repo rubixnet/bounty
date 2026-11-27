@@ -58,3 +58,8 @@ ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 # `rsa` crate with PKCS#1 v1.5, no encryption use) and base64url for JWT/PKCE.
 rsa = { version = "0.10.0", default-features = false, features = ["std", "pkcs1v15", "encoding"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+# Server (Step 4, S4): Jev frames are transcoded in memory, pure Rust on all
+# 3 OSes: WebP decoding (`image-webp`) and baseline (SOF0) JPEG encoding
+# (`jpeg-encoder`; progressive stays off).
+image-webp = { version = "0.2.4", default-features = false }
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"] }

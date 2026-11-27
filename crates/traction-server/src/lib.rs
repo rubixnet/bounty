@@ -33,6 +33,7 @@ pub mod rate_limit;
 pub mod store;
 pub mod submission;
 pub mod token;
+pub mod transcode;
 pub mod views;
 
 use std::collections::HashSet;
