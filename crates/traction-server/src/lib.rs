@@ -3,7 +3,9 @@
 //!
 //! Module map: `config` (TOML, secrets by reference), `app` (state, router,
 //! bearer auth), `pairing` and `auth` (login, CSRF, `AuthProvider`),
-//! `anchors` (`POST /v1/anchors`), `store` (typed-column rows), `partition`
+//! `anchors` (`POST /v1/anchors`), `store` (typed-column rows), `merge` (read-time
+//! overlap merge), `views` (read APIs, `DELETE /v1/me`), `oidc` (Hack Club
+//! login), `partition`
 //! (monthly partitions), `fanout` + `live` (SSE totals), `rate_limit`,
 //! `token`, `error`.
 
