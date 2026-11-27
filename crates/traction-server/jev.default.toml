@@ -38,6 +38,13 @@ price_usd_per_million_input_tokens = 0.042
 # (TypeSafe publishes no estimate yet; a 1568 x 1568 image is ~3.1k patches
 # of 28 px). Text is estimated at one token per UTF-8 byte.
 image_token_ceiling = 4096
+# Safety margin, as a share of the limit. Reservations must fit under
+# limit x (1 - margin), so a reply billed above its estimate (an image's
+# real token count is not published) can never push the month over the
+# limit while the overrun stays within the margin ($2 at the default $40;
+# one request is capped by the 64k-token context, ~$0.003). In 0..1
+# (1.0 is refused: to stop Jev, set `enabled = false`).
+spend_safety_margin = 0.05
 # Where the month's spend is kept across restarts.
 spend_ledger_file = "traction-jev-spend.json"
 

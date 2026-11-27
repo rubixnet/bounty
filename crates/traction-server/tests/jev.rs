@@ -705,6 +705,57 @@ async fn spend_never_crosses_the_monthly_limit_across_submissions_and_restarts()
 }
 
 #[tokio::test]
+async fn a_submission_inside_the_safety_margin_is_not_sent() {
+    let rig = Rig::new().await;
+    triage(&rig.engine(), &green_input()).await;
+    let one = rig.fake.seen()[0].raw_len as f64; // the text estimate, in tokens
+    let price = rig.config().price_usd_per_million_input_tokens / 1e6;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = jev_config(&rig.fake, &dir);
+    // The estimate fits under the limit, but not under limit x (1 - 5%).
+    config.monthly_spend_limit_usd = one * price / 0.97;
+    let engine = engine_with(config);
+    let t = triage(&engine, &green_input()).await;
+
+    assert_eq!(t.engine_id, "heuristic");
+    assert!(has(&t, "jev_fallback_spend_limit"));
+    assert_eq!(
+        rig.fake.seen().len(),
+        1,
+        "only the calibration request was sent"
+    );
+    assert_eq!(engine.spent_this_month_usd(), 0.0);
+}
+
+#[tokio::test]
+async fn a_bill_above_the_estimate_never_pushes_the_month_over_the_limit() {
+    let rig = Rig::new().await;
+    triage(&rig.engine(), &green_input()).await;
+    let one = rig.fake.seen()[0].raw_len as f64;
+    let price = rig.config().price_usd_per_million_input_tokens / 1e6;
+
+    // Every reply bills 4% more than the estimate (an unmeasured image bill).
+    rig.fake.tokens(|len| len as u64 * 104 / 100);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = jev_config(&rig.fake, &dir);
+    // Without a margin a second estimate fits (2.0 <= 2.05) and is billed
+    // 2.08, over the limit.
+    let limit = 2.05 * one * price;
+    config.monthly_spend_limit_usd = limit;
+    let engine = engine_with(config);
+
+    let results = [
+        triage(&engine, &green_input()).await,
+        triage(&engine, &green_input()).await,
+        triage(&engine, &green_input()).await,
+    ];
+    let spent = engine.spent_this_month_usd();
+    assert!(spent <= limit, "spent {spent} must stay <= limit {limit}");
+    assert!(results.iter().any(|t| has(t, "jev_fallback_spend_limit")));
+}
+
+#[tokio::test]
 async fn the_price_per_token_is_config() {
     let rig = Rig::new().await;
     rig.fake.tokens(|_| 1_000_000);

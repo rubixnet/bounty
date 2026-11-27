@@ -83,6 +83,7 @@ private_key_file = "/etc/traction/github-app.pem"
 enabled = false
 api_key_file = "/etc/traction/typesafe-api-key"   # or api_key_env (default TYPESAFE_API_KEY)
 monthly_spend_limit_usd = 40.0
+spend_safety_margin = 0.05   # reservations stop at limit x (1 - margin)
 spend_ledger_file = "/var/lib/traction/jev-spend.json"
 [heuristic]
 [anchor_policy]

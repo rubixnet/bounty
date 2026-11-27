@@ -192,6 +192,7 @@ pub struct Jev {
     pub monthly_spend_limit_usd: f64,
     pub price_usd_per_million_input_tokens: f64,
     pub image_token_ceiling: u64,
+    pub spend_safety_margin: f64,
     pub spend_ledger_file: String,
     pub max_windows: usize,
     pub windows_per_request: usize,
@@ -301,6 +302,9 @@ impl Jev {
         }
         if !(self.monthly_spend_limit_usd >= 0.0 && self.price_usd_per_million_input_tokens > 0.0) {
             return Err("`jev` spend limit and price must be positive".into());
+        }
+        if !(0.0..1.0).contains(&self.spend_safety_margin) {
+            return Err("`jev.spend_safety_margin` must be in 0..1 (a share of the limit)".into());
         }
         if self.windows_per_request == 0 || self.max_windows == 0 {
             return Err("`jev.windows_per_request` and `jev.max_windows` must be positive".into());
@@ -727,6 +731,23 @@ mod tests {
         assert!(!jev.nouls.is_empty() && !jev.choices.is_empty() && !jev.scores.is_empty());
         assert!(!jev.frame_nouls.is_empty());
         jev.validate().expect("the shipped rubric is valid");
+    }
+
+    #[test]
+    fn the_jev_spend_safety_margin_defaults_to_five_percent_and_is_bounded() {
+        let jev = Config::parse("").unwrap().jev;
+        assert_eq!(jev.spend_safety_margin, 0.05, "docs/cost-model.md");
+        let jev = Config::parse("[jev]\nspend_safety_margin = 0.1\n")
+            .unwrap()
+            .jev;
+        assert_eq!(jev.spend_safety_margin, 0.1);
+        jev.validate().expect("0.1 is a valid margin");
+        for bad in ["-0.01", "1.0", "1.5"] {
+            let jev = Config::parse(&format!("[jev]\nspend_safety_margin = {bad}\n"))
+                .unwrap()
+                .jev;
+            assert!(jev.validate().is_err(), "margin {bad} must be refused");
+        }
     }
 
     #[test]

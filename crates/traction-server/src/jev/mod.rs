@@ -125,7 +125,7 @@ impl JevEngine {
         }
         let ledger = SpendLedger::open(
             Path::new(&config.spend_ledger_file),
-            config.monthly_spend_limit_usd,
+            config.monthly_spend_limit_usd * (1.0 - config.spend_safety_margin),
             config.price_usd_per_million_input_tokens,
             clock(),
         )?;

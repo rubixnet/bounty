@@ -66,7 +66,7 @@ The load test proves one AX42 absorbs peak concurrency (10x the ~153-device aver
 
 ## What can move these numbers
 
-- **Jev** is priced at its configured hard limit because the spend limit is the cap the server enforces (falling back to `HeuristicEngine` when reached), not an estimate. The server never crosses it: a submission's upper-bound estimate (one token per UTF-8 byte of text, `image_token_ceiling` per image) is reserved before anything is sent, and the month's spend is persisted in `spend_ledger_file`.
+- **Jev** is priced at its configured hard limit because the spend limit is the cap the server enforces (falling back to `HeuristicEngine` when reached), not an estimate. The server never crosses it: a submission's upper-bound estimate (one token per UTF-8 byte of text, `image_token_ceiling` per image) is reserved before anything is sent, and reservations must fit under the limit less `spend_safety_margin` (default 5%, $2 at $40). TypeSafe publishes no image token count, so a reply can bill above its estimate; the margin absorbs that overrun, and one request is bounded by the 64k-token context (~$0.003). The month's spend is persisted in `spend_ledger_file`.
 - **Domain and exchange rate** change by cents and a few dollars; they do not threaten either ceiling.
 - **Bytes per bucket** from the nightly full-scale run replaces the smoke figure. Even at 3x the measured size (4,350 B), month-12 storage is 343 GB, which still fits the AX42's 512 GB; the cost line stays $0 and the headroom shrinks.
 - **Frames and Redaction (Step 5)** add blob storage that this model does not include; they are out of scope for Step 4.
