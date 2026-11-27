@@ -127,10 +127,38 @@ impl AnchorPolicy {
     }
 }
 
-/// Filled by S3a.
-#[derive(Debug, Clone, Deserialize, Default)]
+/// `HeuristicEngine` thresholds (spec S3a, Q21). Shares are fractions
+/// (`0.10` is 10%). The three the spec left open were set in ticket S3a.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
-pub struct Heuristic {}
+pub struct Heuristic {
+    /// Red: `injected_hid_detected` Human Active Time at or above this share
+    /// of the submitted Human Active Time.
+    pub red_injected_share: f64,
+    /// Red: `late_anchor` windows at or above this share of the submitted
+    /// realtime windows.
+    pub red_late_share: f64,
+    /// Yellow: Project minutes shared with another device at or above this
+    /// share of the Project's active minutes.
+    pub multi_device_overlap_share: f64,
+    /// Yellow: Credited Time at or below this share of Human Active Time.
+    pub yellow_credit_ratio: f64,
+    /// Yellow: this many minutes of consecutive busy 15-minute slots with no
+    /// mutation, commit or turn in the Timeline Marks.
+    pub long_run_minutes: u32,
+}
+
+impl Default for Heuristic {
+    fn default() -> Self {
+        Self {
+            red_injected_share: 0.10,
+            red_late_share: 0.05,
+            multi_device_overlap_share: 0.10,
+            yellow_credit_ratio: 0.15,
+            long_run_minutes: 90,
+        }
+    }
+}
 
 /// Filled by S4.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -202,10 +230,51 @@ pub struct Roles {
     pub admins: Vec<String>,
 }
 
-/// Filled by S3a.
-#[derive(Debug, Clone, Deserialize, Default)]
+/// Where Audit Bundles are stored (spec S3a, Q15). Credentials come only
+/// from environment variables or files.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct Blob {}
+pub struct Blob {
+    /// `local` (the server serves HMAC-signed URLs itself) or `r2`.
+    pub provider: String,
+    /// Largest accepted bundle.
+    pub max_bytes: u64,
+    /// How long a presigned upload URL lives.
+    pub presign_expiry_sec: u64,
+    /// `local`: the directory bundles are written to.
+    pub local_dir: String,
+    /// `local`: environment variable holding the HMAC key. Without one the
+    /// server signs with a random per-process key (URLs die on restart).
+    pub local_hmac_key_env: String,
+    pub local_hmac_key_file: Option<String>,
+    /// `r2`: the S3 endpoint, for example
+    /// `https://<account>.r2.cloudflarestorage.com`.
+    pub r2_endpoint: String,
+    pub r2_bucket: String,
+    pub r2_region: String,
+    pub r2_access_key_id_env: String,
+    pub r2_secret_access_key_env: String,
+    pub r2_secret_access_key_file: Option<String>,
+}
+
+impl Default for Blob {
+    fn default() -> Self {
+        Self {
+            provider: "local".into(),
+            max_bytes: 64 * 1024 * 1024,
+            presign_expiry_sec: 15 * 60,
+            local_dir: "traction-blobs".into(),
+            local_hmac_key_env: "TRACTION_BLOB_HMAC_KEY".into(),
+            local_hmac_key_file: None,
+            r2_endpoint: String::new(),
+            r2_bucket: String::new(),
+            r2_region: "auto".into(),
+            r2_access_key_id_env: "TRACTION_R2_ACCESS_KEY_ID".into(),
+            r2_secret_access_key_env: "TRACTION_R2_SECRET_ACCESS_KEY".into(),
+            r2_secret_access_key_file: None,
+        }
+    }
+}
 
 /// Filled by S3b.
 #[derive(Debug, Clone, Deserialize, Default)]
