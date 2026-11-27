@@ -6,7 +6,7 @@ use super::Backend;
 use super::aggregate::Sample;
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]

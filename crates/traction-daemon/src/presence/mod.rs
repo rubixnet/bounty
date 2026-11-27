@@ -18,7 +18,7 @@
 
 pub mod aggregate;
 pub mod category;
-mod platform;
+pub(crate) mod platform;
 
 use std::io;
 use std::sync::Arc;

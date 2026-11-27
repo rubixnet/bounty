@@ -7,6 +7,7 @@
 mod attribution;
 mod audit;
 mod bus;
+mod capture;
 mod claude_code;
 mod clock;
 mod commits;
