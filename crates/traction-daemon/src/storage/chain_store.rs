@@ -126,6 +126,12 @@ impl Sealer {
                 .filter(|r| r.window_start_ms >= first_open)
                 .cloned()
                 .collect(),
+            marks: batch
+                .marks
+                .iter()
+                .filter(|m| m.minute_start_ms >= first_open)
+                .cloned()
+                .collect(),
             baseline,
         }))
     }

@@ -26,7 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use traction_core::TRACTION_RULES_1;
 use traction_core::sync::{
-    ChainTip, ErrorBody, HeartbeatRequest, HeartbeatResponse, ProjectMeta, SyncMode, codes,
+    ChainTip, ErrorBody, HeartbeatRequest, HeartbeatResponse, ItemKind, ProjectMeta, SyncMode,
+    codes,
 };
 
 use crate::log;
@@ -216,10 +217,16 @@ pub fn build_chunk(
         first_window,
         last_window + TRACTION_RULES_1.activity_rollup_ms,
     )?;
+    let timeline_marks = storage::load_marks(
+        conn,
+        first_window,
+        last_window + TRACTION_RULES_1.activity_rollup_ms,
+    )?;
     let mut project_ids: Vec<&str> = rows
         .work_buckets
         .iter()
         .map(|b| b.project_id.as_str())
+        .chain(timeline_marks.iter().map(|m| m.project_id.as_str()))
         .collect();
     project_ids.sort_unstable();
     project_ids.dedup();
@@ -259,6 +266,7 @@ pub fn build_chunk(
             work_buckets: rows.work_buckets,
             activity_rollups: rows.rollups,
             projects,
+            timeline_marks,
         },
         last_key_id: last.0.clone(),
         last_seq: u64::try_from(last.1).unwrap_or(0),
@@ -416,12 +424,18 @@ impl Client {
                         log::warn("the server's heartbeat answer was not understood");
                         Retry::After(None)
                     })?;
-                let terminal = response
+                // Timeline Marks are unsigned context (`docs/adr/0005`): a
+                // refused mark never holds the cursor back or is retried.
+                let rejected: Vec<_> = response
                     .rejected
+                    .iter()
+                    .filter(|r| r.item.kind != ItemKind::TimelineMark)
+                    .collect();
+                let terminal = rejected
                     .iter()
                     .filter(|r| r.code == codes::WINDOW_TOO_OLD)
                     .count() as u64;
-                if response.rejected.len() as u64 > terminal {
+                if rejected.len() as u64 > terminal {
                     self.rejected_logs += 1;
                     log::warn_counted(
                         "the server rejected synced rows; will retry them",
