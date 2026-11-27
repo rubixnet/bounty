@@ -181,7 +181,7 @@ pub fn parse_rfc3339_ms(text: &str) -> Option<i64> {
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    Some(((days * 86_400 + hour * 3600 + minute * 60 + second - offset_sec) * 1000).max(i64::MIN))
+    Some((days * 86_400 + hour * 3600 + minute * 60 + second - offset_sec) * 1000)
 }
 
 /// Parses one page of the commit list. Entries with an unreadable date are
