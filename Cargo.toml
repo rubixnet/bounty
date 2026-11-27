@@ -54,3 +54,7 @@ toml = { version = "1.2.3", default-features = false, features = ["parse", "serd
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 # Daemon sync client: blocking HTTP(S) on its own thread (rustls, ring provider).
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+# Server (Step 4, S2): Hack Club OIDC. RS256 id-token verification only (the
+# `rsa` crate with PKCS#1 v1.5, no encryption use) and base64url for JWT/PKCE.
+rsa = { version = "0.10.0", default-features = false, features = ["std", "pkcs1v15"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }

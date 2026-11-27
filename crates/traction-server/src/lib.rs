@@ -15,6 +15,7 @@ pub mod error;
 pub mod fanout;
 pub mod live;
 pub mod merge;
+pub mod oidc;
 pub mod pairing;
 pub mod partition;
 pub mod rate_limit;
@@ -33,6 +34,7 @@ use crate::app::{AppState, Clock, system_clock};
 use crate::auth::{AuthProvider, DevAuth};
 use crate::config::Config;
 use crate::fanout::BroadcastFanout;
+use crate::oidc::{OidcProvider, OidcSettings};
 use crate::rate_limit::RateLimiter;
 
 /// Applies the embedded migrations.
@@ -52,7 +54,17 @@ pub async fn ensure_standard_partitions(
 
 /// Builds the shared state. `clock` is microseconds since the Unix epoch.
 pub fn build_state(pool: PgPool, config: Config, clock: Option<Clock>) -> Result<AppState, String> {
+    let clock = clock.unwrap_or_else(system_clock);
     let auth: Box<dyn AuthProvider> = match config.auth.provider.as_str() {
+        "hackclub" => {
+            let secret = config
+                .auth
+                .client_secret(|name| std::env::var(name).ok())
+                .map_err(|e| e.to_string())?;
+            let settings =
+                OidcSettings::from_config(&config.auth, secret, &config.server.public_url)?;
+            Box::new(OidcProvider::new(settings, Arc::clone(&clock)))
+        }
         "dev" => Box::new(DevAuth {
             sub: config.auth.dev_sub.clone(),
             display_name: config.auth.dev_display_name.clone(),
@@ -69,7 +81,7 @@ pub fn build_state(pool: PgPool, config: Config, clock: Option<Clock>) -> Result
         auth,
         fanout: Arc::new(BroadcastFanout::new(64)),
         limiter,
-        clock: clock.unwrap_or_else(system_clock),
+        clock,
         known_months: Mutex::new(HashSet::new()),
     })
 }

@@ -18,7 +18,8 @@ use traction_core::sync::{
 
 use crate::app::{AppState, authenticate};
 use crate::auth::{
-    AuthStep, CSRF_COOKIE, approval_page, cookie_value, csrf_ok, message_page, origin_ok,
+    AuthStep, CSRF_COOKIE, SESSION_COOKIE, approval_page, cookie_value, csrf_ok, message_page,
+    origin_ok,
 };
 use crate::error::ApiError;
 use crate::token::{hash_secret, new_device_token, random_hex, secure_eq};
@@ -176,6 +177,7 @@ fn html(status: StatusCode, body: String) -> Response {
 /// `GET /auth/login?pair=<code>`: shows the approval page. Never approves.
 pub async fn login_page(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, ApiError> {
     let Some(pairing) = open_pairing(&state, &query.pair).await? else {
@@ -184,7 +186,8 @@ pub async fn login_page(
             message_page("This pairing code is unknown, used or expired. Run the login again."),
         ));
     };
-    let identity = match state.auth.begin(&query.pair) {
+    let session = cookie_value(header(&headers, COOKIE), SESSION_COOKIE);
+    let identity = match state.auth.begin(&query.pair, session) {
         AuthStep::Redirect(url) => {
             let mut response = StatusCode::FOUND.into_response();
             if let Ok(value) = HeaderValue::from_str(&url) {
@@ -210,6 +213,59 @@ pub async fn login_page(
         response.headers_mut().insert(SET_COOKIE, value);
     }
     Ok(response)
+}
+
+#[derive(Deserialize)]
+pub struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    /// Sent by an identity provider that refused the login; never echoed.
+    error: Option<String>,
+}
+
+/// `GET /auth/callback?code&state`: where the identity provider sends the
+/// browser back. A finished login sets the session cookie and returns to the
+/// Pairing page; anything else is one value-free refusal.
+pub async fn callback(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
+    let refused = || {
+        html(
+            StatusCode::BAD_REQUEST,
+            message_page("Sign-in failed. Run the login again."),
+        )
+    };
+    let (Some(code), Some(returned_state)) = (query.code.as_deref(), query.state.as_deref()) else {
+        return refused();
+    };
+    if query.error.is_some() {
+        return refused();
+    }
+    let Ok(done) = state.auth.callback(code, returned_state).await else {
+        return refused();
+    };
+    let secure = if state.config.server.public_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    // `Lax`, not `Strict`: this response follows a cross-site redirect from
+    // the identity provider and the next request must carry the cookie. The
+    // Approve POST is still guarded by its own `Strict` CSRF cookie.
+    let cookie = format!(
+        "{SESSION_COOKIE}={}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=1800{secure}",
+        done.session
+    );
+    let mut response = StatusCode::FOUND.into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    let location = format!("/auth/login?pair={}", crate::oidc::url_encode(&done.pair));
+    if let Ok(value) = HeaderValue::from_str(&location) {
+        response.headers_mut().insert(LOCATION, value);
+    }
+    response
 }
 
 #[derive(sqlx::FromRow)]
@@ -245,7 +301,8 @@ pub async fn approve(
     if !csrf_ok(cookie, form.csrf.as_deref()) {
         return forbidden("Request refused.");
     }
-    let identity = match state.auth.begin(&form.pair) {
+    let session = cookie_value(header(&headers, COOKIE), SESSION_COOKIE);
+    let identity = match state.auth.begin(&form.pair, session) {
         AuthStep::Identified(identity) => identity,
         AuthStep::Redirect(_) => return forbidden("Sign in first."),
     };

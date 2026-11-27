@@ -140,11 +140,24 @@ pub struct Jev {}
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
-    /// `dev` is the only provider in S1; S2 adds `hackclub`.
+    /// `dev` (development and tests) or `hackclub` (OIDC).
     pub provider: String,
     /// The stable `sub` the dev provider logs everyone in as.
     pub dev_sub: String,
     pub dev_display_name: String,
+    /// OIDC issuer; the `iss` claim must equal it exactly.
+    pub issuer: String,
+    pub client_id: String,
+    /// Environment variable holding the OIDC client secret (never inline).
+    pub client_secret_env: String,
+    /// Or a file holding it.
+    pub client_secret_file: Option<String>,
+    /// Endpoint overrides; by default `<issuer>/oauth/authorize`,
+    /// `<issuer>/oauth/token` and `<issuer>/oauth/discovery/keys`
+    /// (no discovery request is made).
+    pub authorization_endpoint: Option<String>,
+    pub token_endpoint: Option<String>,
+    pub jwks_uri: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -153,7 +166,31 @@ impl Default for AuthConfig {
             provider: "dev".into(),
             dev_sub: "dev-user".into(),
             dev_display_name: "Dev User".into(),
+            issuer: "https://auth.hackclub.com".into(),
+            client_id: String::new(),
+            client_secret_env: "TRACTION_OIDC_CLIENT_SECRET".into(),
+            client_secret_file: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            jwks_uri: None,
         }
+    }
+}
+
+impl AuthConfig {
+    /// The OIDC client secret from its file or environment variable.
+    pub fn client_secret(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<String, ConfigError> {
+        if let Some(path) = &self.client_secret_file {
+            let text = std::fs::read_to_string(path)
+                .map_err(|_| ConfigError::MissingSecret("client_secret_file".into()))?;
+            return Ok(text.trim().to_owned());
+        }
+        env(&self.client_secret_env)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ConfigError::MissingSecret(self.client_secret_env.clone()))
     }
 }
 

@@ -1,6 +1,9 @@
 //! Accounts: the `AuthProvider` seam, the S1 dev provider, and the pure
 //! pieces of the Pairing approval page (HTML, CSRF).
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::token::secure_eq;
 
 /// Who the provider says the browser user is. Users are keyed by `sub`.
@@ -19,10 +22,41 @@ pub enum AuthStep {
     Redirect(String),
 }
 
+/// A boxed future, so the trait stays object-safe without a macro crate.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A finished redirect login: the opaque session the provider will accept
+/// as the browser's cookie, and the pairing the login was started for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginDone {
+    pub session: String,
+    pub pair: String,
+}
+
+/// A failed login. Value-free on purpose: nothing the identity provider or
+/// the browser sent is echoed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginError;
+
+/// The cookie that carries a provider session (`Path=/auth`).
+pub const SESSION_COOKIE: &str = "traction_session";
+
 pub trait AuthProvider: Send + Sync {
     fn id(&self) -> &'static str;
     /// Begins authentication for a Pairing (`pair` is the pairing code).
-    fn begin(&self, pair: &str) -> AuthStep;
+    /// `session` is the value of the provider's session cookie, if the
+    /// browser sent one.
+    fn begin(&self, pair: &str, session: Option<&str>) -> AuthStep;
+
+    /// Completes a redirect-based login (`GET /auth/callback`). Providers
+    /// that never redirect refuse.
+    fn callback<'a>(
+        &'a self,
+        _code: &'a str,
+        _state: &'a str,
+    ) -> BoxFuture<'a, Result<LoginDone, LoginError>> {
+        Box::pin(async { Err(LoginError) })
+    }
 }
 
 /// Logs everyone in as one configured user. For development and tests only;
@@ -37,7 +71,7 @@ impl AuthProvider for DevAuth {
         "dev"
     }
 
-    fn begin(&self, _pair: &str) -> AuthStep {
+    fn begin(&self, _pair: &str, _session: Option<&str>) -> AuthStep {
         AuthStep::Identified(Identity {
             sub: self.sub.clone(),
             display_name: self.display_name.clone(),
@@ -133,7 +167,7 @@ mod tests {
             display_name: "U".into(),
         };
         assert_eq!(
-            provider.begin("CODE"),
+            provider.begin("CODE", None),
             AuthStep::Identified(Identity {
                 sub: "u1".into(),
                 display_name: "U".into()

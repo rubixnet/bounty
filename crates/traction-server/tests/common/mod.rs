@@ -7,6 +7,8 @@
 //! missing URL into a failure so CI can never skip silently.
 #![allow(dead_code)]
 
+pub mod idp;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -94,6 +96,7 @@ pub struct Reply {
     pub status: u16,
     pub retry_after: Option<String>,
     pub set_cookie: Option<String>,
+    pub location: Option<String>,
     pub body: String,
 }
 
@@ -117,6 +120,7 @@ fn reply(mut response: ureq::http::Response<ureq::Body>) -> Reply {
         status: response.status().as_u16(),
         retry_after: header("retry-after"),
         set_cookie: header("set-cookie"),
+        location: header("location"),
         body: response.body_mut().read_to_string().unwrap_or_default(),
     }
 }

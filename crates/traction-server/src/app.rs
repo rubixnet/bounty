@@ -73,6 +73,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/pairings/poll", post(pairing::poll))
         .route("/auth/login", get(pairing::login_page))
         .route("/auth/approve", post(pairing::approve))
+        .route("/auth/callback", get(pairing::callback))
         .route("/v1/devices/{id}", delete(pairing::revoke_device))
         .route("/v1/anchors", post(anchors::post_anchors))
         .route("/v1/live", get(live::stream))

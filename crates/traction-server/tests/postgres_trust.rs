@@ -460,3 +460,120 @@ async fn a_bad_timeline_mark_is_rejected_by_code_and_never_blocks_the_heartbeat(
     // The buckets were stored regardless.
     assert_eq!(response.accepted.len(), 4);
 }
+
+#[tokio::test]
+async fn pairing_signs_in_through_oidc_before_the_csrf_checked_approval() {
+    let Some(url) = database_url() else { return };
+    let idp = common::idp::start(NOW).await;
+    let secret_dir = tempfile::tempdir().unwrap();
+    let secret_file = secret_dir.path().join("oidc.secret");
+    std::fs::write(&secret_file, format!("{}\n", common::idp::CLIENT_SECRET)).unwrap();
+    let mut config = Config::default();
+    config.auth = common::idp::auth_config(&idp, &secret_file);
+    let server = start(&url, config, Some(clock())).await;
+
+    let key = device_key(28);
+    let started = post_json(
+        format!("{}/v1/pairings", server.base),
+        None,
+        serde_json::json!({
+            "public_key": key.verifying_key().to_hex(),
+            "previous_key_id": null,
+            "device_label": "oidc laptop"
+        })
+        .to_string(),
+    )
+    .await;
+    let started: traction_core::sync::PairingStartResponse =
+        serde_json::from_str(&started.body).unwrap();
+
+    // Opening the login URL without a session sends the browser to the
+    // identity provider (302), which sends it back to the callback.
+    let login = http("GET", started.login_url.clone(), None, vec![], None).await;
+    assert_eq!(login.status, 302);
+    let authorize = login.location.unwrap();
+    assert!(authorize.starts_with(&idp.base), "{authorize}");
+    let back = http("GET", authorize, None, vec![], None).await;
+    assert_eq!(back.status, 302);
+    let callback = http("GET", back.location.unwrap(), None, vec![], None).await;
+    assert_eq!(callback.status, 302, "{}", callback.body);
+    let cookie = callback.set_cookie.unwrap();
+    assert!(
+        cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"),
+        "{cookie}"
+    );
+    let session = cookie.split(';').next().unwrap().to_owned();
+    assert!(session.starts_with("traction_session="));
+    assert_eq!(
+        callback.location.unwrap(),
+        started.login_url.replace(&server.base, "")
+    );
+
+    // With the session the approval page appears, naming the signed-in user.
+    let page = http(
+        "GET",
+        started.login_url.clone(),
+        None,
+        vec![("cookie", session.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("Ada Lovelace") && page.body.contains("Approve device"));
+    let csrf = page
+        .set_cookie
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("traction_csrf=")
+        .unwrap()
+        .to_owned();
+
+    // Approving needs the session as well as the CSRF pair.
+    let form = format!("pair={}&csrf={csrf}", started.pair_code);
+    let approve = |cookies: String| {
+        http(
+            "POST",
+            format!("{}/auth/approve", server.base),
+            None,
+            vec![("cookie", cookies)],
+            Some((form.clone(), "application/x-www-form-urlencoded")),
+        )
+    };
+    assert_eq!(approve(format!("traction_csrf={csrf}")).await.status, 403);
+    assert_eq!(
+        approve(format!("traction_csrf={csrf}; {session}"))
+            .await
+            .status,
+        200
+    );
+    let polled = post_json(
+        format!("{}/v1/pairings/poll", server.base),
+        None,
+        serde_json::json!({"pair_code": started.pair_code, "poll_secret": started.poll_secret})
+            .to_string(),
+    )
+    .await;
+    let polled: traction_core::sync::PairingPollResponse =
+        serde_json::from_str(&polled.body).unwrap();
+    let me = json(&get(&server, "/v1/me", polled.device_token.as_deref()).await);
+    assert_eq!(me["display_name"], "Ada Lovelace");
+    let sub: String = sqlx::query_scalar("SELECT sub FROM users")
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(sub, "hc-user-1");
+
+    // A callback the provider refused is a plain 400 that echoes nothing.
+    let bad = http(
+        "GET",
+        format!("{}/auth/callback?error=access_denied&state=x", server.base),
+        None,
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(bad.status, 400);
+    assert!(!bad.body.contains("access_denied"));
+}
