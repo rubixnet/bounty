@@ -28,6 +28,9 @@ use objc2_screen_capture_kit::{
 
 use super::{Bgra, Focus, GrabError};
 
+/// `SCStreamErrorUserDeclined`.
+const SC_STREAM_ERROR_USER_DECLINED: isize = -3801;
+
 /// How long one ScreenCaptureKit completion handler may take.
 const SCK_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -130,7 +133,7 @@ fn screenshot(
 fn classify(error: *mut NSError) -> GrabError {
     // SAFETY: null or a valid NSError for the duration of the handler.
     match unsafe { error.as_ref() } {
-        Some(error) if error.code() == -3801 => GrabError::PermissionDenied,
+        Some(error) if error.code() == SC_STREAM_ERROR_USER_DECLINED => GrabError::PermissionDenied,
         _ => GrabError::Error,
     }
 }

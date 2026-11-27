@@ -21,11 +21,11 @@ use super::settings::VisualProof;
 use super::{CAPTURE_ACTIVE_WINDOW, CAPTURE_CHILD_TIMEOUT, grab, local_jitter_interval_ms, runner};
 use crate::clock::now_ms;
 use crate::log;
-use crate::storage::{DB_FILE, FrameRow, WriteOp};
+use crate::storage::{DB_FILE, FrameRecordWrite, WriteOp};
 use crate::writer::WriterSender;
 
 /// The window start of the capture child now running, if any.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InFlight(Arc<AtomicU64>);
 
 const NONE_IN_FLIGHT: u64 = u64::MAX;
@@ -49,6 +49,12 @@ impl InFlight {
     /// Whether a batch ending at `through_ms` may be sealed now.
     pub fn allows_sealing_through(&self, through_ms: u64) -> bool {
         self.window().is_none_or(|w| through_ms <= w)
+    }
+}
+
+impl Default for InFlight {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -116,6 +122,15 @@ pub fn spawn(
                     // window boundary after it is turned on again.
                     next_slot = None;
                 }
+                // A slot missed by more than the longest interval (sleep, a
+                // stalled machine) restarts the schedule instead of firing a
+                // burst of stale slots.
+                if next_slot.is_some_and(|slot| {
+                    now.saturating_sub(slot) > super::SCHEDULE_BASE_MS + super::SCHEDULE_JITTER_MS
+                }) && settings.interval_override.is_none()
+                {
+                    next_slot = None;
+                }
                 let slot = *next_slot.get_or_insert_with(|| first_slot(now, &settings));
                 if proof.enabled && now >= slot {
                     next_slot = Some(slot + interval_ms(&settings));
@@ -136,10 +151,14 @@ pub fn spawn(
                             }
                             _ => {}
                         }
-                        if let Some(ChildReport::Written { .. }) = &report
-                            && let Some(op) = frame_op(&data_dir, report.as_ref(), slot)
-                            && writer.send(op).is_err()
-                        {
+                        let sent = match frame_op(&data_dir, report.as_ref(), slot) {
+                            Some(op) => writer.send(op).is_ok(),
+                            None => true,
+                        };
+                        // Only now: the writer queue is FIFO, so the Frame is
+                        // recorded before any batch that seals its window.
+                        in_flight.set(None);
+                        if !sent {
                             return;
                         }
                     }
@@ -210,7 +229,7 @@ fn capture_once(
     prev_dhash: Option<u64>,
     quality: f32,
 ) -> Option<ChildReport> {
-    // No focus, no Frame (fail closed).
+    // No focus, no Frame (fail closed). The caller clears `in_flight`.
     let focus = grab::focus()?;
     let args = ChildArgs {
         data_dir: data_dir.to_path_buf(),
@@ -224,7 +243,6 @@ fn capture_once(
     };
     in_flight.set(Some(window_of(now_ms())));
     let report = runner::run_child(program, &args, settings.child_timeout);
-    in_flight.set(None);
     if report.is_none() {
         log::warn("a capture child was killed or reported nothing; no Frame recorded");
     }
@@ -257,7 +275,7 @@ fn frame_op(data_dir: &Path, report: Option<&ChildReport>, slot: u64) -> Option<
         let _ = std::fs::remove_file(&vault_file);
         return None;
     }
-    Some(WriteOp::Frame(Box::new(FrameRow {
+    Some(WriteOp::Frame(Box::new(FrameRecordWrite {
         record,
         width: *width,
         height: *height,

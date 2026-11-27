@@ -707,12 +707,12 @@ pub enum WriteOp {
     /// Records one Frame the `capture-frame` child wrote. A Frame whose
     /// window was already sealed is discarded: its Vault file is deleted and
     /// no record is written (it is never re-sealed).
-    Frame(Box<FrameRow>),
+    Frame(Box<FrameRecordWrite>),
 }
 
 /// One Frame Record plus its local context (see [`MIGRATION_13`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrameRow {
+pub struct FrameRecordWrite {
     pub record: traction_core::FrameRecord,
     pub width: u32,
     pub height: u32,
@@ -1175,7 +1175,7 @@ pub fn apply_batch_with(
 /// Records one `written` capture report for a stopped daemon, through the
 /// writer's own insert (tests drive the post-grab path with it).
 #[doc(hidden)]
-pub fn record_frame(data_dir: &Path, frame: FrameRow) -> rusqlite::Result<bool> {
+pub fn record_frame(data_dir: &Path, frame: FrameRecordWrite) -> rusqlite::Result<bool> {
     let mut conn = open(data_dir)?;
     let tx = conn.transaction()?;
     let inserted = insert_frame(&tx, &frame)?;
@@ -1195,7 +1195,7 @@ pub fn remove_vault_orphans(conn: &Connection, data_dir: &Path) -> std::io::Resu
 /// Inserts a Frame Record unless its window is already finalized (then the
 /// Frame is discarded and its Vault file deleted). Returns whether it was
 /// recorded.
-fn insert_frame(conn: &Connection, frame: &FrameRow) -> rusqlite::Result<bool> {
+fn insert_frame(conn: &Connection, frame: &FrameRecordWrite) -> rusqlite::Result<bool> {
     let record = &frame.record;
     let width = traction_core::TRACTION_RULES_1.activity_rollup_ms;
     let window = record.captured_at_ms / width * width;
@@ -1205,30 +1205,33 @@ fn insert_frame(conn: &Connection, frame: &FrameRow) -> rusqlite::Result<bool> {
         |row| row.get(0),
     )?;
     let sealed = finalized.is_some_and(|through| to_i64(window) < through);
-    let inserted = !sealed
-        && record.validate().is_ok()
-        && conn
-            .prepare_cached(
-                "INSERT OR IGNORE INTO frame
+    if sealed || record.validate().is_err() {
+        let _ = std::fs::remove_file(&frame.vault_file);
+        crate::log::warn("discarded a Frame that reported after its window was sealed");
+        return Ok(false);
+    }
+    let inserted =
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO frame
                      (frame_id, window_start_ms, captured_at_ms, frame_hash, trigger,
                       scheduled_at_ms, nonce_id, width, height, pixels_state)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'present')",
-            )?
-            .execute(params![
-                record.frame_id,
-                to_i64(window),
-                to_i64(record.captured_at_ms),
-                record.frame_hash,
-                record.trigger.as_str(),
-                record.scheduled_at_ms.map(to_i64),
-                record.nonce_id,
-                frame.width,
-                frame.height,
-            ])?
-            == 1;
+        )?
+        .execute(params![
+            record.frame_id,
+            to_i64(window),
+            to_i64(record.captured_at_ms),
+            record.frame_hash,
+            record.trigger.as_str(),
+            record.scheduled_at_ms.map(to_i64),
+            record.nonce_id,
+            frame.width,
+            frame.height,
+        ])? == 1;
     if !inserted {
-        let _ = std::fs::remove_file(&frame.vault_file);
-        crate::log::warn("discarded a Frame that reported after its window was sealed");
+        // An id that is already recorded: its file belongs to that record,
+        // so it is kept.
+        crate::log::warn("a Frame reused a recorded frame_id; not recorded");
     }
     Ok(inserted)
 }

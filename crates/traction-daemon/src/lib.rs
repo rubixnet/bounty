@@ -97,7 +97,7 @@ pub use secret::DEVICE_SECRET_FILE;
 pub use signing_key::{SIGNING_KEY_FILE, SIGNING_PUB_FILE};
 pub use storage::{DB_FILE, PROJECT_EVENT_VIEW};
 #[doc(hidden)]
-pub use storage::{FrameRow, record_frame};
+pub use storage::{FrameRecordWrite, record_frame};
 #[doc(hidden)]
 pub use storage::{VerifyDatabaseError, verify_database, verify_database_with};
 pub use submit::{run_submit, submit_project};

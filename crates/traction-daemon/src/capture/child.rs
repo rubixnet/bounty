@@ -284,7 +284,7 @@ pub fn store(
     let (width, height) = image::target_size(image.width, image.height);
     ChildReport::Written {
         frame_id: id,
-        frame_hash: traction_core::frame_hash_hex(&webp, &salt),
+        frame_hash: hash.iter().map(|b| format!("{b:02x}")).collect(),
         dhash: dhash_hex(dhash),
         captured_at_ms,
         width,

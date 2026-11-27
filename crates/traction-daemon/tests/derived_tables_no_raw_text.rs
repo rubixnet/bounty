@@ -223,7 +223,7 @@ fn frame_records_and_the_child_line_carry_no_text() {
     else {
         panic!("{line}")
     };
-    let row = traction_daemon::FrameRow {
+    let row = traction_daemon::FrameRecordWrite {
         record: traction_core::FrameRecord {
             frame_id: frame_id.clone(),
             frame_hash,

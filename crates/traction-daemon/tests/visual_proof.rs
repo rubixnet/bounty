@@ -21,7 +21,7 @@ use traction_core::{
     frame_hash_hex,
 };
 use traction_daemon::{
-    Bgra, ChildArgs, ChildReport, DB_FILE, FrameRow, VaultKey, enable_visual_proof,
+    Bgra, ChildArgs, ChildReport, DB_FILE, FrameRecordWrite, VaultKey, enable_visual_proof,
     finalize_settled, frame_path, read_frame, record_frame, run_capture_child, store_frame,
     verify_database,
 };
@@ -161,7 +161,7 @@ fn record(dir: &Path, report: &ChildReport, trigger: FrameTrigger) -> bool {
     };
     record_frame(
         dir,
-        FrameRow {
+        FrameRecordWrite {
             record: FrameRecord {
                 frame_id: frame_id.clone(),
                 frame_hash: frame_hash.clone(),
@@ -191,7 +191,14 @@ fn after_the_grab_fixtures_are_encoded_encrypted_recorded_and_sealed() {
     let mut sizes = Vec::new();
     for (n, fixture) in FIXTURES.iter().enumerate() {
         let image = bgra_from_webp(fixture);
-        let report = store_frame(dir, &key, &image, None, now - 10_000 + n as u64, 60.0);
+        let report = store_frame(
+            dir,
+            &key,
+            &image,
+            None,
+            now - 10_000 + n as u64,
+            traction_daemon::DEFAULT_WEBP_QUALITY,
+        );
         let ChildReport::Written {
             width,
             height,
@@ -206,7 +213,7 @@ fn after_the_grab_fixtures_are_encoded_encrypted_recorded_and_sealed() {
         sizes.push(std::fs::metadata(frame_path(dir, frame_id)).unwrap().len());
         assert!(record(dir, &report, FrameTrigger::ToolFail));
     }
-    eprintln!("fixture Vault file sizes at q60: {sizes:?}");
+    eprintln!("fixture Vault file sizes at the default quality: {sizes:?}");
     // A schema-1 style database with Frames still verifies end to end.
     assert_eq!(seal_and_check(dir).len(), 2);
 }
@@ -217,14 +224,28 @@ fn an_identical_screen_is_a_duplicate_with_no_encode_and_no_file() {
     enable_visual_proof(dir.path()).unwrap();
     let key = VaultKey::load(dir.path()).unwrap().unwrap();
     let image = bgra_from_webp(FIXTURES[1]);
-    let first = store_frame(dir.path(), &key, &image, None, 1_000, 60.0);
+    let first = store_frame(
+        dir.path(),
+        &key,
+        &image,
+        None,
+        1_000,
+        traction_daemon::DEFAULT_WEBP_QUALITY,
+    );
     let ChildReport::Written { dhash, .. } = &first else {
         panic!("{first:?}")
     };
     let prev = u64::from_str_radix(dhash, 16).unwrap();
     let files = || std::fs::read_dir(dir.path().join("vault")).unwrap().count();
     let before = files();
-    let again = store_frame(dir.path(), &key, &image, Some(prev), 2_000, 60.0);
+    let again = store_frame(
+        dir.path(),
+        &key,
+        &image,
+        Some(prev),
+        2_000,
+        traction_daemon::DEFAULT_WEBP_QUALITY,
+    );
     assert_eq!(
         again,
         ChildReport::Duplicate {

@@ -67,3 +67,26 @@ Acceptance:
 - [ ] `GLOSSARY.md`: Frame, Frame Record, Visual Proof Mode, Vault, Capture Nonce, Expired Frame. Extend "Audit Bundle" and "Redaction".
 
 ## Comments
+
+### 2026-11-27: S1 implementation notes (agent)
+
+**WebP quality measurement.** The repo's committed WebPs (`crates/traction-server/tests/data/frames/*.webp`) are synthetic and compress to ~2.5 KB, so they can't calibrate the default. I measured instead on one real, text-dense 1280×720 macOS screen through the real ScreenCaptureKit path (`macos_real_screencapturekit_grab`, run locally; nothing written to disk):
+
+| quality | 5 | 10 | 15 | 20 | 25 | 30 | 40 | 60 | 80 |
+|---|---|---|---|---|---|---|---|---|---|
+| bytes | 22.5 K | 26.4 K | 29.1 K | 31.6 K | 34.2 K | 36.4 K | 41.1 K | 48.4 K | 61.8 K |
+
+Default set to **15** (`DEFAULT_WEBP_QUALITY`, overridable as `webp_quality` in `visual_proof.json`). Lighter screens come in smaller. **Human check:** is text at q15 legible enough for review? If not, raise it and accept ~35–45 KB.
+
+**Build checks (addition 3).** CI run 46018020800 is green on `ubuntu-latest`, `macos-latest` and `windows-latest`. The Windows GDI `BitBlt` test found the known-colour window, so no deviation is needed.
+
+**macOS real grab (deviation 3).** `macos_real_screencapturekit_grab` passed locally on 2026-11-27, macOS 26.5.2 (25F84), with access already granted. It still awaits the human's own run.
+
+**Not done / open:**
+- The wakeup/RSS guard (the daemon process never maps libwebp at idle) is not built.
+- No real-screen WebP fixtures are committed: recording them would commit a real screen. The macOS CI post-grab path uses the synthetic server fixtures. Record sanitized fixtures if wanted.
+- Simplifications in focus and display:
+  - macOS: focus is the frontmost app's pid and the display is the main display.
+  - X11: grabs the default screen's root.
+  - Windows: the foreground window's monitor.
+- The macOS CI `permission_denied` comes from the never-prompting preflight, before any ScreenCaptureKit call (by design, so CI never prompts).
