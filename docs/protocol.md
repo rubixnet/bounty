@@ -330,7 +330,7 @@ Stored buckets and rollups are typed columns that round-trip exactly to `WorkBuc
 
 ## 4. Signed Hash-Chain & Redaction Tombstones
 
-Step 3a (`traction-core::chain`, sealed by the daemon's single writer, verified by the same code in the `verify` command and, from Step 4, the server). Frame hashing and redaction tombstones are Step 3b/3c; their slot in the format is already reserved (see `frame_digest`).
+Step 3a (`traction-core::chain`, sealed by the daemon's single writer, verified by the same code in the `verify` command and, from Step 4, the server). Step 3b (S1) fills `frame_digest` with the window's Frame Records (see **Frames** below); the format is unchanged, so 3a chains and devices with Visual Proof Mode off still verify byte for byte.
 
 **Domain separation.** Every hash and signature input starts with a fixed ASCII tag that ends in `0x00`. No tag is a prefix of another, so no byte string is valid in two domains. All JSON is canonical (sorted keys, no whitespace, no floats), all digests are SHA-256 in lowercase hex, signatures are 64 bytes of lowercase hex.
 
@@ -344,7 +344,8 @@ Step 3a (`traction-core::chain`, sealed by the daemon's single writer, verified 
 | `traction/v1/sig/link\0` | the 32-byte `entry_hash` (what Ed25519 signs) |
 | `traction/v1/manifest\0` | canonical JSON of the bundle manifest body (and of the `chains` array, for `chains_digest`) |
 | `traction/v1/sig/manifest\0` | the 32-byte manifest digest |
-| `traction/v1/frames\0` | reserved for Step 3b (`frame_digest`) |
+| `traction/v1/frame\0` | one Frame's WebP bytes then its 16-byte salt (`frame_hash`, Step 3b) |
+| `traction/v1/frames\0` | canonical JSON of one window's Frame Records, sorted by `frame_id` (`frame_digest`, Step 3b) |
 
 **Chain Link.** One per sealed 120 s Activity Rollup window that holds any row (a window with nothing in it gets no link).
 
@@ -353,7 +354,7 @@ key_id         = "ed25519:" || hex(SHA256("traction/v1/key-id\0" || public_key)[
 rows_digest    = SHA256("traction/v1/rows\0" || canonical_json(ProjectWindowRows))
 payload        = { window_start_ms, ruleset_id, device_rows_digest,
                    projects: [{ project_id, rows_digest }, ...],   # sorted by project_id, unique
-                   frame_digest,                                   # 32 zero bytes until Step 3b
+                   frame_digest,                                   # the window's Frames; 32 zero bytes when none
                    supersedes }                                    # null, or the previous chain's tip (see below)
 header         = { schema_version: 1, seq, prev_hash, payload_digest, key_id, ruleset_id,
                    window_start_ms, sealed_at_ms, clock_regressed }
@@ -365,7 +366,7 @@ signature      = Ed25519.sign("traction/v1/sig/link\0" || entry_hash)
 - `ProjectWindowRows = { project_id, work_buckets (sorted by minute), commit_oids (sorted, de-duplicated, lowercase 40/64 hex) }` for one Project in one window. Commit oids replace the old `git_diff_hash`: a Step 4 reviewer can cross-check them against the Linked Repo, and reading them needs no diff.
 - `device_rows_digest` covers the window's Activity Rollup (counts and ratios only), device-wide.
 - Genesis sentinel: `prev_hash` is 64 `'0'` characters exactly when `seq == 0`, and never otherwise. Later links carry the previous link's `entry_hash`.
-- `frame_digest` replaces the old `frame_hash_n`. It is 32 zero bytes in Step 3a and is already signed into every payload, so Step 3b needs no format change.
+- `frame_digest` replaces the old `frame_hash_n`: the digest of the window's Frame Records (see **Frames**), or 32 zero bytes when the window has none (every 3a link, and every device with Visual Proof Mode off).
 - `sealed_at_ms` is the wall clock at sealing, stored as is. If it is earlier than the previous link's, the link sets `clock_regressed: true`: advisory, signed, counted in the report, never a failure on its own. `window_start_ms` must still strictly increase.
 
 **Verification** (`verify_strict` only: it rejects small-order public keys and non-canonical `S`; a loaded public key must also not be weak). The checks run per link in this order and the first failure in chain order is returned, so the result is deterministic for any tamper. Each error has a stable `code`.
@@ -375,7 +376,7 @@ signature      = Ed25519.sign("traction/v1/sig/link\0" || entry_hash)
 | 1 | `schema_version == 1` | `unsupported_schema` |
 | 2 | position: link 0 is `seq 0` with the genesis sentinel; link `i > 0` has `seq == i` | `truncated_genesis`, `duplicate_seq`, `seq_gap` |
 | 3 | `key_id` is the chain's (and pinned) key | `unknown_key` |
-| 4 | `payload_digest` recomputes; window and ruleset match the header; every digest the held rows cover recomputes (a Project in scope with rows but no entry, or an entry but no rows, also fails) | `payload_hash_mismatch` (`part`: payload, device_rows or the Project) |
+| 4 | `payload_digest` recomputes; window and ruleset match the header; every digest the held rows cover recomputes (a Project in scope with rows but no entry, or an entry but no rows, also fails); when the caller holds Frame Records (`verify --data-dir`), `frame_digest` recomputes from them | `payload_hash_mismatch` (`part`: payload, device_rows, the Project, or frames) |
 | 5 | `entry_hash` recomputes from the header | `entry_hash_mismatch` |
 | 6 | the signature verifies strictly | `invalid_signature` |
 | 7 | `prev_hash` is the previous `entry_hash` | `broken_prev_hash` |
@@ -401,7 +402,24 @@ Exit code **0**: verified, exactly one chain. **2**: verified, but more than one
 - Without `--trusted-key` the chain's own public key is trusted on first use, so a whole chain rebuilt under a fresh key verifies (with a different `key_id` and `pinned=false`). Pin the key from the user's `signing.pub`.
 - `clock_regressed` and `sealed_at_ms` are the device's own clock; they flag, they do not prove.
 
-**User Redaction (Step 3c).** Dropping frame `i` will delete its bytes and salt from the Audit Bundle while retaining `{ "frame_id": "i", "redacted": true, "frame_hash": "<hex>" }`, so `frame_digest` still recomputes. Not implemented in Step 3a.
+**Frames (Step 3b, S1; spec `.scratch/step-3bc/spec.md` Q2, Q7, Q8).** With Visual Proof Mode on (`traction-daemon visual-proof enable`; off by default), the daemon runs a short-lived `traction-daemon capture-frame` child for each scheduled Frame. The child grabs the focused display (ScreenCaptureKit `SCScreenshotManager` on macOS 14+, GDI `BitBlt` on Windows, X11 `GetImage`; Wayland and older macOS report `unsupported`), re-checks focus right after the grab (`focus_changed` discards it), downscales to 720 px high (never up), computes a 64-bit dHash (9×8 grayscale) and stops **before encoding** when it is within `DHASH_SKIP_DISTANCE` (3) bits of the previous Frame's. Otherwise it encodes lossy WebP, draws a 16-byte salt and computes
+
+```text
+frame_hash   = SHA256("traction/v1/frame\0" || webp_bytes || salt)          # deviation 2: domain-tagged
+FrameRecord  = { frame_id, frame_hash, captured_at_ms, trigger, scheduled_at_ms, nonce_id }
+frame_id     = "<captured_at_ms>-<2-digit counter>"                         # [1-9][0-9]*-[0-9]{2} (or 0-NN)
+trigger      = "scheduled" | "turn_start" | "tool_fail" | "focus_shift"
+frame_digest = SHA256("traction/v1/frames\0" || canonical_json([FrameRecord...] sorted by frame_id))
+             = 32 zero bytes when the window has no Frames
+```
+
+for the Frames whose `captured_at_ms` falls in the link's window. Vectors: `crates/traction-core/tests/frame_vectors.rs`. A record holds ids, hashes, times and closed enums only, never a title, path or file name. The child prints exactly one JSON line, `{"status":"written","frame_id","frame_hash","dhash","captured_at_ms","width","height"}` or `{"status":"duplicate","dhash"}` or `{"status":<permission_denied|unsupported|focus_changed|error>}`, and never opens SQLite. The daemon kills it after `CAPTURE_CHILD_TIMEOUT` (10 s), keeps only the last dHash (8 bytes) and never decodes or holds pixels. The single writer stores the record in the append-only `frame` table (plus local `window_start_ms`, `width`, `height` and `pixels_state` ∈ `present|redacted|expired`, which is outside every digest because Redaction and expiry happen after sealing). The finalizer does not seal a window while a capture child for it is running. A Frame reported after its window was sealed is discarded with its Vault file and never re-sealed. At startup, Vault files without a record (a killed child, an uncommitted write) are deleted.
+
+S1 scheduling: while Visual Proof Mode is on and a Project had a Traction Event in the last `CAPTURE_ACTIVE_WINDOW` (5 min), one scheduled Frame per slot, `interval = 60_000 + (u64::from_be_bytes(r[..8]) % 30_000)` ms with `r` from the OS CSPRNG (local jitter, `nonce_id: null`), starting at the first 120 s window boundary after it is turned on. S2 adds the policy (categories, denylist, event triggers, 20 s floor) and the server Capture Nonce. The default WebP quality is 15 (`visual_proof.json` `webp_quality`): measured on a real, text-dense 1280×720 macOS screen, q15 gives ~29 KB, q30 ~36 KB, q60 ~48 KB.
+
+**Vault (Q7).** `<data-dir>/vault/` holds one file per Frame, `<frame_id>.bin = nonce (24 bytes) || XChaCha20-Poly1305(vault.key, salt || webp, aad = frame_id || frame_hash)`, written through a temp file and a rename, plus `vault.key` (32 random bytes, created by `visual-proof enable` with the same owner-only permissions as `signing.key`). The associated data binds each file to its name and record, so a file moved to another Frame or paired with an edited hash does not decrypt. **Honest limit:** the key sits next to the Vault, so encryption guards copied folders and backups, not malware running as the same user (OS keychain storage is out of scope).
+
+**User Redaction (Step 3c).** Dropping a Frame deletes its Vault file (pixels and salt) while its Frame Record stays, so `frame_digest` still recomputes; the archive format and verification codes are S3's (section 5).
 
 ## 5. Audit Bundle and `.traction-bundle` Archive (Step 3a export / Step 3c archive / Step 4)
 

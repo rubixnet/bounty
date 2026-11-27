@@ -142,6 +142,14 @@
 - [ ] Password-manager / `.env` focus test confirms zero frames are captured during sensitive focus.
 - [ ] Frame tampering (swapping, altering or removing a real frame) is caught by the same server verification path Step 4 builds (`verify_bundle` against anchored tips). *(Added by Step 4 deviation 2.)*
 
+> **Scope deviations recorded 2026-11-27 (Step 3b/3c spec, `.scratch/step-3bc/spec.md`):**
+> 2. **Domain-tagged `frame_hash`.** Build item 2's `frame_hash = SHA256(image_bytes || salt)` is `SHA256("traction/v1/frame\0" || webp_bytes || salt)`, so every hash in the format is domain-separated (`docs/protocol.md` section 4; vectors in `crates/traction-core/tests/frame_vectors.rs`).
+> 3. **macOS real-capture proof is local.** GitHub `macos-latest` runners cannot grant Screen Recording. On macOS, CI runs everything after the grab on recorded WebP fixtures (`crates/traction-daemon/tests/visual_proof.rs`) and checks that the real ScreenCaptureKit path returns a clean `permission_denied` (`capture::grab::macos::tests`). The real grab is the `#[ignore]`d `macos_real_screencapturekit_grab`, which the human runs once locally. Linux (Xvfb) and Windows run real capture in CI. *Local run: passed 2026-11-27 on macOS 26.5.2 (25F84) in the S1 agent session; awaiting the human's own run and sign-off.*
+>
+> (Deviation 1, the `tar.zst` archive layout, is recorded by S3.)
+>
+> **Offline item (Build 2, third bullet): met by Step 4 S1.** `offline_buffered` tagging and `network_class` tracking shipped there and are proven by `crates/traction-daemon/tests/sync_client.rs` (`requests_for_an_old_backlog_are_offline_buffered_and_fresh_ones_are_realtime`) and `crates/traction-server/tests/postgres_trust.rs` (`late_and_offline_buffered_windows_are_tagged_and_still_count_as_logged_hours`); Step 3b/3c adds no code for it.
+
 ---
 
 ## Step 4: Centralized Backend, Hash Anchoring & Swappable `DecisionEngine` (Jev)

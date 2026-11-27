@@ -35,8 +35,12 @@ The gates below are excerpts from `docs/steps.md`. A Step is complete only when 
 | Sub-step | Scope |
 |---|---|
 | **3a: Hash-Chain in core** | Signed, domain-separated Chain Links over Work Buckets, Activity Rollups and commit oids (frames reserved as `frame_digest`), the Device Signing Key, sealing in the finalizer, frame-less Audit Bundle export and the offline `verify` command. Gate: tampering, deletion and insertion all fail (`tamper_red_team.rs`). Specced in `.scratch/step-3/`. |
-| **3b: Snapshot Vault** | Opt-in visual proof mode, 720p WebP, dHash dedup, encrypted vault, 45-day retention, denylist (password managers, incognito, `.env`). Gate: zero frames captured while sensitive windows are focused. |
-| **3c: Offline + Review UI + Bundle** | `network_class`, `/submit` filmstrip UI, Redaction, zstd `.traction-bundle` export (wrapping the 3a frame-less bundle). The `offline_buffered` sync mode itself ships in Step 4 S1. Gate: redacting 3 frames still verifies, and frame tampering is caught through the Step 4 server verification path. |
+| **3b/3c S1: Capture tracer** | `traction-daemon capture-frame` child (native grabs, 720p, dHash, lossy WebP, salt, domain-tagged `frame_hash`), the encrypted Vault (`vault.key`), Frame Records through the single writer, `frame_digest` sealed per window, `visual-proof enable/disable/status`, local-jitter schedule. Gate 1 (records): an edited, deleted or inserted Frame Record fails `verify --data-dir`. Ticket `.scratch/step-3bc/issues/01-capture-tracer.md`. |
+| **3b/3c S2: Capture policy** | Screen Recording prompt only in `enable`, the active-Project, category and denylist rules (password managers, private windows, `.env`), event triggers with a 20 s floor, the server Capture Nonce schedule, 45-day retention with pins and a 2 GB cap. Gate 3: zero Frames while a sensitive window has focus. |
+| **3b/3c S3: Bundle and verification** | `tar.zst` `.traction-bundle` with `bundle_schema: 2`, Redaction (Vault file deleted, record kept), core frame verification codes, archive hardening, the server's schedule check and verified frames for `JevEngine`. Gates 1 (vault bytes), 2 and 4. |
+| **3b/3c S4: Review & Redact UI** | `submit --review`, a one-time code and cookie session, the embedded `/submit` filmstrip with live `% redacted`, Export and Submit. Gate 2 again through the UI. |
+
+All four slices are specced in `.scratch/step-3bc/spec.md`. The offline item (Step 3 Build 2, third bullet) is already met by Step 4 S1.
 
 > **Deferral recorded 2026-11-26:** only 3a is built now. Sub-steps 3b and 3c (Step 3 Exit Gate items 2 and 3) follow Step 4, like 1d/1e were deferred past Step 2, and must pass before Step 5. `frame_digest` is already signed into every Chain Link as 32 zero bytes, so they add no chain format change.
 

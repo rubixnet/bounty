@@ -141,9 +141,33 @@ A new chain, under a new Device Signing Key, started after `signing.key` was los
 _Avoid_: Fork, rotated chain, reset
 
 **Audit Bundle**:
-The export of one Project's buckets (and, from Step 3c, user-reviewed, optionally redacted snapshot frames) together with every Chain Link the device holds and a signed manifest, which reviewers verify offline and against Anchors. Frame-less until Step 3c.
+The export of one Project's buckets (and, from Step 3c S3, its Frame Records with the pixels and salts of every Frame that is neither redacted nor expired) together with every Chain Link the device holds and a signed manifest, which reviewers verify offline and against Anchors. Frame-less until S3; user Redactions and Expired Frames are counted separately.
 _Avoid_: Export, archive, proof pack
 
+**Frame**:
+One 720p lossy WebP of the focused display, taken by the short-lived `capture-frame` child while Visual Proof Mode is on and stored encrypted in the Vault. The daemon process never holds its pixels.
+_Avoid_: Screenshot, snapshot, image
+
+**Frame Record**:
+The signed, text-free part of a Frame (`frame_id`, `frame_hash`, `captured_at_ms`, `trigger`, `scheduled_at_ms`, `nonce_id`), kept in the `frame` table forever and sealed into its window's `frame_digest`. Redacting or expiring the pixels never changes it.
+_Avoid_: Frame metadata, frame row
+
+**Visual Proof Mode**:
+Opt-in capture of Frames, off by default (`traction-daemon visual-proof enable`). The only path that ever prompts for macOS Screen Recording.
+_Avoid_: Screenshot mode, screen recording
+
+**Vault**:
+`<data-dir>/vault/`: one XChaCha20-Poly1305 file per Frame plus `vault.key`. It guards copied folders and backups, not same-user malware.
+_Avoid_: Frame store, cache
+
+**Capture Nonce**:
+A per-device server secret delivered in the heartbeat reply, from which the daemon derives its scheduled capture times; the server rechecks those times at submission (Step 3b/3c S2). Until a device has one, it schedules by local jitter (`nonce_id: null`).
+_Avoid_: Seed, jitter key
+
+**Expired Frame**:
+A Frame whose pixels retention deleted after 45 days. Exported like a Redaction but counted apart from user Redactions.
+_Avoid_: Old frame, deleted frame
+
 **Redaction**:
-Removing a snapshot frame's pixels and salt from an Audit Bundle while keeping its hash so the chain still verifies.
+The user permanently deleting a Frame's pixels and salt (its Vault file) while its Frame Record stays, so `frame_digest` still verifies; the exported Audit Bundle marks it `redacted` and counts it in `% redacted`.
 _Avoid_: Deletion, blur
