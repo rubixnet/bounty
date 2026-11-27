@@ -371,6 +371,41 @@ mod tests {
     }
 
     #[test]
+    fn the_s3a_defaults_are_the_documented_policy() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.blob.max_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.blob.presign_expiry_sec, 15 * 60);
+        assert_eq!(config.blob.provider, "local");
+        let h = config.heuristic;
+        assert_eq!(
+            (h.red_injected_share, h.red_late_share),
+            (0.10, 0.05),
+            "spec Q21"
+        );
+        assert_eq!(h.multi_device_overlap_share, 0.10);
+        assert_eq!(h.yellow_credit_ratio, 0.15);
+        assert_eq!(h.long_run_minutes, 90);
+    }
+
+    #[test]
+    fn heuristic_thresholds_are_tunable_and_blob_secrets_are_never_inline() {
+        let tuned =
+            Config::parse("[heuristic]\nred_late_share = 0.02\nlong_run_minutes = 45\n").unwrap();
+        assert_eq!(tuned.heuristic.red_late_share, 0.02);
+        assert_eq!(tuned.heuristic.long_run_minutes, 45);
+        for text in [
+            "[blob]\nr2_secret_access_key = \"x\"\n",
+            "[blob]\nlocal_hmac_key_token = \"x\"\n",
+        ] {
+            assert!(
+                matches!(Config::parse(text), Err(ConfigError::InlineSecret(_))),
+                "{text}"
+            );
+        }
+        assert!(Config::parse("[blob]\nr2_secret_access_key_env = \"X\"\n").is_ok());
+    }
+
+    #[test]
     fn secret_references_and_public_keys_are_fine() {
         let text = "[server]\ndatabase_url_env = \"X\"\ndatabase_url_file = \"/x\"\n";
         assert!(Config::parse(text).is_ok());
