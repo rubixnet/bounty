@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sync::TimelineMark;
+use crate::sync::{SignedBuildStatement, TimelineMark};
 use crate::{ActivityRollup, KeyId, WorkBucket};
 
 /// Whether the request was sent close to the windows' end.
@@ -49,6 +49,11 @@ pub struct HeartbeatRequest {
     /// Unsigned Timeline Marks (`docs/adr/0005`); absent from older daemons.
     #[serde(default)]
     pub timeline_marks: Vec<TimelineMark>,
+    /// The CI-signed build statement, sent on the first heartbeat after the
+    /// daemon starts (so a changed version is always reported). Soft
+    /// provenance: see `sync::provenance`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<SignedBuildStatement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

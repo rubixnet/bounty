@@ -87,6 +87,7 @@ fn heartbeat() -> HeartbeatRequest {
             tool_failures: 0,
             harnesses: vec![HarnessId::ClaudeCode],
         }],
+        build: None,
     }
 }
 
@@ -189,6 +190,7 @@ fn the_pairing_messages_round_trip_and_refuse_unknown_fields() {
         public_key: "d".repeat(64),
         previous_key_id: Some("ed25519:abc".into()),
         device_label: "laptop".into(),
+        build: None,
     };
     round_trips(&start);
     rejects_extra_at(&start, &[&[]]);

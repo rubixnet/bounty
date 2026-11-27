@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sync::SignedBuildStatement;
+
 /// `POST /v1/pairings`: the device announces its Device Signing Key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +15,9 @@ pub struct PairingStartRequest {
     pub previous_key_id: Option<String>,
     /// A label the user will see on the approval page (a host name).
     pub device_label: String,
+    /// The CI-signed build statement compiled into the daemon, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<SignedBuildStatement>,
 }
 
 /// The server's answer: show `pair_code`, open `login_url`, then poll.

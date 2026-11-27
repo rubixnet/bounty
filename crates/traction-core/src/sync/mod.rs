@@ -9,6 +9,7 @@
 mod heartbeat;
 mod overlap;
 mod pairing;
+mod provenance;
 mod submission;
 mod timeline;
 mod validate;
@@ -22,6 +23,7 @@ pub use pairing::{
     PairingPollRequest, PairingPollResponse, PairingStartRequest, PairingStartResponse,
     PairingStatus,
 };
+pub use provenance::{BuildTag, SignedBuildStatement, tag_build};
 pub use submission::{BundleCompleteResponse, BundleStartRequest, BundleStartResponse};
 pub use timeline::{MAX_MARK_COUNT, TimelineMark, timeline_marks, validate_timeline_mark};
 pub use validate::{
