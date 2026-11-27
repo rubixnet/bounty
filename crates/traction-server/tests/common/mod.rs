@@ -203,10 +203,44 @@ pub async fn pair(
     key: &DeviceSigningKey,
     previous_key_id: Option<String>,
 ) -> (String, String) {
+    pair_with_build(server, key, previous_key_id, None).await
+}
+
+/// The CI key the tests configure under `[provenance] ci_public_keys`.
+pub fn ci_key() -> DeviceSigningKey {
+    device_key(0xC1)
+}
+
+/// A build statement signed by `signer`.
+pub fn build_statement(signer: &DeviceSigningKey) -> traction_core::sync::SignedBuildStatement {
+    traction_core::sync::SignedBuildStatement::sign(
+        signer,
+        "0.1.0",
+        &"a".repeat(40),
+        "x86_64-unknown-linux-gnu",
+    )
+    .unwrap()
+}
+
+/// A config that trusts [`ci_key`].
+pub fn config_trusting_ci() -> Config {
+    let mut config = Config::default();
+    config.provenance.ci_public_keys = vec![ci_key().verifying_key().to_hex()];
+    config
+}
+
+/// [`pair`] presenting `build` when it starts the Pairing.
+pub async fn pair_with_build(
+    server: &TestServer,
+    key: &DeviceSigningKey,
+    previous_key_id: Option<String>,
+    build: Option<traction_core::sync::SignedBuildStatement>,
+) -> (String, String) {
     let request = PairingStartRequest {
         public_key: key.verifying_key().to_hex(),
         previous_key_id,
         device_label: "test laptop".into(),
+        build,
     };
     let reply = post_json(
         format!("{}/v1/pairings", server.base),
@@ -325,6 +359,7 @@ pub fn heartbeat(
             os_username: "u".into(),
         }],
         timeline_marks: vec![],
+        build: None,
     }
 }
 

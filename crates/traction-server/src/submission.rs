@@ -392,6 +392,8 @@ pub async fn evaluate(
         .fetch_one(&state.pool)
         .await?;
 
+    flags.self_built = crate::provenance::is_self_built(&state.pool, &device.id).await?;
+
     // 5. Other devices of the user in the Project's active minutes, merged
     //    under the 60-second cap.
     let shares: Vec<ShareRow> = sqlx::query_as(

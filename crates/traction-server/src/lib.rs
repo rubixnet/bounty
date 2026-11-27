@@ -25,6 +25,7 @@ pub mod merge;
 pub mod oidc;
 pub mod pairing;
 pub mod partition;
+pub mod provenance;
 pub mod rate_limit;
 pub mod store;
 pub mod submission;

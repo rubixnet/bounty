@@ -42,7 +42,7 @@ struct Rig {
 async fn rig_with(url: &str, engine: Option<Arc<dyn DecisionEngine>>) -> Rig {
     let now = Arc::new(AtomicU64::new(T0));
     let blobs = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
+    let mut config = config_trusting_ci();
     config.blob.local_dir = blobs.path().to_string_lossy().into_owned();
     let server = start_with_engine(url, config, Some(user_clock(Arc::clone(&now))), engine).await;
     Rig {
@@ -130,6 +130,7 @@ fn heartbeat_for(
             os_username: "u".into(),
         }],
         timeline_marks: vec![],
+        build: None,
     }
 }
 
@@ -161,7 +162,8 @@ impl Rig {
 
     async fn paired(&self, seed: u8) -> (DeviceSigningKey, String, String) {
         let key = device_key(seed);
-        let (token, device_id) = pair(&self.server, &key, None).await;
+        let (token, device_id) =
+            pair_with_build(&self.server, &key, None, Some(build_statement(&ci_key()))).await;
         (key, token, device_id)
     }
 }
@@ -700,4 +702,26 @@ async fn the_r2_store_round_trips_a_bundle_through_minio_and_delete_me_removes_i
     let key = format!("bundles/{}.json", started.bundle_id);
     let stored = rig.server.state.blobs.get(&key).await.unwrap();
     assert_eq!(stored, None, "the object is gone from MinIO");
+}
+
+#[tokio::test]
+async fn a_self_built_device_is_yellow_never_red_and_a_ci_signed_one_is_green() {
+    let Some(url) = database_url() else { return };
+    let rig = rig(&url).await;
+    // `paired` presents a CI-signed statement; a plain `pair` does not.
+    let (key_ci, token_ci, _) = rig.paired(1).await;
+    let key_dev = device_key(2);
+    let (token_dev, _) = pair(&rig.server, &key_dev, None).await;
+    let chain_ci = seal_chain(key_ci, 4, honest_buckets);
+    let chain_dev = seal_chain(key_dev, 4, honest_buckets);
+    rig.anchor(&token_ci, &chain_ci, 0..4, 30_000, 0).await;
+    rig.anchor(&token_dev, &chain_dev, 0..4, 30_000, 0).await;
+
+    let ci = submit(&rig, &token_ci, &bundle_bytes(&chain_ci, 4, None)).await;
+    let dev = submit(&rig, &token_dev, &bundle_bytes(&chain_dev, 4, None)).await;
+    let ci = decision(&rig, &ci).await;
+    let dev = decision(&rig, &dev).await;
+    assert_eq!((ci.verdict.as_str(), ci.reasons.len()), ("green", 0));
+    assert_eq!(dev.verdict, "yellow", "{:?} {:?}", dev.reasons, dev.failure);
+    assert!(dev.reasons.contains(&"self_built".to_owned()));
 }

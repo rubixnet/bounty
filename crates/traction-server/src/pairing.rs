@@ -52,13 +52,20 @@ pub async fn start(
     if request.device_label.len() > 200 {
         return Err(ApiError::bad_request("label_too_long"));
     }
+    let keys = state
+        .config
+        .provenance
+        .keys()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_misconfigured"))?;
+    let build = crate::provenance::classify(request.build.as_ref(), &keys);
     let now = state.now_ms();
     let poll_secret = random_hex(32);
     let pair_code = new_pair_code();
     sqlx::query(
         "INSERT INTO pairings (pair_code, poll_secret_hash, public_key, previous_key_id,
-                               device_label, created_at_ms, expires_at_ms)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                               device_label, created_at_ms, expires_at_ms,
+                               build_tag, build_version, build_git_commit, build_target)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(&pair_code)
     .bind(hash_secret(&poll_secret).to_vec())
@@ -67,6 +74,10 @@ pub async fn start(
     .bind(&request.device_label)
     .bind(i64::try_from(now).unwrap_or(i64::MAX))
     .bind(i64::try_from(now + PAIRING_TTL_MS).unwrap_or(i64::MAX))
+    .bind(build.tag.as_str())
+    .bind(&build.version)
+    .bind(&build.git_commit)
+    .bind(&build.target)
     .execute(&state.pool)
     .await?;
     let base = state.config.server.public_url.trim_end_matches('/');
@@ -408,6 +419,17 @@ pub async fn approve(
     .bind(&device_id)
     .bind(&key_id)
     .bind(&public_key)
+    .execute(&mut *tx)
+    .await?;
+    // Soft provenance: the tag the pairing carried (checked when it started)
+    // becomes the device's, also when this re-pairs an existing device.
+    sqlx::query(
+        "UPDATE devices d SET build_tag = p.build_tag, build_version = p.build_version,
+                build_git_commit = p.build_git_commit, build_target = p.build_target
+         FROM pairings p WHERE p.pair_code = $1 AND d.id = $2",
+    )
+    .bind(&form.pair)
+    .bind(&device_id)
     .execute(&mut *tx)
     .await?;
     sqlx::query(

@@ -80,6 +80,7 @@ pub fn login(
             public_key: key.verifying_key().to_hex(),
             previous_key_id,
             device_label: label,
+            build: crate::provenance::compiled(),
         },
     )?;
     let _ = writeln!(out, "Pairing code: {}", started.pair_code);

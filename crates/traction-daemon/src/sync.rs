@@ -74,6 +74,9 @@ pub struct SyncSettings {
     pub backoff_base: Duration,
     pub backoff_max: Duration,
     pub request_timeout: Duration,
+    /// The CI-signed build statement sent on the first heartbeat after the
+    /// daemon starts. Defaults to the one compiled into this binary.
+    pub build: Option<traction_core::sync::SignedBuildStatement>,
 }
 
 impl Default for SyncSettings {
@@ -88,6 +91,7 @@ impl Default for SyncSettings {
             backoff_base: BACKOFF_BASE,
             backoff_max: BACKOFF_MAX,
             request_timeout: REQUEST_TIMEOUT,
+            build: crate::provenance::compiled(),
         }
     }
 }
@@ -267,6 +271,7 @@ pub fn build_chunk(
             activity_rollups: rows.rollups,
             projects,
             timeline_marks,
+            build: None,
         },
         last_key_id: last.0.clone(),
         last_seq: u64::try_from(last.1).unwrap_or(0),
@@ -351,6 +356,8 @@ struct Client {
     cursor: Option<Cursor>,
     os_username: String,
     rejected_logs: u64,
+    /// Whether the server acknowledged the build statement this run.
+    build_sent: bool,
 }
 
 impl Client {
@@ -403,9 +410,13 @@ impl Client {
                 Retry::After(None)
             },
         )?;
-        let Some(chunk) = chunk else {
+        let Some(mut chunk) = chunk else {
             return Ok(Pass::Idle);
         };
+        let sending_build = !self.build_sent && self.settings.build.is_some();
+        if sending_build {
+            chunk.request.build = self.settings.build.clone();
+        }
         let body = serde_json::to_vec(&chunk.request).map_err(|_| Retry::After(None))?;
         let reply = post_json(
             &format!("{url}/v1/anchors"),
@@ -419,6 +430,7 @@ impl Client {
         })?;
         match reply.status {
             200 => {
+                self.build_sent |= sending_build;
                 let response: HeartbeatResponse =
                     serde_json::from_slice(&reply.body).map_err(|_| {
                         log::warn("the server's heartbeat answer was not understood");
@@ -519,6 +531,7 @@ pub fn spawn(
         cursor: None,
         os_username: os_username(),
         rejected_logs: 0,
+        build_sent: false,
     };
     let handle = thread::Builder::new()
         .name("traction-sync".to_owned())

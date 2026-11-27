@@ -29,6 +29,7 @@ mod owner_only;
 mod paths;
 mod pause;
 mod presence;
+mod provenance;
 mod router;
 mod secret;
 mod signing_key;

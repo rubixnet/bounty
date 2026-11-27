@@ -60,6 +60,7 @@ pub struct Config {
     pub roles: Roles,
     pub blob: Blob,
     pub github: Github,
+    pub provenance: Provenance,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,10 +277,73 @@ impl Default for Blob {
     }
 }
 
-/// Filled by S3b.
+/// GitHub App linking (spec S3b, Q16). The App has read-only `metadata` and
+/// `contents` permissions. Its private key comes only from an environment
+/// variable or a file, and the API base URL can be injected for tests.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Github {
+    pub api_base_url: String,
+    /// The GitHub App's numeric ID (the JWT `iss`). Empty turns linking off.
+    pub app_id: String,
+    pub private_key_env: String,
+    pub private_key_file: Option<String>,
+    /// Commits fetched per page (GitHub allows 100).
+    pub per_page: u32,
+    /// Most pages one fetch follows; bounds a huge repo's first fetch.
+    pub max_pages: u32,
+}
+
+impl Default for Github {
+    fn default() -> Self {
+        Self {
+            api_base_url: "https://api.github.com".into(),
+            app_id: String::new(),
+            private_key_env: "TRACTION_GITHUB_APP_PRIVATE_KEY".into(),
+            private_key_file: None,
+            per_page: 100,
+            max_pages: 30,
+        }
+    }
+}
+
+impl Github {
+    /// The App private key (PEM) from its file or environment variable.
+    pub fn private_key(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<String, ConfigError> {
+        if let Some(path) = &self.private_key_file {
+            return std::fs::read_to_string(path)
+                .map_err(|_| ConfigError::MissingSecret("private_key_file".into()));
+        }
+        env(&self.private_key_env)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ConfigError::MissingSecret(self.private_key_env.clone()))
+    }
+}
+
+/// Soft build provenance (spec S3b, Q18): the CI public keys a build
+/// statement may be signed with. Public keys may be written inline.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
-pub struct Github {}
+pub struct Provenance {
+    /// Ed25519 public keys, 64 lowercase hex digits each.
+    pub ci_public_keys: Vec<String>,
+}
+
+impl Provenance {
+    /// The parsed keys; a malformed entry is a config error.
+    pub fn keys(&self) -> Result<Vec<traction_core::VerifyingKeyHex>, ConfigError> {
+        self.ci_public_keys
+            .iter()
+            .map(|text| {
+                traction_core::VerifyingKeyHex::parse(text)
+                    .map_err(|_| ConfigError::Parse("`provenance.ci_public_keys` has a malformed key".into()))
+            })
+            .collect()
+    }
+}
 
 impl Config {
     /// Parses config text, refusing an inline secret.
