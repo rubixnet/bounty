@@ -15,10 +15,16 @@
 //! - `export-bundle --project <project_id> --out <file> [--data-dir <path>]`
 //!   writes that Project's frame-less Audit Bundle (read-only; safe while the
 //!   daemon runs).
+//! - `submit --project <project_id> [--data-dir <path>]` exports that Project's
+//!   bundle and sends it to the paired server (presigned upload, then
+//!   `complete`); the server verifies and triages it.
 //! - `verify <bundle> [--trusted-key <hex>]... [--expect-tip <key_id>:<seq>:<hash>]`
 //!   or `verify --data-dir <path> ...` checks a bundle or the local database
 //!   offline. Exit 0 = verified (one chain), 2 = verified with more than one
 //!   chain (key discontinuity), 1 = failed or unreadable.
+//! - `login --server <url> [--data-dir <path>] [--no-browser]` pairs this
+//!   device with the server (opens the approval page, then stores the device
+//!   token in `<data dir>/server.token`, owner-only).
 //! - `install claude-code [--settings <path>] [--claude-program <path>]
 //!   [--port <n>] [--profile <path>]...` merges Traction's hooks into Claude
 //!   Code's `settings.json` (default `$CLAUDE_CONFIG_DIR/settings.json`, else
@@ -59,9 +65,17 @@ fn run() -> Result<(), String> {
             args.next();
             return install(args);
         }
+        Some("login") => {
+            args.next();
+            return traction_daemon::run_login(args);
+        }
         Some("export-bundle") => {
             args.next();
             return finish(traction_daemon::run_export(args)?);
+        }
+        Some("submit") => {
+            args.next();
+            return finish(traction_daemon::run_submit(args)?);
         }
         Some("verify") => {
             args.next();

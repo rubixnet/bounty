@@ -89,6 +89,9 @@ pub struct DaemonConfig {
     pub commits: crate::commits::CommitSettings,
     /// Finalizer tuning.
     pub finalizer: crate::finalizer::FinalizerSettings,
+    /// Server sync client tuning. It does nothing until `traction login`
+    /// has written `server.url` and `server.token` (or both are injected).
+    pub sync: crate::sync::SyncSettings,
     /// Claude Code's config folder, whose `projects/` the transcript tailer
     /// watches. Default: [`crate::claude_code::config_dir::claude_config_dir`]
     /// (the installer's rule). `None` turns the tailer off. Tests point it at a
@@ -120,6 +123,7 @@ impl DaemonConfig {
             presence: crate::presence::PresenceSettings::default(),
             commits: crate::commits::CommitSettings::default(),
             finalizer: crate::finalizer::FinalizerSettings::default(),
+            sync: crate::sync::SyncSettings::default(),
         }
     }
 

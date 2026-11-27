@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/traction-core", "crates/traction-daemon"]
+members = ["crates/traction-core", "crates/traction-daemon", "crates/traction-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -47,3 +47,19 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 # Linux-only: X11 presence backend (pure-Rust protocol, no libX11).
 x11rb = { version = "0.14.0", default-features = false, features = ["xinput", "screensaver"] }
 tempfile = { version = "3.27.0", default-features = false }
+# Server (Step 4): Axum, runtime-checked SQLx (never the query! macros), TOML config.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "form", "tokio"] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros"] }
+toml = { version = "1.2.3", default-features = false, features = ["parse", "serde"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+# Daemon sync client: blocking HTTP(S) on its own thread (rustls, ring provider).
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+# Server (Step 4, S2): Hack Club OIDC. RS256 id-token verification only (the
+# `rsa` crate with PKCS#1 v1.5, no encryption use) and base64url for JWT/PKCE.
+rsa = { version = "0.10.0", default-features = false, features = ["std", "pkcs1v15", "encoding"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+# Server (Step 4, S4): Jev frames are transcoded in memory, pure Rust on all
+# 3 OSes: WebP decoding (`image-webp`) and baseline (SOF0) JPEG encoding
+# (`jpeg-encoder`; progressive stays off).
+image-webp = { version = "0.2.4", default-features = false }
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"] }

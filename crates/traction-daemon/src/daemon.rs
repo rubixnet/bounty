@@ -40,6 +40,7 @@ use crate::signing_key;
 use crate::socket::{self, SocketError, SocketFile};
 use crate::storage::Sealer;
 use crate::symbol_index::SymbolIndexes;
+use crate::sync::{self, SyncThread};
 use crate::token::BusToken;
 use crate::watcher::{self, WatcherThread, Watches};
 use crate::writer::{self, WriterThread};
@@ -59,6 +60,7 @@ pub struct DaemonHandle {
     commits: Option<CommitObserver>,
     /// The Work Bucket finalizer.
     finalizer: Option<FinalizerThread>,
+    sync: Option<SyncThread>,
     router: Option<RouterThread>,
     writer: Option<WriterThread>,
     #[cfg(unix)]
@@ -134,6 +136,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
     let presence_writer = writer_sender.clone();
     let commits_writer = writer_sender.clone();
     let finalizer_writer = writer_sender.clone();
+    let sync_writer = writer_sender.clone();
     let mut router = Router::new(git, exclusions, device_secret, writer_sender, registry);
     router.set_attribution_timing(&config.watcher);
     // Re-attach every stored (non-merged) Project before anything can edit
@@ -289,6 +292,18 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         None
     };
 
+    let sync_thread = if config.sync.enabled {
+        match sync::spawn(&config.data_dir, sync_writer, config.sync.clone()) {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                log::error("failed to start the sync client", &error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(DaemonHandle {
         local_addr,
         shutdown: Some(shutdown_tx),
@@ -298,6 +313,7 @@ pub fn start(config: DaemonConfig) -> Result<DaemonHandle, StartError> {
         presence,
         commits: commit_observer,
         finalizer,
+        sync: sync_thread,
         router: Some(router_thread),
         writer: Some(writer_thread),
         #[cfg(unix)]
@@ -377,6 +393,9 @@ impl DaemonHandle {
         // Drops the sensor's writer sender before the writer drains.
         if let Some(Err(_)) = self.presence.take().map(PresenceSensor::stop) {
             log::warn("the presence sensor thread panicked");
+        }
+        if let Some(Err(_)) = self.sync.take().map(SyncThread::stop) {
+            log::warn("the sync client thread panicked");
         }
         if let Some(Err(_)) = self.finalizer.take().map(FinalizerThread::stop) {
             log::warn("the finalizer thread panicked");

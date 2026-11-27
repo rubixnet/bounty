@@ -140,6 +140,7 @@
 - [ ] Tampering with, deleting, or inserting any past bucket in local SQLite fails `traction-core` hash-chain verification immediately (frames: deferred to 3b). *(Proven for 3a by `tamper_red_team.rs`; ticked at human sign-off of 3a.)*
 - [ ] Redacting 3 frames removes 100% of their pixel bytes and salts from the exported bundle while passing chain verification and accurately reporting `% redacted`.
 - [ ] Password-manager / `.env` focus test confirms zero frames are captured during sensitive focus.
+- [ ] Frame tampering (swapping, altering or removing a real frame) is caught by the same server verification path Step 4 builds (`verify_bundle` against anchored tips). *(Added by Step 4 deviation 2.)*
 
 ---
 
@@ -162,15 +163,20 @@
      - Endpoint: `POST https://api.typesafe.ai/v1/systemone` with `Authorization: Bearer <TYPESAFE_API_KEY>`, pinned to `jev-1.14.0` (never an unpinned alias).
      - Enforce a hard monthly Jev spend limit from server config; when reached, triage falls back to `HeuristicEngine` (never overspend).
      - Centralize all question definitions, criteria, and confidence routing thresholds in a **single server config file** (outside source logic so Fraud Squad can tune rubrics without code changes).
-     - Run batched atomic questions (`noul` with starting `0.7`/`0.3` thresholds, `choice` **always** including an `"other"` option, and `score` inspecting the **full level probability distribution** rather than raw averages) on anonymized 15-minute telemetry JSON first.
+     - Run batched atomic questions (`noul` with starting `0.7`/`0.3` thresholds, `choice` **always** including an `"other"` option (superseded by a companion "does any option fit?" `noul`, see Exit Gate deviation 3), and `score` inspecting the **full level probability distribution** rather than raw averages) on anonymized 15-minute telemetry JSON first.
      - For submitted Audit Bundles / flagged anomalies only: transcode sampled WebP frames **in memory on the server** to 8-bit baseline JPEG (longest side ≤1568px), attach in the top-level `assets` map with UUID placeholders, and send with header `TypeSafe-Danger-Zone-Images: true` strictly as a secondary reviewer hint.
      - Route via 3-way confidence router (Green fast-track / Yellow fail-closed human review / Red anomaly pin)—**never auto-ban**.
 
 ### Exit Gate (Must Pass Before Step 5)
+> **Scope deviations recorded 2026-11-26 (Step 4 spec, `.scratch/step-4/spec.md`; ADR `docs/adr/0006-linux-only-db-ci.md`):**
+> 1. **Postgres and MinIO tests run on Linux only.** `traction-server` deploys only on Linux, and installing Postgres on Windows and macOS runners is slow and flaky. These still run on all 3 OSes: `cargo fmt`, `cargo clippy --workspace --all-targets`, every `traction-core` test, every `traction-daemon` test (including the sync client against a local test HTTP server) and every `traction-server` test that needs no database. The Postgres 17 and MinIO service-container tests run on `ubuntu-latest`. "Passes in CI" for this Step means this split.
+> 2. **Real frame tampering moves to the 3b/3c gate.** Frames do not exist until 3b. Step 4 proves `frame_digest` integrity (changing a link's `frame_digest` fails verification) through `verify_bundle`; 3b/3c gain a gate item that runs real frame tampering through the same server path.
+> 3. **No catch-all `"other"` choice option (recorded 2026-11-27).** Build item 2 and Gate item 4 ask for every `choice` to include an `"other"` option. TypeSafe's live `v1/systemone` guidance (the installed `typesafe@typesafe-ai` 0.6.2 skill) says a catch-all option competes with the real options for probability and distorts the distribution. Instead each `choice` is paired with a companion `noul` asking "does any of these options fit?", and "nothing fits" routes to Yellow (fail-closed human review). Gate item 4's `"other"` fallback is proven by that companion `noul` handling (`crates/traction-server/tests/jev.rs`: `no_choice_has_a_catch_all_other_and_each_has_a_companion_fits_noul`, `nothing_fits_routes_to_yellow_and_a_fitting_option_uses_its_colour`).
+
 - [ ] Benchmark/load test simulates 15,488 MAU (110k hrs/mo peak burst) against Postgres + Axum with <50ms p95 ingest latency and low memory footprint (<512 MB server RAM).
 - [ ] Itemized all-in monthly cost model (server, Postgres storage growth, R2, Jev at its spend limit, bandwidth, backups, domain/email) totals ≤$300 at 15,488 MAU and stays ≤$500 under the load test's peak burst.
-- [ ] Recomputing a submitted Audit Bundle against anchored `server_received_at` tips catches backdating, frame tampering, and clock-skew overlap attacks.
-- [ ] `HeuristicEngine` passes full test suite with zero network calls; `JevEngine` passes contract tests verifying `v1/systemone` payload shape, WebP→baseline JPEG transcoding, `"other"` fallback, and score-distribution handling.
+- [ ] Recomputing a submitted Audit Bundle against anchored `server_received_at` tips catches backdating, `frame_digest` tampering (real frame tampering: see deviation 2), and clock-skew overlap attacks.
+- [ ] `HeuristicEngine` passes full test suite with zero network calls; `JevEngine` passes contract tests verifying `v1/systemone` payload shape, WebP→baseline JPEG transcoding, `"other"` fallback (the companion `noul` "nothing fits" → Yellow, see deviation 3), and score-distribution handling.
 
 ---
 

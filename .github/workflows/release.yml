@@ -1,0 +1,58 @@
+name: Release
+
+# Builds the daemon and server for Linux and signs a build statement
+# ({version, git_commit, target_triple}) with the CI Ed25519 key, so the
+# daemon sends it at pairing and the server tags the device `ci_signed`
+# (spec S3b, Q18). The tag is soft: a statement can be copied into a fork.
+# The seed is the repository secret TRACTION_CI_SIGNING_SEED (64 hex digits);
+# its public key goes into `[provenance] ci_public_keys` (docs/deploy.md).
+# Provisioning that secret is a human step.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Sign the build statement
+        shell: bash
+        env:
+          TRACTION_CI_SIGNING_SEED: ${{ secrets.TRACTION_CI_SIGNING_SEED }}
+        run: |
+          cargo build --release -p traction-core --bin traction-sign-build
+          VERSION=$(cargo pkgid -p traction-daemon | sed 's/.*[#@]//')
+          STATEMENT=$(target/release/traction-sign-build "$VERSION" "$GITHUB_SHA" "${{ matrix.target }}")
+          echo "TRACTION_BUILD_STATEMENT=$STATEMENT" >> "$GITHUB_ENV"
+      - name: Build the daemon and server
+        shell: bash
+        run: cargo build --release -p traction-daemon -p traction-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: traction-${{ matrix.target }}
+          path: |
+            target/release/traction-daemon*
+            target/release/traction-server*
+            !target/release/*.d
+            !target/release/*.pdb

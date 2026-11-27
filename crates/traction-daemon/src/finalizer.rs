@@ -20,6 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, params};
+use traction_core::sync::timeline_marks;
 use traction_core::{
     CommitObservation, MINUTE_MS, PresenceMinute, RollupInput, Ruleset, TRACTION_RULES_1,
     TractionEvent, fold_baseline, rollup,
@@ -249,6 +250,9 @@ pub fn finalize_range(
         .into_iter()
         .filter(|r| inside(r.window_start_ms))
         .collect();
+    // Unsigned Timeline Marks come from the same stored events: counts and
+    // harness IDs only, outside the chain (`docs/adr/0005`).
+    let marks = timeline_marks(&events, from, to);
     // The batch's present minutes join the baseline after it was scored
     // against the history that came before.
     fold_baseline(rules, &mut baseline, &buckets);
@@ -259,6 +263,7 @@ pub fn finalize_range(
         through_ms: to,
         buckets,
         rollups,
+        marks,
         baseline,
     }))
 }
@@ -519,6 +524,145 @@ mod tests {
             })
             .unwrap();
         assert_eq!(id, "traction-rules/1");
+    }
+
+    /// An event with its own harness (`None`: a manual file mutation) and
+    /// canary values in every field that must never reach a mark.
+    fn marked_event(n: u32, ts: u64, kind: &str, harness: Option<&str>, project: &str) -> WriteOp {
+        let source = if harness.is_some() {
+            "harness_hook"
+        } else {
+            "file_watcher"
+        };
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "event_id": format!("019a7c2e-8b4d-7000-8000-{n:012x}"),
+            "timestamp_ms": ts,
+            "harness_id": harness,
+            "session_id": harness.map(|_| "CANARY-SESSION-7f3a"),
+            "parent_orchestrator_id": null,
+            "event_type": kind,
+            "end_reason": null,
+            "cwd": "/home/CANARY-CWD-91cd/project",
+            "project_id": project,
+            "model_id": "CANARY-MODEL-55e1",
+            "network_class": "cloud_api",
+            "attribution_source": source,
+            "metrics_only": {"tool_name": "CANARY-TOOL-02b8"}
+        });
+        let event: TractionEvent = serde_json::from_value(value).expect("event");
+        WriteOp::Event(Box::new(EventRow::try_from(event).expect("row")))
+    }
+
+    fn marks_in(conn: &Connection) -> Vec<traction_core::sync::TimelineMark> {
+        storage::load_marks(conn, 0, u64::MAX / 2).unwrap()
+    }
+
+    #[test]
+    fn the_finalizer_writes_timeline_marks_from_stored_events_beside_the_buckets() {
+        let (_dir, mut conn) = open();
+        let project = "p";
+        let mut ops = vec![
+            marked_event(1, T0 + 1_000, "PROMPT_SUBMIT", Some("claude-code"), project),
+            marked_event(2, T0 + 2_000, "FILE_MUTATION", Some("claude-code"), project),
+            marked_event(3, T0 + 3_000, "FILE_MUTATION", None, project),
+            marked_event(4, T0 + 4_000, "FILE_MUTATION", None, project),
+            marked_event(5, T0 + 5_000, "TOOL_FAIL", Some("codex-cli"), project),
+            marked_event(
+                6,
+                T0 + MIN + 1_000,
+                "PROMPT_SUBMIT",
+                Some("opencode"),
+                project,
+            ),
+            marked_event(7, T0 + 2 * MIN, "TURN_END", Some("opencode"), project),
+        ];
+        ops.extend((0..10).map(|i| idle_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+
+        let through = finalize(&mut conn, None, T0 + 10 * MIN).unwrap();
+        let marks = marks_in(&conn);
+        assert_eq!(marks.len(), 3, "{marks:?}");
+        assert_eq!(
+            (
+                marks[0].minute_start_ms,
+                marks[0].mutations_manual,
+                marks[0].mutations_harness,
+                marks[0].turns_started,
+                marks[0].tool_failures
+            ),
+            (T0, 2, 1, 1, 1)
+        );
+        assert_eq!(
+            marks[0].harnesses,
+            [
+                traction_core::HarnessId::ClaudeCode,
+                traction_core::HarnessId::CodexCli
+            ]
+        );
+        assert_eq!(marks[1].turns_started, 1);
+        assert_eq!(marks[1].harnesses, [traction_core::HarnessId::OpenCode]);
+
+        // A minute is marked once: a late event never rewrites it.
+        apply_batch(
+            &mut conn,
+            &[marked_event(8, T0 + 6_000, "TOOL_FAIL", None, project)],
+        )
+        .unwrap();
+        assert_eq!(finalize(&mut conn, Some(through), T0 + 10 * MIN), None);
+        assert_eq!(marks_in(&conn), marks);
+    }
+
+    #[test]
+    fn no_raw_text_cwd_model_or_session_reaches_the_marks_table_or_the_heartbeat() {
+        use crate::sync::{Cursor, SyncSettings, build_chunk};
+        let (_dir, mut conn) = open();
+        let mut ops = vec![
+            marked_event(1, T0 + 1_000, "PROMPT_SUBMIT", Some("claude-code"), "p"),
+            marked_event(2, T0 + 2_000, "TOOL_FAIL", Some("claude-code"), "p"),
+            marked_event(3, T0 + 3_000, "FILE_MUTATION", None, "p"),
+        ];
+        ops.extend((0..10).map(|i| idle_minute(T0 + i * MIN)));
+        apply_batch(&mut conn, &ops).unwrap();
+        finalize(&mut conn, None, T0 + 10 * MIN).unwrap();
+        assert!(!marks_in(&conn).is_empty());
+
+        let table_text: String = conn
+            .prepare(
+                "SELECT project_id || '|' || minute_start_ms || '|' || mutations_manual || '|' ||
+                        mutations_harness || '|' || turns_started || '|' || tool_failures || '|' ||
+                        harnesses FROM timeline_mark",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunk = build_chunk(
+            &conn,
+            Cursor::default(),
+            T0 + 3_600_000,
+            &SyncSettings::default(),
+            "tester",
+        )
+        .unwrap();
+        // The chunk is only built once the chain has links; the finalizer
+        // sealed them, so the heartbeat carries the marks.
+        let chunk = chunk.expect("a heartbeat");
+        assert!(!chunk.request.timeline_marks.is_empty());
+        let heartbeat_marks = serde_json::to_string(&chunk.request.timeline_marks).unwrap();
+        for canary in [
+            "CANARY-SESSION",
+            "CANARY-CWD",
+            "CANARY-MODEL",
+            "CANARY-TOOL",
+            "/home/",
+        ] {
+            assert!(!table_text.contains(canary), "{canary} in the marks table");
+            assert!(!heartbeat_marks.contains(canary), "{canary} in the marks");
+        }
+        assert!(table_text.contains("claude-code"));
     }
 
     #[test]
@@ -1303,6 +1447,7 @@ mod tests {
             through_ms: T0 - 8 * MIN,
             buckets: Vec::new(),
             rollups: vec![late],
+            marks: Vec::new(),
             baseline: Vec::new(),
         };
         apply_batch(&mut conn, &[WriteOp::Rollup(Box::new(stale))]).unwrap();

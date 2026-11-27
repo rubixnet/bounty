@@ -1,0 +1,70 @@
+name: Load (Gate 1, full scale)
+
+# Step 4 Gate 1 (docs/cost-model.md, .scratch/step-4/spec.md): the full-scale
+# run of the `load` binary against the real `traction-server` and Postgres 17:
+# 15,488 enrolled devices, a month of data (~6.6M Work Buckets), peak
+# concurrency at 10x the ~153-device average. It fails when ingest p95 is not
+# below 50 ms or server RSS is not below 512 MB, and publishes the JSON report
+# as the `gate1-load-report` artifact (Gate 1 is ticked against that report).
+# Every PR runs the reduced-scale smoke version in ci.yml instead.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  load-full-scale:
+    name: Gate 1 load (ubuntu-latest, full scale)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Build release binaries
+        run: cargo build --release -p traction-server --bins
+      - name: Disk before the run
+        run: df -h /
+      - name: Run the full-scale load test
+        run: |
+          mkdir -p report
+          target/release/load \
+            --database-url postgres://postgres:postgres@localhost:5432/postgres \
+            --devices 15488 --seed-buckets 6600000 \
+            --max-p95-ms 50 --max-rss-mb 512 \
+            --report report/gate1-load-report.json
+      - name: Summarize
+        if: always()
+        run: |
+          if [ -f report/gate1-load-report.json ]; then
+            echo '### Gate 1 load report' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat report/gate1-load-report.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Publish the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate1-load-report
+          path: report/gate1-load-report.json
+          if-no-files-found: warn

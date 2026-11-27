@@ -1,0 +1,42 @@
+[package]
+name = "traction-server"
+description = "Traction server: Axum API, Postgres (runtime SQLx), Anchors, Pairing and live totals."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "traction_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "traction-server"
+path = "src/main.rs"
+
+[dependencies]
+traction-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
+axum.workspace = true
+sqlx.workspace = true
+toml.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+subtle.workspace = true
+ureq.workspace = true
+rsa.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+image-webp.workspace = true
+jpeg-encoder.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rsa = { workspace = true, features = ["encoding"] }
+tempfile.workspace = true
+rusqlite.workspace = true
+traction-daemon = { path = "../traction-daemon" }

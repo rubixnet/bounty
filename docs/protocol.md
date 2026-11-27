@@ -263,16 +263,70 @@ Scored per Work Bucket by `traction-core` (pure, integer-only, no I/O). Every co
 
 **`repo_symbol_hits`.** The daemon keeps, per watched Project, an in-memory set of 64-bit hashes of lower-cased file names, file stems and folder names (never contents): a bounded breadth-first names-only walk when the Project is attached (honoring the watcher's exclusions, `.gitignore` and `.tractionignore`), then every mutation the watcher reports. Common words (`main`, `index`, `test`, ...) and stems under 4 characters never match alone. A Claude Code prompt (hook or transcript) is reduced in memory to at most `index_max_prompt_candidates` hashed words, counted against the index of the Project holding its `cwd`, and dropped with the text; the count is stored. `null` means no index covers the `cwd` (for example the Project's first prompt, which can arrive before registration), not zero.
 
-## 3. Server Sync Heartbeat (Every 2 Minutes — No PII)
+## 3. Server Sync: the Per-Device Heartbeat (Every 2 Minutes, No PII)
 
-Sent to `POST /v1/anchors` per `project_id`, containing aggregated 60-second `WorkBucket` records plus the rolling chain tip:
+The daemon's sync client (one task) sends **one heartbeat per device**, not per Project, to `POST /v1/anchors`. The wire types live in `traction-core::sync` (`deny_unknown_fields`, no floats) and are shared by the daemon, the server and the cross-platform test servers. The server never runs chain verification on a heartbeat (verify at submission, `docs/adr/0004`).
 
-- `human_active_sec`, `agent_compute_sec`, `idle_autonomous_sec` (the Work Bucket, Activity Rollup, Ruleset and their tables are defined in section 2c)
-- `injected_hid_detected`, `window_category_counts`, `struggle_axes` (`steering`, `specificity`, `friction`, `comfort_delta`)
-- `sync_mode`: `"realtime" | "offline_buffered"`
-- `chain_tip_hex`: 32-byte SHA-256 hex digest, the `entry_hash` of the tip Chain Link (section 4)
+### Pairing (`traction login`)
 
-Server assigns authoritative monotonic `server_received_at`.
+1. `POST /v1/pairings` `{public_key, previous_key_id, device_label}` -> `{pair_code, poll_secret, login_url, expires_in_sec}`. The public key is the Device Signing Key's; `previous_key_id` names the key being replaced when a Successor Chain re-pairs.
+2. The CLI opens `login_url` (`<server>/auth/login?pair=<code>`). The server authenticates the user through the `AuthProvider` (users are keyed by the provider's stable `sub`) and shows one plain HTML page with the pairing code and an **Approve device** button. A `GET` never approves; `POST /auth/approve` needs a double-submit CSRF token (`SameSite=Strict` cookie plus form field) and refuses a foreign `Origin`.
+3. `POST /v1/pairings/poll` `{pair_code, poll_secret}` -> `{status: pending|approved|expired, device_token, device_id}`. The token (32 random bytes, 64 hex) is delivered exactly once; the server keeps only its SHA-256. On approval the server pins the public key in `device_keys`; a successor key is added to the same device and **every historical `key_id` stays trusted**.
+4. The device stores the token at `<data-dir>/server.token` (`0600`, an owner-only DACL on Windows), the server URL at `server.url`.
+
+`DELETE /v1/devices/{id}` revokes a device's token and stops its keys being accepted for new Anchors; the keys stay trusted for history. Every authenticated call is rate limited per device (token bucket); a refusal is `429` with `Retry-After`.
+
+### The heartbeat request
+
+```json
+{
+  "tip": {"key_id": "ed25519:...", "seq": 41, "entry_hash": "<64 hex>", "window_start_ms": 1800000000000},
+  "sync_mode": "realtime",
+  "sent_at_ms": 1800000900000,
+  "work_buckets": [ ...WorkBucket... ],
+  "activity_rollups": [ ...ActivityRollup... ],
+  "projects": [ {"project_id": "...", "project_name": "...", "project_root_path": "...",
+                 "project_home_relative_path": "...", "os_username": "..."} ],
+  "timeline_marks": [ ...TimelineMark... ]
+}
+```
+
+- `tip` is the Chain Tip of this request (the newest Chain Link it carries) and its window. One request carries one key: a backlog never mixes two chains.
+- `sync_mode` is `realtime` or `offline_buffered`. The daemon marks a request `offline_buffered` once its oldest window ended more than **20 minutes** ago (`OFFLINE_BUFFERED_AFTER`, the server's default `MAX_ANCHOR_LAG`).
+- The rows are the Work Buckets and Activity Rollups (section 2c, unchanged) sealed since the last acknowledged window, in ordered chunks of at most **30 Chain Links** (`MAX_LINKS_PER_REQUEST`); `projects` is the metadata (section 2a) of the Projects those buckets and marks name. `linked_repo` is set from the website, never sent by the daemon. `timeline_marks` are the unsigned Timeline Marks of the same minutes (below); the field may be absent (older daemons).
+- The server body cap is 2 MiB (`[anchor_policy] max_body_bytes`).
+
+### The server's checks and answers
+
+The server assigns a monotonic per-device `server_received_at` and stores the Anchor `(device, key_id, seq, entry_hash, window_start_ms, sync_mode, sent_at_ms, server_received_at)`.
+
+- `(device, key_id, seq)` is **idempotent** when `entry_hash` matches (`anchor: "duplicate"`), and **`409 anchor_conflict`** when it differs. A stored Anchor never changes.
+- The tip's key must be pinned for the calling device (`403 key_not_pinned`); a revoked device or bad token is `401`.
+- `422 future_window`: the tip window starts after `server_received_at + MAX_FUTURE_SKEW` (2 min). `422 window_too_old`: it is older than `MAX_BACKLOG_AGE` (45 days). Both are policy constants in `[anchor_policy]`, not part of the Ruleset.
+- Each row is validated by pure `traction-core::sync` functions and answered `accepted` or `rejected` with a value-free reason code: `unknown_ruleset` (only `traction-rules/1`), `human_active_over_minute` (`human_active_sec` > 60), `credit_over_human_active`, `idle_over_agent_compute`, `agent_compute_over_minute`, `misaligned_minute`, `misaligned_window`, `window_after_tip` (a window after the tip's), `invalid_project_id`, `window_too_old` (an item beyond `MAX_BACKLOG_AGE`) and `value_out_of_range`.
+- The daemon moves its `sync_cursor` past **terminal** rejections (`window_too_old`, per item or as a whole-request `422`), keeping a local count, and retries everything else with jittered backoff, honouring `Retry-After`.
+
+### Timeline Mark (unsigned, outside the chain; `docs/adr/0005`)
+
+```json
+{"project_id": "dir:<64 hex>", "minute_start_ms": 1800000000000,
+ "mutations_manual": 2, "mutations_harness": 1, "turns_started": 1, "tool_failures": 0,
+ "harnesses": ["claude-code", "codex-cli"]}
+```
+
+- **Counts per Project and UTC minute**, computed by the daemon finalizer from stored events (the same events the bucket batch reads) and written once with that batch into the daemon's `timeline_mark` table, through the single writer. `mutations_manual` is `FILE_MUTATION` with no `harness_id`, `mutations_harness` is `FILE_MUTATION` attributed to a Harness, `turns_started` is `PROMPT_SUBMIT`, `tool_failures` is `TOOL_FAIL`. `harnesses` is the sorted set of `harness_id`s that produced any event in the minute. A minute with no event has no mark.
+- **Content-free.** The type is `deny_unknown_fields` and holds counts and `harness_id`s only: never `cwd`, `model_id`, a session ID, a path or any text.
+- **Unsigned.** A mark is not in a Chain Link and is never proof. The server stores it in a `timeline_marks` table partitioned on `minute_start_ms` (same partition policy as the other tables), and every API response labels marks `"integrity": "unsigned"`. Signing them could be a later `bundle_schema` bump.
+- **Validation.** The server checks `project_id` (`invalid_project_id`), minute alignment (`misaligned_minute`), the tip window (`window_after_tip`), age (`window_too_old`) and the bounds (`invalid_timeline_mark`: a count above 100,000 or a repeated `harness_id`). A refused mark is answered like any rejected item (`item.kind: "timeline_mark"`), and the daemon never holds its cursor back or retries because of one.
+
+### Timing flags, overlap merge and read APIs (server, S2)
+
+- **`late_anchor`:** a `realtime` bucket first anchored more than `MAX_ANCHOR_LAG` (20 min) after its minute ended. **`offline_buffered`:** buckets of a request sent in `offline_buffered` mode are tagged and count as Logged Hours only, never as proof of timing. The tags are set when a row is first anchored and never change.
+- **`clock_skew`:** the server stores `skew = server_received_at - sent_at_ms` on every Anchor and flags the device (`GET /v1/me`) while `|skew| > MAX_CLOCK_SKEW` (2 min) for its newest heartbeat.
+- **Multi-device overlap merge (read time only):** one user's Human Active Time is capped at 60 s per UTC minute across devices and Projects. Every bucket in an over-cap minute shrinks by the same proportion (`60 / total`) with integer math and the largest-remainder rule, ties broken by `(device_id, project_id)`; `struggle_credit_sec` scales by the same proportion (floored, never above the merged human time); the minute is flagged `multi_device_overlap`. Agent Compute Time is never capped and stored rows are never changed. Live totals (`GET /v1/live`), the Project list and the timeline all report the merged figures.
+- **Visibility:** `GET /v1/users/{user_id}/projects` returns `project_name` and totals to anyone; the owner, reviewers and admins (`[roles]` lists of provider `sub`s) also get `project_id`, `project_root_path`, `project_home_relative_path`, `os_username` and `linked_repo`. `GET /v1/users/{user_id}/projects/{project_id}/timeline?from_ms&to_ms` (at most 7 days) lines up Work Buckets, Activity Rollups, commit oids and Timeline Marks per minute for the owner, reviewers and admins. `DELETE /v1/me` hard-deletes every row the user owns.
+
+Stored buckets and rollups are typed columns that round-trip exactly to `WorkBucket` and `ActivityRollup` (no JSONB), so the later submission cross-check is struct equality. Live Logged Hours totals (`GET /v1/live`, Server-Sent Events, event `totals`; `resync` after a missed update) are sums of these synced, unverified buckets and are never proof.
 
 ## 4. Signed Hash-Chain & Redaction Tombstones
 

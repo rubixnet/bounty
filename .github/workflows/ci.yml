@@ -46,3 +46,108 @@ jobs:
         run: |
           cargo test -p traction-daemon --test presence -- --nocapture macos_injection | tee presence-skip.log
           grep 'SKIPPED (macOS injection)' presence-skip.log | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Step 4 deviation 1 (docs/adr/0006): the Postgres-backed `traction-server`
+  # tests run on Linux only, against a real Postgres 17 service container.
+  # TRACTION_REQUIRE_DB=1 turns a missing database into a failure, so these
+  # tests can never be skipped silently here. Every other job and test stays
+  # on the 3-OS matrix above.
+  postgres:
+    name: Postgres 17 (ubuntu-latest)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TRACTION_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      TRACTION_REQUIRE_DB: "1"
+      # S3a: the R2BlobStore round trip runs against a real S3-compatible
+      # store, started below. TRACTION_REQUIRE_MINIO=1 forbids a silent skip.
+      # (The MINIO names predate the switch to versitygw and are kept so the
+      # tests need no change.)
+      TRACTION_REQUIRE_MINIO: "1"
+      TRACTION_TEST_MINIO_ENDPOINT: http://127.0.0.1:9000
+      TRACTION_TEST_MINIO_BUCKET: traction-test
+      TRACTION_TEST_MINIO_ACCESS_KEY: traction-ci
+      TRACTION_TEST_MINIO_SECRET_KEY: traction-ci-secret-123
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      # A service container cannot take a command, so the S3 store is started
+      # in a step. MinIO no longer publishes images (minio/minio is gone from
+      # Docker Hub and quay.io answers 401), so this is versitygw with its
+      # POSIX backend: every directory under the root is a bucket. Pinned by
+      # tag and digest; verified locally against both minio_blob tests.
+      - name: Start S3 store (versitygw)
+        run: |
+          mkdir -p "$RUNNER_TEMP/s3/traction-test"
+          docker run -d --name s3 -p 9000:9000 \
+            -e ROOT_ACCESS_KEY="$TRACTION_TEST_MINIO_ACCESS_KEY" \
+            -e ROOT_SECRET_KEY="$TRACTION_TEST_MINIO_SECRET_KEY" \
+            -e VGW_HEALTH=/health \
+            -v "$RUNNER_TEMP/s3:/data" \
+            ghcr.io/versity/versitygw:v1.11.0@sha256:8319a530d08d537426e2f855bae5280709795dc73a3f0c347973ef915d6343c5 \
+            --port :9000 posix /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/health > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9000/health > /dev/null || { docker logs s3; exit 1; }
+          # The bucket exists and the test credentials can write and delete in it.
+          sig=(--aws-sigv4 "aws:amz:us-east-1:s3" --user "$TRACTION_TEST_MINIO_ACCESS_KEY:$TRACTION_TEST_MINIO_SECRET_KEY")
+          probe="$TRACTION_TEST_MINIO_ENDPOINT/$TRACTION_TEST_MINIO_BUCKET/ci-probe"
+          curl -sf "${sig[@]}" -X PUT --data-binary probe "$probe" \
+            && curl -sf "${sig[@]}" -X DELETE "$probe" \
+            || { docker logs s3; exit 1; }
+      - name: Test traction-server (Postgres + S3)
+        run: cargo test -p traction-server -- --nocapture
+
+  # Step 4 Gate 1, reduced scale: the same `load` binary against the real
+  # server and Postgres 17, at 1/15 of the enrolled devices and ~1/33 of the
+  # seeded month. The full-scale run is the nightly/workflow_dispatch job in
+  # load.yml, which publishes the report Gate 1 is ticked against.
+  load-smoke:
+    name: Load smoke (ubuntu-latest)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Build release binaries
+        run: cargo build --release -p traction-server --bins
+      - name: Run the smoke load test
+        run: |
+          mkdir -p report
+          target/release/load \
+            --database-url postgres://postgres:postgres@localhost:5432/postgres \
+            --devices 1000 --seed-buckets 200000 --peak-devices 150 \
+            --max-p95-ms 50 --max-rss-mb 512 \
+            --report report/smoke-load-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-load-report
+          path: report/smoke-load-report.json
+          if-no-files-found: warn

@@ -16,6 +16,7 @@
 
 pub mod chain;
 pub mod fixtures;
+pub mod http_server;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -78,6 +79,18 @@ impl TestDaemon {
         self.addr = handle.local_addr();
         self.handle = Some(handle);
         self
+    }
+
+    /// [`Self::restart_with`] on a daemon that is borrowed, not consumed.
+    pub fn restart_in_place(&mut self, adjust: impl FnOnce(&mut DaemonConfig)) {
+        self.shutdown();
+        let mut config = test_config(self.data_dir.path());
+        config.home_dir = Some(self.home());
+        config.claude_config_dir = Some(self.home().join(".claude"));
+        adjust(&mut config);
+        let handle = start_after_shutdown(config);
+        self.addr = handle.local_addr();
+        self.handle = Some(handle);
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -754,4 +767,4 @@ pub fn assert_no_file_contains(data_dir: &Path, needle: &str) -> Vec<String> {
 /// The daemon's current SQLite `user_version` (the number of migrations in
 /// `storage::MIGRATIONS`). Bump it here, once, when a migration is appended.
 #[allow(dead_code)]
-pub const LATEST_SCHEMA_VERSION: i64 = 10;
+pub const LATEST_SCHEMA_VERSION: i64 = 12;

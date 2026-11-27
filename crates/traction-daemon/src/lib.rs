@@ -23,18 +23,22 @@ mod http;
 mod install;
 mod lock;
 mod log;
+mod login;
 #[cfg(windows)]
 mod owner_only;
 mod paths;
 mod pause;
 mod presence;
+mod provenance;
 mod router;
 mod secret;
 mod signing_key;
 #[cfg(unix)]
 mod socket;
 mod storage;
+mod submit;
 mod symbol_index;
+mod sync;
 mod token;
 mod watcher;
 mod writer;
@@ -62,6 +66,8 @@ pub use finalizer::finalize_settled;
 pub use install::claude_code::{ClaudeCodeInstall, InstallError, InstallReport};
 pub use install::{BACKUP_SUFFIX, MIN_ON_FAILURE_VERSION, VERSION_TIMEOUT, Version};
 pub use lock::LOCK_FILE;
+#[doc(hidden)]
+pub use login::{LoginOptions, login, run_login};
 pub use presence::{DEFAULT_SUBSLOT, PresenceSettings};
 pub use router::RESOLUTION_TTL;
 pub use secret::DEVICE_SECRET_FILE;
@@ -69,4 +75,10 @@ pub use signing_key::{SIGNING_KEY_FILE, SIGNING_PUB_FILE};
 pub use storage::{DB_FILE, PROJECT_EVENT_VIEW};
 #[doc(hidden)]
 pub use storage::{VerifyDatabaseError, verify_database, verify_database_with};
+pub use submit::{run_submit, submit_project};
+pub use sync::{
+    BACKOFF_BASE, BACKOFF_MAX, MAX_LINKS_PER_REQUEST, MAX_RETRY_AFTER, OFFLINE_BUFFERED_AFTER,
+    REQUEST_TIMEOUT, SERVER_KEY_ID_FILE, SERVER_TOKEN_FILE, SERVER_URL_FILE, SYNC_INTERVAL,
+    SyncSettings, backoff_delay, sync_mode_for, wait_after_failure,
+};
 pub use token::TOKEN_FILE;

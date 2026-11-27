@@ -19,6 +19,7 @@ pub use chain_store::{
 };
 
 use rusqlite::{Connection, params};
+use traction_core::sync::TimelineMark;
 use traction_core::{
     ActivityRollup, BaselineDay, CommitObservation, EndReason, HarnessId, MutationKind,
     PresenceMinute, TractionEvent, WorkBucket,
@@ -58,6 +59,8 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_8,
     MIGRATION_9,
     MIGRATION_10,
+    MIGRATION_11,
+    MIGRATION_12,
 ];
 
 /// Step 1b: schema room on `schema_version: 1`, the Project registry and
@@ -426,6 +429,39 @@ const MIGRATION_10: &str = "
     BEGIN SELECT RAISE(ABORT, 'chain_link is append-only'); END;
 ";
 
+/// Step 4 (S1): the server sync cursor. One row (`id = 1`): the newest
+/// Chain Link window the server acknowledged (or that a terminal rejection
+/// moved the cursor past), and a running count of terminal rejections. The
+/// only mutable sync state; written through the single writer.
+const MIGRATION_11: &str = "
+    CREATE TABLE sync_cursor (
+        id                  INTEGER PRIMARY KEY CHECK (id = 1),
+        window_start_ms     INTEGER NOT NULL,
+        key_id              TEXT NOT NULL,
+        seq                 INTEGER NOT NULL,
+        terminal_rejections INTEGER NOT NULL,
+        updated_at_ms       INTEGER NOT NULL
+    ) STRICT;
+";
+
+/// Step 4 (S2): Timeline Marks (`docs/adr/0005`). Per Project and minute,
+/// counts and the `harness_id` set only (a JSON array of wire names), computed
+/// by the finalizer from stored events. It sits beside `work_bucket` but
+/// outside the hash chain: unsigned context, never proof. A minute is written
+/// once (`INSERT OR IGNORE`), through the single writer.
+const MIGRATION_12: &str = "
+    CREATE TABLE timeline_mark (
+        project_id        TEXT NOT NULL,
+        minute_start_ms   INTEGER NOT NULL,
+        mutations_manual  INTEGER NOT NULL,
+        mutations_harness INTEGER NOT NULL,
+        turns_started     INTEGER NOT NULL,
+        tool_failures     INTEGER NOT NULL,
+        harnesses         TEXT NOT NULL,
+        PRIMARY KEY (project_id, minute_start_ms)
+    ) STRICT, WITHOUT ROWID;
+";
+
 /// The alias-aware events view (see [`MIGRATION_3`]).
 pub const PROJECT_EVENT_VIEW: &str = "project_event";
 
@@ -630,6 +666,18 @@ pub enum WriteOp {
     /// Appends one finalized range of Work Buckets and Activity Rollups and
     /// advances the finalizer's cursor, in one transaction.
     Rollup(Box<RollupBatch>),
+    /// Moves the server sync cursor (`sync_cursor`).
+    SyncCursor(SyncCursorRow),
+}
+
+/// The `sync_cursor` row. `terminal_rejections` is the running total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncCursorRow {
+    pub window_start_ms: u64,
+    pub key_id: String,
+    pub seq: u64,
+    pub terminal_rejections: u64,
+    pub updated_at_ms: u64,
 }
 
 /// See [`WriteOp::Rollup`].
@@ -645,6 +693,8 @@ pub struct RollupBatch {
     pub through_ms: u64,
     pub buckets: Vec<WorkBucket>,
     pub rollups: Vec<ActivityRollup>,
+    /// Unsigned Timeline Marks of the batch's minutes (outside the chain).
+    pub marks: Vec<TimelineMark>,
     /// The comfort baseline after this batch: stored as is (days not listed
     /// here are pruned).
     pub baseline: Vec<BaselineDay>,
@@ -667,7 +717,8 @@ impl WriteOp {
             | Self::HookRun(_)
             | Self::Presence(_)
             | Self::Commit(_)
-            | Self::Rollup(_) => 0,
+            | Self::Rollup(_)
+            | Self::SyncCursor(_) => 0,
         }
     }
 }
@@ -1025,6 +1076,24 @@ pub fn apply_batch_with(
             WriteOp::Presence(minute) => insert_presence(&tx, minute)?,
             WriteOp::Commit(commit) => insert_commit(&tx, commit)?,
             WriteOp::Rollup(batch) => insert_rollup(&tx, batch, sealer)?,
+            WriteOp::SyncCursor(cursor) => {
+                tx.prepare_cached(
+                    "INSERT INTO sync_cursor
+                         (id, window_start_ms, key_id, seq, terminal_rejections, updated_at_ms)
+                     VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (id) DO UPDATE SET
+                         window_start_ms = excluded.window_start_ms, key_id = excluded.key_id,
+                         seq = excluded.seq, terminal_rejections = excluded.terminal_rejections,
+                         updated_at_ms = excluded.updated_at_ms",
+                )?
+                .execute(params![
+                    to_i64(cursor.window_start_ms),
+                    cursor.key_id,
+                    to_i64(cursor.seq),
+                    to_i64(cursor.terminal_rejections),
+                    to_i64(cursor.updated_at_ms),
+                ])?;
+            }
             WriteOp::HookRun(hook) => {
                 tx.prepare_cached(
                     "INSERT OR IGNORE INTO session_hook_run
@@ -1166,6 +1235,23 @@ fn insert_rollup_rows(conn: &Connection, batch: &RollupBatch) -> rusqlite::Resul
         ])?;
     }
     replace_baseline(conn, &batch.baseline)?;
+    for m in &batch.marks {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO timeline_mark
+                 (project_id, minute_start_ms, mutations_manual, mutations_harness,
+                  turns_started, tool_failures, harnesses)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?
+        .execute(params![
+            m.project_id,
+            to_i64(m.minute_start_ms),
+            m.mutations_manual,
+            m.mutations_harness,
+            m.turns_started,
+            m.tool_failures,
+            serde_json::to_string(&m.harnesses).unwrap_or_else(|_| "[]".to_owned()),
+        ])?;
+    }
     for r in &batch.rollups {
         let share = serde_json::to_string(&r.category_share_milli).unwrap_or_default();
         conn.prepare_cached(
@@ -1187,6 +1273,46 @@ fn insert_rollup_rows(conn: &Connection, batch: &RollupBatch) -> rusqlite::Resul
         ])?;
     }
     Ok(())
+}
+
+/// The stored Timeline Marks of `[from, to)`, oldest first.
+pub fn load_marks(conn: &Connection, from: u64, to: u64) -> rusqlite::Result<Vec<TimelineMark>> {
+    let mut stmt = conn.prepare(
+        "SELECT project_id, minute_start_ms, mutations_manual, mutations_harness,
+                turns_started, tool_failures, harnesses
+         FROM timeline_mark WHERE minute_start_ms >= ?1 AND minute_start_ms < ?2
+         ORDER BY minute_start_ms, project_id",
+    )?;
+    let rows = stmt.query_map(params![to_i64(from), to_i64(to)], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, u32>(2)?,
+            row.get::<_, u32>(3)?,
+            row.get::<_, u32>(4)?,
+            row.get::<_, u32>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (project_id, minute, manual, harness, turns, failures, harnesses) = row?;
+        let (Ok(minute_start_ms), Ok(harnesses)) =
+            (u64::try_from(minute), serde_json::from_str(&harnesses))
+        else {
+            continue;
+        };
+        out.push(TimelineMark {
+            project_id,
+            minute_start_ms,
+            mutations_manual: manual,
+            mutations_harness: harness,
+            turns_started: turns,
+            tool_failures: failures,
+            harnesses,
+        });
+    }
+    Ok(out)
 }
 
 /// Stores `days` as the whole baseline (upserting each, pruning the rest).
