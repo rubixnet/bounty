@@ -44,7 +44,7 @@ Acceptance:
 - [x] Transcoding real WebP fixtures produces 8-bit baseline (non-progressive) JPEG with the longest side ≤1568 px.
 - [x] Spend-limit fallback and error/timeout fallback both produce a Heuristic decision, recorded as a fallback.
 - [x] The router never returns a ban, and an engine cannot upgrade a deterministic Red.
-- [x] Gate 4 (Jev part) is ticked in the spec with test names.
+- [ ] Gate 4 (Jev part) is ticked in the spec with test names. *(Evidence is recorded in the spec; the gate box itself waits for green CI and, for Gate 2, the full-scale load run.)*
 - [ ] `cargo fmt`/`clippy`/`test` green on all 3 OSes.
 
 ## Comments

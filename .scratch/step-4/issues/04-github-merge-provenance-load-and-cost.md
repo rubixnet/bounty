@@ -52,13 +52,13 @@ Acceptance:
   - bandwidth
   - `pg_dump` backups to R2
   - domain and email
-- [x] Its totals show ≤$300 at 15,488 MAU and ≤$500 at the load test's peak burst. Gate 2 is ticked in the spec.
+- [ ] Its totals show ≤$300 at 15,488 MAU and ≤$500 at the load test's peak burst. Gate 2 is ticked in the spec. *(Evidence is recorded in the spec; the gate box itself waits for green CI and, for Gate 2, the full-scale load run.)*
 
 **Deploy**
 - [x] `docs/deploy.md` covers one Linux `traction-server` binary with migrations embedded, a `systemd` unit, and a sample Caddy config for TLS. There is no Docker requirement, and actual provisioning stays a human step.
 
 **Tests (spec "Testing seams" S3b)**
-- [x] **All 3 OSes:**
+- [ ] **All 3 OSes:** *(tests written; ticked once CI is green.)*
   - provenance signature checks and tagging;
   - the GitHub client against a local test HTTP server replaying recorded real GitHub API responses (pagination, the 403 rate limit, the push-access check);
   - alias resolution and cycle refusal.

@@ -39,11 +39,11 @@ Acceptance:
 - [x] OIDC authorization code + PKCE, configured from `[auth]` + env (the client secret is env/file only), and wired into S1's Pairing page.
 
 **Tests (spec "Testing seams" S2)**
-- [x] **All 3 OSes:**
+- [ ] **All 3 OSes:** *(tests written; ticked once CI is green.)*
   - the core `TimelineMark` and overlap-merge math;
   - the daemon finalizer writing marks from fixture events, plus the canary;
   - the OIDC provider against a test identity provider run inside the test, which issues real signed tokens.
-- [x] **Linux only (Postgres):**
+- [ ] **Linux only (Postgres):** *(tests written; ticked once CI is green.)*
   - two devices with offset clocks: `clock_skew` is flagged, the merged minute is ≤60 s, and `multi_device_overlap` is set;
   - `late_anchor` and `offline_buffered` tagging;
   - the public JSON contains no `project_root_path`, `project_home_relative_path` or `os_username`;
