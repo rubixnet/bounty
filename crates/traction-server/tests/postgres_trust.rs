@@ -468,8 +468,10 @@ async fn pairing_signs_in_through_oidc_before_the_csrf_checked_approval() {
     let secret_dir = tempfile::tempdir().unwrap();
     let secret_file = secret_dir.path().join("oidc.secret");
     std::fs::write(&secret_file, format!("{}\n", common::idp::CLIENT_SECRET)).unwrap();
-    let mut config = Config::default();
-    config.auth = common::idp::auth_config(&idp, &secret_file);
+    let config = Config {
+        auth: common::idp::auth_config(&idp, &secret_file),
+        ..Config::default()
+    };
     let server = start(&url, config, Some(clock())).await;
 
     let key = device_key(28);
