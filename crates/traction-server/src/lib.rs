@@ -12,6 +12,7 @@
 pub mod anchors;
 pub mod app;
 pub mod auth;
+pub mod blob;
 pub mod config;
 pub mod decision;
 pub mod error;
