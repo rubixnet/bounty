@@ -7,7 +7,9 @@
 //! overlap merge), `views` (read APIs, `DELETE /v1/me`), `oidc` (Hack Club
 //! login), `partition`
 //! (monthly partitions), `fanout` + `live` (SSE totals), `rate_limit`,
-//! `token`, `error`.
+//! `token`, `error`, `blob` (`BlobStore`: R2 SigV4 + local HMAC), `decision`
+//! (`DecisionEngine` seam), `heuristic` and `submission` (bundle upload,
+//! verification and triage).
 
 pub mod anchors;
 pub mod app;
@@ -25,6 +27,7 @@ pub mod pairing;
 pub mod partition;
 pub mod rate_limit;
 pub mod store;
+pub mod submission;
 pub mod token;
 pub mod views;
 
@@ -38,7 +41,9 @@ use sqlx::postgres::PgPoolOptions;
 use crate::app::{AppState, Clock, system_clock};
 use crate::auth::{AuthProvider, DevAuth};
 use crate::config::Config;
+use crate::decision::DecisionEngine;
 use crate::fanout::BroadcastFanout;
+use crate::heuristic::HeuristicEngine;
 use crate::oidc::{OidcProvider, OidcSettings};
 use crate::rate_limit::RateLimiter;
 
@@ -59,7 +64,25 @@ pub async fn ensure_standard_partitions(
 
 /// Builds the shared state. `clock` is microseconds since the Unix epoch.
 pub fn build_state(pool: PgPool, config: Config, clock: Option<Clock>) -> Result<AppState, String> {
+    let engine: Arc<dyn DecisionEngine> = Arc::new(HeuristicEngine::new(config.heuristic.clone()));
+    build_state_with_engine(pool, config, clock, engine)
+}
+
+/// [`build_state`] with a chosen `DecisionEngine` (S4 wires `JevEngine`).
+pub fn build_state_with_engine(
+    pool: PgPool,
+    config: Config,
+    clock: Option<Clock>,
+    engine: Arc<dyn DecisionEngine>,
+) -> Result<AppState, String> {
     let clock = clock.unwrap_or_else(system_clock);
+    let blob_clock = Arc::clone(&clock);
+    let blobs = blob::build(
+        &config.blob,
+        &config.server.public_url,
+        Arc::new(move || blob_clock() / 1000),
+        |name| std::env::var(name).ok(),
+    )?;
     let auth: Box<dyn AuthProvider> = match config.auth.provider.as_str() {
         "hackclub" => {
             let secret = config
@@ -84,6 +107,8 @@ pub fn build_state(pool: PgPool, config: Config, clock: Option<Clock>) -> Result
         pool,
         config,
         auth,
+        blobs,
+        engine,
         fanout: Arc::new(BroadcastFanout::new(64)),
         limiter,
         clock,

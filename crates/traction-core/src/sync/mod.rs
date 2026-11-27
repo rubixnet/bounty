@@ -9,6 +9,7 @@
 mod heartbeat;
 mod overlap;
 mod pairing;
+mod submission;
 mod timeline;
 mod validate;
 
@@ -21,6 +22,7 @@ pub use pairing::{
     PairingPollRequest, PairingPollResponse, PairingStartRequest, PairingStartResponse,
     PairingStatus,
 };
+pub use submission::{BundleCompleteResponse, BundleStartRequest, BundleStartResponse};
 pub use timeline::{MAX_MARK_COUNT, TimelineMark, timeline_marks, validate_timeline_mark};
 pub use validate::{
     IngestError, validate_project_id, validate_rollup, validate_ruleset,

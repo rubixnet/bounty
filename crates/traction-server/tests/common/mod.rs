@@ -53,7 +53,17 @@ pub fn fixed_clock(ms: u64) -> Clock {
 }
 
 /// A fresh database, migrated, with the standard partitions, and a server.
-pub async fn start(admin_url: &str, mut config: Config, clock: Option<Clock>) -> TestServer {
+pub async fn start(admin_url: &str, config: Config, clock: Option<Clock>) -> TestServer {
+    start_with_engine(admin_url, config, clock, None).await
+}
+
+/// [`start`] with a chosen `DecisionEngine` instead of `HeuristicEngine`.
+pub async fn start_with_engine(
+    admin_url: &str,
+    mut config: Config,
+    clock: Option<Clock>,
+    engine: Option<Arc<dyn traction_server::decision::DecisionEngine>>,
+) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     config.server.public_url = format!("http://{addr}");
@@ -74,7 +84,12 @@ pub async fn start(admin_url: &str, mut config: Config, clock: Option<Clock>) ->
         .await
         .unwrap();
     traction_server::migrate(&pool).await.unwrap();
-    let state = Arc::new(traction_server::build_state(pool.clone(), config, clock).unwrap());
+    let state = Arc::new(match engine {
+        Some(engine) => {
+            traction_server::build_state_with_engine(pool.clone(), config, clock, engine).unwrap()
+        }
+        None => traction_server::build_state(pool.clone(), config, clock).unwrap(),
+    });
     let months = traction_server::ensure_standard_partitions(&pool, state.now_ms())
         .await
         .unwrap();

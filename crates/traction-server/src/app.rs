@@ -7,17 +7,19 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use sqlx::PgPool;
 
 use crate::auth::AuthProvider;
+use crate::blob::BlobStore;
 use crate::config::Config;
+use crate::decision::DecisionEngine;
 use crate::error::ApiError;
 use crate::fanout::LiveFanout;
 use crate::partition::Month;
 use crate::rate_limit::RateLimiter;
 use crate::token::{bearer, hash_secret};
-use crate::{anchors, live, pairing, views};
+use crate::{anchors, live, pairing, submission, views};
 
 /// Microseconds since the Unix epoch. Injectable so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -34,6 +36,10 @@ pub struct AppState {
     pub pool: PgPool,
     pub config: Config,
     pub auth: Box<dyn AuthProvider>,
+    /// Where Audit Bundles are stored (`[blob]`).
+    pub blobs: Arc<dyn BlobStore>,
+    /// The engine that triages a submitted bundle; `HeuristicEngine` by default.
+    pub engine: Arc<dyn DecisionEngine>,
     pub fanout: Arc<dyn LiveFanout>,
     pub limiter: RateLimiter,
     pub clock: Clock,
@@ -68,6 +74,7 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Devic
 
 pub fn router(state: Arc<AppState>) -> Router {
     let cap = state.config.anchor_policy.max_body_bytes;
+    let blob_cap = usize::try_from(state.config.blob.max_bytes).unwrap_or(usize::MAX);
     Router::new()
         .route("/v1/pairings", post(pairing::start))
         .route("/v1/pairings/poll", post(pairing::poll))
@@ -77,6 +84,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/devices/{id}", delete(pairing::revoke_device))
         .route("/v1/anchors", post(anchors::post_anchors))
         .route("/v1/live", get(live::stream))
+        .route("/v1/bundles", post(submission::start))
+        .route("/v1/bundles/{id}/complete", post(submission::complete))
         .route("/v1/me", get(views::get_me).delete(views::delete_me))
         .route("/v1/users/{user_id}/projects", get(views::list_projects))
         .route(
@@ -84,5 +93,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(views::project_timeline),
         )
         .layer(DefaultBodyLimit::max(cap))
+        // The local blob store's upload route carries the whole bundle, so it
+        // has its own (64 MB `[blob] max_bytes`) body limit.
+        .merge(
+            Router::new()
+                .route("/v1/blobs/{*key}", put(submission::local_put))
+                .layer(DefaultBodyLimit::max(blob_cap)),
+        )
         .with_state(state)
 }

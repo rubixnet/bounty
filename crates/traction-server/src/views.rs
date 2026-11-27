@@ -102,15 +102,26 @@ pub async fn get_me(
 }
 
 /// `DELETE /v1/me`: removes every row the user owns (devices, keys, buckets,
-/// rollups, Anchors, marks, commits, Projects, the account). R2 objects join
-/// this in S3a, when `BlobStore` exists.
+/// rollups, Anchors, marks, commits, Projects, bundles with their blob-store
+/// objects, the account).
 pub async fn delete_me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let caller = authenticate(&state, &headers).await?;
+    // The bundle objects go first: if the blob store fails the account is
+    // left whole so the request can simply be retried.
+    for key in crate::submission::blob_keys_of_user(&state.pool, &caller.user_id).await? {
+        state
+            .blobs
+            .delete(&key)
+            .await
+            .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "blob_store"))?;
+    }
     let mut tx = state.pool.begin().await?;
     for statement in [
+        "DELETE FROM triage_decisions WHERE bundle_id IN (SELECT id FROM bundles WHERE user_id = $1)",
+        "DELETE FROM bundles WHERE user_id = $1",
         "DELETE FROM anchors WHERE device_id IN (SELECT id FROM devices WHERE user_id = $1)",
         "DELETE FROM work_buckets WHERE user_id = $1",
         "DELETE FROM activity_rollups WHERE user_id = $1",
