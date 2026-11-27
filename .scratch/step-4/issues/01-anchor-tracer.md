@@ -44,11 +44,11 @@ Acceptance:
   - It moves the cursor past terminal rejections (`window_too_old`) and keeps a local count of them; it retries everything else.
 
 **Tests (spec "Testing seams" S1)**
-- [ ] **All 3 OSes:** *(tests written; ticked once CI is green.)*
+- [x] **All 3 OSes:** *(green in CI run 46003549496 on `01b596f`.)*
   - the core `sync` round-trip and unknown-field tests;
   - the daemon sync client against a local test HTTP server built from `traction-core::sync`: cursor resume across a restart, ordered backlog chunking, backoff with `Retry-After`, skipping past terminal rejections, `offline_buffered` marking, and `server.token` permissions;
   - server tests that need no database: validation, token hashing, the CSRF check, and refusing an inline secret.
-- [ ] **Linux only (Postgres 17 service container):** *(tests written; ticked once CI is green.)*
+- [x] **Linux only (Postgres 17 service container):** *(green in CI run 46003549496 on `01b596f`.)*
   - the full end-to-end run: real daemon, real `traction-server` and Postgres, covering pairing, then heartbeat, then stored rows, then the SSE total going up;
   - idempotent re-send and `409`;
   - `future_window` and `window_too_old`;
@@ -63,7 +63,7 @@ Acceptance:
 - [x] `docs/protocol.md` §3 becomes the per-device heartbeat and the sync contract.
 - [x] `GLOSSARY.md` adds Pairing, Timeline Mark and Triage, and sets out Logged Hours vs verified stats.
 - [x] New ADRs: `docs/adr/0004-verify-at-submission.md` and `docs/adr/0006-linux-only-db-ci.md`.
-- [ ] `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` green on all 3 OSes, and the Linux Postgres job green.
+- [x] `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` green on all 3 OSes, and the Linux Postgres job green. *(CI run 46003549496 on `01b596f`.)*
 
 ## Comments
 

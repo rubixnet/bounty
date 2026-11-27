@@ -39,11 +39,11 @@ Acceptance:
 - [x] OIDC authorization code + PKCE, configured from `[auth]` + env (the client secret is env/file only), and wired into S1's Pairing page.
 
 **Tests (spec "Testing seams" S2)**
-- [ ] **All 3 OSes:** *(tests written; ticked once CI is green.)*
+- [x] **All 3 OSes:** *(green in CI run 46003549496 on `01b596f`.)*
   - the core `TimelineMark` and overlap-merge math;
   - the daemon finalizer writing marks from fixture events, plus the canary;
   - the OIDC provider against a test identity provider run inside the test, which issues real signed tokens.
-- [ ] **Linux only (Postgres):** *(tests written; ticked once CI is green.)*
+- [x] **Linux only (Postgres):** *(green in CI run 46003549496 on `01b596f`.)*
   - two devices with offset clocks: `clock_skew` is flagged, the merged minute is ≤60 s, and `multi_device_overlap` is set;
   - `late_anchor` and `offline_buffered` tagging;
   - the public JSON contains no `project_root_path`, `project_home_relative_path` or `os_username`;
@@ -53,7 +53,7 @@ Acceptance:
 **Docs**
 - [x] `docs/protocol.md` adds `TimelineMark` and its heartbeat field.
 - [x] New `docs/adr/0005-unsigned-timeline-marks.md`, which notes that signing them could be a later `bundle_schema` bump.
-- [ ] `cargo fmt`/`clippy`/`test` green on all 3 OSes, and the Linux Postgres job green.
+- [x] `cargo fmt`/`clippy`/`test` green on all 3 OSes, and the Linux Postgres job green. *(CI run 46003549496 on `01b596f`.)*
 
 ## Comments
 

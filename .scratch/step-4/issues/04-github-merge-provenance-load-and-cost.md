@@ -39,9 +39,9 @@ Acceptance:
 - [x] A `load` binary in `crates/traction-server` drives the real server and Postgres 17. It simulates 15,488 enrolled devices, with peak concurrency at 10× the ~153-device average, realistic heartbeat sizes including Timeline Marks, and chunked offline backlogs.
 - [x] It runs against a database preseeded with a month of data (~6.6M buckets) and reports the ingest p95 and server RSS.
 - [ ] CI:
-  - every PR runs a reduced-scale smoke version on Linux;
-  - a nightly or `workflow_dispatch` Linux job runs it at full scale and publishes the report as an artifact.
-- [ ] The full-scale report shows **<50 ms p95 ingest** and **<512 MB server RSS**. Gate 1 is ticked in the spec with a link to the report.
+  - every PR runs a reduced-scale smoke version on Linux; *(done: Load smoke green in CI run 46003549496 on `01b596f`.)*
+  - a nightly or `workflow_dispatch` Linux job runs it at full scale and publishes the report as an artifact. *(Pending: `load.yml` is a new workflow file, so GitHub cannot dispatch it until it is on `main`; it will be dispatched immediately after merging to `main`.)*
+- [ ] The full-scale report shows **<50 ms p95 ingest** and **<512 MB server RSS**. Gate 1 is ticked in the spec with a link to the report. *(Pending the first full-scale `load.yml` run: `load.yml` is a new workflow file, so GitHub cannot dispatch it until it is on `main`; it will be dispatched immediately after merging to `main`.)*
 
 **Cost model (Gate 2)**
 - [x] `docs/cost-model.md` itemizes the monthly cost, each line with a dated source:
@@ -52,18 +52,18 @@ Acceptance:
   - bandwidth
   - `pg_dump` backups to R2
   - domain and email
-- [ ] Its totals show ≤$300 at 15,488 MAU and ≤$500 at the load test's peak burst. Gate 2 is ticked in the spec. *(Evidence is recorded in the spec; the gate box itself waits for green CI and, for Gate 2, the full-scale load run.)*
+- [ ] Its totals show ≤$300 at 15,488 MAU and ≤$500 at the load test's peak burst. Gate 2 is ticked in the spec. *(CI is green (CI run 46003549496 on `01b596f`); the box waits for the full-scale load run to refresh the numbers. `load.yml` is a new workflow file, so GitHub cannot dispatch it until it is on `main`; it will be dispatched immediately after merging to `main`.)*
 
 **Deploy**
 - [x] `docs/deploy.md` covers one Linux `traction-server` binary with migrations embedded, a `systemd` unit, and a sample Caddy config for TLS. There is no Docker requirement, and actual provisioning stays a human step.
 
 **Tests (spec "Testing seams" S3b)**
-- [ ] **All 3 OSes:** *(tests written; ticked once CI is green.)*
+- [x] **All 3 OSes:** *(green in CI run 46003549496 on `01b596f`.)*
   - provenance signature checks and tagging;
   - the GitHub client against a local test HTTP server replaying recorded real GitHub API responses (pagination, the 403 rate limit, the push-access check);
   - alias resolution and cycle refusal.
-- [ ] **Linux only:** the Project merge API across two devices' Projects; the load smoke run on PRs; the full nightly run.
-- [ ] `cargo fmt`/`clippy`/`test` green on all 3 OSes, and the Linux jobs green.
+- [ ] **Linux only:** the Project merge API across two devices' Projects; the load smoke run on PRs; the full nightly run. *(Merge API and load smoke green in CI run 46003549496 on `01b596f`; the full run is pending: `load.yml` is a new workflow file, so GitHub cannot dispatch it until it is on `main`; it will be dispatched immediately after merging to `main`.)*
+- [x] `cargo fmt`/`clippy`/`test` green on all 3 OSes, and the Linux jobs green. *(CI run 46003549496 on `01b596f`.)*
 
 ## Comments
 

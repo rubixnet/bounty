@@ -57,11 +57,11 @@ Acceptance:
 - [x] The three thresholds the spec leaves open (`multi_device_overlap` share, `yellow_credit_ratio`, and the length of a "long run" with no marks) are set in this ticket, documented in `[heuristic]`, and recorded in a comment below.
 
 **Tests (spec "Testing seams" S3a)**
-- [ ] **All 3 OSes:** *(tests written; ticked once CI is green.)*
+- [x] **All 3 OSes:** *(green in CI run 46003549496 on `01b596f`.)*
   - `HeuristicEngine` over fixture `TriageInput`s, one per Red, Yellow and Green reason code, including `tier_limited_share` never changing the colour, run in a test that proves no network access;
   - SigV4 presigning against AWS's published test vectors;
   - the `LocalBlobStore` round trip, expiry and `Content-Length` cap.
-- [ ] **Linux only (Postgres + MinIO service container):** *(tests written; ticked once CI is green.)* a red-team suite against the real server:
+- [x] **Linux only (Postgres + S3 container; versitygw since `01b596f`, MinIO before):** *(green in CI run 46003549496 on `01b596f`.)* a red-team suite against the real server:
   - a backdated tip gives `late_anchor` → Red/Yellow per the thresholds;
   - a cut tail (an Anchor missing from the bundle) gives Red;
   - rewritten rows (bundle vs live sync) give Red;
@@ -69,8 +69,8 @@ Acceptance:
   - two-device clock skew gives Yellow with `clock_skew` + `multi_device_overlap`;
   - a deterministic failure stays Red whatever the engine returns;
   - the `R2BlobStore` upload round trip against MinIO.
-- [ ] **Gate 3** and **Gate 4 (Heuristic part)** are ticked in the spec, with test names. *(Evidence is recorded in the spec; the gate boxes themselves wait for green CI.)*
-- [ ] `cargo fmt`/`clippy`/`test` green on all 3 OSes, and the Linux Postgres + MinIO job green.
+- [x] **Gate 3** and **Gate 4 (Heuristic part)** are ticked in the spec, with test names. *(CI run 46003549496 on `01b596f`.)*
+- [x] `cargo fmt`/`clippy`/`test` green on all 3 OSes, and the Linux Postgres + S3 job green. *(CI run 46003549496 on `01b596f`.)*
 
 ## Comments
 
