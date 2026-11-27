@@ -98,3 +98,43 @@ jobs:
           exit 1
       - name: Test traction-server (Postgres + MinIO)
         run: cargo test -p traction-server -- --nocapture
+
+  # Step 4 Gate 1, reduced scale: the same `load` binary against the real
+  # server and Postgres 17, at 1/15 of the enrolled devices and ~1/33 of the
+  # seeded month. The full-scale run is the nightly/workflow_dispatch job in
+  # load.yml, which publishes the report Gate 1 is ticked against.
+  load-smoke:
+    name: Load smoke (ubuntu-latest)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Build release binaries
+        run: cargo build --release -p traction-server --bins
+      - name: Run the smoke load test
+        run: |
+          mkdir -p report
+          target/release/load \
+            --database-url postgres://postgres:postgres@localhost:5432/postgres \
+            --devices 1000 --seed-buckets 200000 --peak-devices 150 \
+            --max-p95-ms 50 --max-rss-mb 512 \
+            --report report/smoke-load-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-load-report
+          path: report/smoke-load-report.json
+          if-no-files-found: warn

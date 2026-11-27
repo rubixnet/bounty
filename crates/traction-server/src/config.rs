@@ -413,6 +413,30 @@ mod tests {
     }
 
     #[test]
+    fn the_deploy_guide_config_parses_and_the_s3b_sections_are_public_keys_and_references() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/deploy.md"),
+        )
+        .unwrap();
+        let start = text.find("```toml\n").unwrap() + 8;
+        let toml_text = &text[start..start + text[start..].find("```").unwrap()];
+        let config = Config::parse(toml_text).expect("docs/deploy.md example parses");
+        assert_eq!(config.blob.provider, "r2");
+        assert_eq!(config.github.app_id, "<numeric app id>");
+        assert_eq!(config.provenance.ci_public_keys.len(), 1);
+        assert!(
+            config.provenance.keys().is_err(),
+            "the placeholder is not a key"
+        );
+        let ok = Config::parse(&format!(
+            "[provenance]\nci_public_keys = [\"{}\"]\n",
+            "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+        ))
+        .unwrap();
+        assert_eq!(ok.provenance.keys().unwrap().len(), 1);
+    }
+
+    #[test]
     fn all_seven_sections_parse() {
         let text = "[anchor_policy]\n[heuristic]\n[jev]\n[auth]\n[roles]\n[blob]\n[github]\n";
         assert!(Config::parse(text).is_ok());
