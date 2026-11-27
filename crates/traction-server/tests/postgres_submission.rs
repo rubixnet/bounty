@@ -620,3 +620,84 @@ async fn delete_me_also_deletes_the_users_blobs() {
         assert_eq!(n, 0, "{table}");
     }
 }
+
+/// MinIO (S3-compatible, standing in for R2). Linux CI starts MinIO and sets
+/// `TRACTION_TEST_MINIO_ENDPOINT` (and `_BUCKET`, `_ACCESS_KEY`,
+/// `_SECRET_KEY`); elsewhere the test is skipped unless
+/// `TRACTION_REQUIRE_MINIO=1`.
+fn minio_env() -> Option<(String, String)> {
+    let endpoint = std::env::var("TRACTION_TEST_MINIO_ENDPOINT").ok();
+    if endpoint.is_none() && std::env::var("TRACTION_REQUIRE_MINIO").is_ok_and(|v| v == "1") {
+        panic!("TRACTION_REQUIRE_MINIO=1 but TRACTION_TEST_MINIO_ENDPOINT is not set");
+    }
+    let bucket =
+        std::env::var("TRACTION_TEST_MINIO_BUCKET").unwrap_or_else(|_| "traction-test".into());
+    endpoint.map(|e| (e, bucket))
+}
+
+#[tokio::test]
+async fn the_r2_store_round_trips_a_bundle_through_minio_and_delete_me_removes_it() {
+    let Some(url) = database_url() else { return };
+    let Some((endpoint, bucket)) = minio_env() else {
+        eprintln!("SKIPPED (no TRACTION_TEST_MINIO_ENDPOINT): MinIO-backed test");
+        return;
+    };
+    let mut config = Config::default();
+    config.blob.provider = "r2".into();
+    config.blob.r2_endpoint = endpoint.clone();
+    config.blob.r2_bucket = bucket.clone();
+    config.blob.r2_region = "us-east-1".into();
+    config.blob.r2_access_key_id_env = "TRACTION_TEST_MINIO_ACCESS_KEY".into();
+    config.blob.r2_secret_access_key_env = "TRACTION_TEST_MINIO_SECRET_KEY".into();
+    // The real clock: MinIO checks the presigned timestamp against its own.
+    let server = start(&url, config, None).await;
+    let (token, _) = pair(&server, &device_key(1), None).await;
+    let rig = Rig {
+        server,
+        now: Arc::new(AtomicU64::new(0)),
+        _blobs: tempfile::tempdir().unwrap(),
+    };
+
+    // A bundle that is not a bundle still travels the whole R2 path and is
+    // read back by the server (and stored as a Red decision).
+    let bytes = b"{\"not\":\"a bundle\"}".to_vec();
+    let started = start_bundle(&rig, &token, bytes.len() as u64).await;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let started: BundleStartResponse = serde_json::from_str(&started.body).unwrap();
+    assert!(
+        started
+            .put_url
+            .starts_with(&format!("{endpoint}/{bucket}/bundles/")),
+        "{}",
+        started.put_url
+    );
+    assert!(started.put_url.contains("X-Amz-Expires=900"));
+    // The signed Content-Length: a different body is refused by the store.
+    let refused = put(
+        started.put_url.clone(),
+        b"{\"not\":\"a bundle!!\"}".to_vec(),
+    )
+    .await;
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(complete(&rig, &token, &started.bundle_id).await.status, 409);
+    // The exact body is accepted.
+    assert_eq!(put(started.put_url.clone(), bytes).await.status, 200);
+    let done = complete(&rig, &token, &started.bundle_id).await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    let d = decision(&rig, &started.bundle_id).await;
+    assert_eq!(d.failure.as_deref(), Some("malformed_bundle"));
+
+    // DELETE /v1/me deletes the object from the store.
+    let gone = http(
+        "DELETE",
+        format!("{}/v1/me", rig.server.base),
+        Some(token),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(gone.status, 204);
+    let key = format!("bundles/{}.json", started.bundle_id);
+    let stored = rig.server.state.blobs.get(&key).await.unwrap();
+    assert_eq!(stored, None, "the object is gone from MinIO");
+}
