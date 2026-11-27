@@ -20,14 +20,23 @@ use traction_daemon::{
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+const LOGIN_URL: &str = "https://example.invalid/auth/login?pair=ABCD-EFGH";
+
 fn pairing_server(approve_after_polls: usize) -> HttpServer {
+    pairing_server_with_login_url(approve_after_polls, LOGIN_URL)
+}
+
+fn pairing_server_with_login_url(
+    approve_after_polls: usize,
+    login_url: &'static str,
+) -> HttpServer {
     HttpServer::start(move |req: &Request, n| match req.path.as_str() {
         "/v1/pairings" => Response::json(
             200,
             &PairingStartResponse {
                 pair_code: "ABCD-EFGH".into(),
                 poll_secret: "s".repeat(64),
-                login_url: "http://example.invalid/auth/login?pair=ABCD-EFGH".into(),
+                login_url: login_url.into(),
                 expires_in_sec: 600,
             },
         ),
@@ -80,10 +89,7 @@ fn login_pins_the_key_waits_for_approval_and_stores_the_token_owner_only() {
         std::fs::read_to_string(dir.path().join(SERVER_URL_FILE)).unwrap(),
         server.url()
     );
-    assert_eq!(
-        *opened.borrow(),
-        ["http://example.invalid/auth/login?pair=ABCD-EFGH"]
-    );
+    assert_eq!(*opened.borrow(), [LOGIN_URL]);
 
     // The key that went up is the Device Signing Key in the data folder.
     let public = std::fs::read_to_string(dir.path().join(SIGNING_PUB_FILE)).unwrap();
@@ -208,4 +214,43 @@ fn a_server_url_without_a_scheme_is_refused() {
     options.server_url = "example.com".into();
     assert!(login(&options, &mut Vec::new(), &|_| {}).is_err());
     assert_eq!(server.count(), 0);
+}
+
+#[test]
+fn a_plain_http_server_url_off_loopback_is_refused_before_any_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = pairing_server(0);
+    let mut options = options(dir.path(), &server);
+    for remote in ["http://traction.example", "http://127.0.0.1.evil.example"] {
+        options.server_url = remote.into();
+        let error = login(&options, &mut Vec::new(), &|_| {}).unwrap_err();
+        assert!(error.contains("https"), "{error}");
+    }
+    assert_eq!(server.count(), 0);
+    assert!(!dir.path().join(SERVER_TOKEN_FILE).exists());
+}
+
+#[test]
+fn a_server_returned_browser_url_that_is_not_safe_http_is_never_opened() {
+    for bad in [
+        "file:///Applications/Calculator.app",
+        "javascript:alert(1)",
+        "http://example.invalid/auth/login?pair=ABCD-EFGH",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = pairing_server_with_login_url(0, bad);
+        let opened = RefCell::new(Vec::<String>::new());
+        let mut out = Vec::new();
+        let error = login(&options(dir.path(), &server), &mut out, &|url| {
+            opened.borrow_mut().push(url.to_owned());
+        })
+        .unwrap_err();
+        assert!(error.contains("login URL"), "{bad}: {error}");
+        assert!(opened.borrow().is_empty(), "{bad} was opened");
+        assert!(
+            !String::from_utf8_lossy(&out).contains(bad),
+            "{bad} was printed"
+        );
+        assert!(!dir.path().join(SERVER_TOKEN_FILE).exists());
+    }
 }

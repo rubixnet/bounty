@@ -60,6 +60,9 @@ pub struct GithubState {
     pub installed: Mutex<bool>,
     /// The `x-ratelimit-reset` value the rate-limit reply carries.
     pub reset_at: Mutex<u64>,
+    /// When set, page 1's `rel="next"` link starts with this instead of the
+    /// server's own address (a look-alike origin the client must not follow).
+    pub next_link_base: Mutex<Option<String>>,
 }
 
 pub struct FakeGithub {
@@ -254,12 +257,18 @@ async fn commits(
     }
     let page = q.get("page").map_or("1", String::as_str);
     let (body, link) = if page == "1" {
+        let next_base = state
+            .next_link_base
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| state.base.clone());
         (
             PAGE1,
             Some(format!(
                 "<{0}/repositories/1296269/commits?per_page=2&page=2>; rel=\"next\", \
                  <{0}/repositories/1296269/commits?per_page=2&page=2>; rel=\"last\"",
-                state.base
+                next_base
             )),
         )
     } else {
@@ -308,6 +317,7 @@ pub async fn start() -> FakeGithub {
         pass_first: Mutex::new(0),
         installed: Mutex::new(true),
         reset_at: Mutex::new(0),
+        next_link_base: Mutex::new(None),
     });
     let app = axum::Router::new()
         .route("/user", get(user))

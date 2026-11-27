@@ -58,19 +58,10 @@ pub struct OidcSettings {
     pub redirect_url: String,
 }
 
-fn is_loopback_http(url: &str) -> bool {
-    ["http://127.0.0.1", "http://localhost", "http://[::1]"]
-        .iter()
-        .any(|p| {
-            url.strip_prefix(p)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
-        })
-}
-
 /// Endpoints must be `https`; plain `http` is allowed only on loopback (the
 /// test identity provider).
 fn endpoint_ok(url: &str) -> bool {
-    url.starts_with("https://") || is_loopback_http(url)
+    traction_core::secure_http_url(url)
 }
 
 impl OidcSettings {

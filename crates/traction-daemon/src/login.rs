@@ -16,6 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use traction_core::secure_http_url;
 use traction_core::sync::{
     PairingPollRequest, PairingPollResponse, PairingStartRequest, PairingStartResponse,
     PairingStatus,
@@ -58,8 +59,11 @@ pub fn login(
     open: &dyn Fn(&str),
 ) -> Result<(), String> {
     let base = options.server_url.trim().trim_end_matches('/').to_owned();
-    if !(base.starts_with("https://") || base.starts_with("http://")) {
-        return Err("the server URL must start with https:// (or http:// for local tests)".into());
+    if !secure_http_url(&base) {
+        return Err(
+            "the server URL must start with https:// (plain http:// only on localhost, 127.0.0.1 or [::1])"
+                .into(),
+        );
     }
     std::fs::create_dir_all(&options.data_dir)
         .map_err(|e| format!("cannot create the data folder: {e}"))?;
@@ -83,6 +87,14 @@ pub fn login(
             build: crate::provenance::compiled(),
         },
     )?;
+    // The browser opener hands this to the OS, which would happily launch a
+    // `file:` path or another scheme handler: only safe HTTP(S) goes there.
+    if !secure_http_url(&started.login_url) {
+        return Err(
+            "the server sent a login URL that is not https:// (or loopback http://); refusing to open it"
+                .into(),
+        );
+    }
     let _ = writeln!(out, "Pairing code: {}", started.pair_code);
     let _ = writeln!(out, "Approve this device at: {}", started.login_url);
     if options.open_browser {
@@ -129,8 +141,12 @@ pub fn login(
     }
 }
 
-/// Best effort: ask the OS to open `url` in the default browser.
+/// Best effort: ask the OS to open `url` in the default browser. Anything but
+/// `https://` (or loopback `http://`) is ignored, never handed to the OS.
 pub fn open_in_browser(url: &str) {
+    if !secure_http_url(url) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     let spawned = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "windows")]

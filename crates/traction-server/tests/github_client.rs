@@ -139,6 +139,25 @@ async fn commits_are_fetched_across_pages_as_oids_and_timestamps_only() {
 }
 
 #[tokio::test]
+async fn a_next_link_that_only_starts_with_the_base_is_not_followed() {
+    let fake = github::start().await;
+    // `http://127.0.0.1:P@127.0.0.1:P/...` starts with the base but its host
+    // is whatever follows the `@`. Here that is the fake itself, so a client
+    // that follows it shows up as a second recorded request.
+    let authority = fake.base.trim_start_matches("http://").to_owned();
+    *fake.state.next_link_base.lock().unwrap() = Some(format!("{}@{authority}", fake.base));
+    let c = client(&fake, APP_KEY_PEM);
+    let commits = run(move || c.fetch_commits(INSTALLATION_TOKEN, REPO, None, NOW))
+        .await
+        .unwrap();
+    assert_eq!(commits.len(), 2, "only page 1 is kept");
+    assert_eq!(
+        fake.state.recorded.lock().unwrap().requests,
+        ["/repos/octocat/Hello-World/commits?per_page=2"]
+    );
+}
+
+#[tokio::test]
 async fn an_incremental_fetch_sends_since() {
     let fake = github::start().await;
     let c = client(&fake, APP_KEY_PEM);

@@ -266,7 +266,7 @@ impl GithubClient {
             .or_else(|_| PrivateKey::from_pkcs8_pem(private_key_pem))
             .map_err(|_| GithubError::Malformed)?;
         let base = config.api_base_url.trim_end_matches('/').to_owned();
-        if !(base.starts_with("https://") || is_loopback_http(&base)) {
+        if !traction_core::secure_http_url(&base) {
             return Err(GithubError::Malformed);
         }
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -448,21 +448,15 @@ impl GithubClient {
             let (body, link) = self.call("GET", &url, installation_token, now_sec)?;
             all.extend(parse_commit_page(&body)?);
             match link.as_deref().and_then(next_link) {
-                // Only ever follow a link that stays on the configured API.
-                Some(next) if next.starts_with(&self.base) => url = next,
+                // Only ever follow a link on the configured API's origin
+                // (scheme, host and port; a prefix match would accept
+                // `https://api.github.com.evil.tld`).
+                Some(next) if traction_core::same_origin(&self.base, &next) => url = next,
                 _ => break,
             }
         }
         Ok(all)
     }
-}
-
-fn is_loopback_http(base: &str) -> bool {
-    base.strip_prefix("http://").is_some_and(|rest| {
-        rest.starts_with("127.0.0.1:")
-            || rest.starts_with("localhost:")
-            || rest.starts_with("[::1]:")
-    })
 }
 
 /// `2012-03-06T23:06:50Z` for a Unix-millisecond time.

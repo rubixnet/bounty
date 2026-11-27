@@ -87,13 +87,6 @@ impl Fallback {
     }
 }
 
-fn endpoint_ok(base: &str) -> bool {
-    base.starts_with("https://")
-        || ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"]
-            .iter()
-            .any(|p| base.starts_with(p))
-}
-
 impl JevEngine {
     /// Builds the engine from `[jev]`, reading the API key only from
     /// `api_key_file` or the `api_key_env` variable (through `env`).
@@ -120,7 +113,7 @@ impl JevEngine {
     ) -> Result<Self, String> {
         config.validate()?;
         let base = config.base_url.trim_end_matches('/').to_owned();
-        if !endpoint_ok(&base) {
+        if !traction_core::secure_http_url(&base) {
             return Err("`jev.base_url` must be https (plain http only on loopback)".into());
         }
         let ledger = SpendLedger::open(

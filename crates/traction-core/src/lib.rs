@@ -12,6 +12,7 @@ mod rollup;
 mod ruleset;
 mod struggle;
 pub mod sync;
+mod url_policy;
 mod validate;
 
 pub use canonical::{CanonicalJsonError, canonical_json};
@@ -41,6 +42,7 @@ pub use rollup::{
 };
 pub use ruleset::{MINUTE_MS, PERSONA_MARKS_1, PersonaMarks, Ruleset, TRACTION_RULES_1};
 pub use struggle::{BASELINE_BINS, BaselineDay, StruggleAxes, fold_baseline};
+pub use url_policy::{same_origin, secure_http_url};
 pub use validate::{
     EventError, MAX_CWD_LEN, MAX_IDENTIFIER_LEN, MAX_SESSION_ID_LEN, ValidationError, uuid_v7,
 };
