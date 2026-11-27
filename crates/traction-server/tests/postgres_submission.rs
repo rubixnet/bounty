@@ -707,21 +707,25 @@ async fn the_r2_store_round_trips_a_bundle_through_minio_and_delete_me_removes_i
 #[tokio::test]
 async fn a_self_built_device_is_yellow_never_red_and_a_ci_signed_one_is_green() {
     let Some(url) = database_url() else { return };
-    let rig = rig(&url).await;
-    // `paired` presents a CI-signed statement; a plain `pair` does not.
-    let (key_ci, token_ci, _) = rig.paired(1).await;
-    let key_dev = device_key(2);
-    let (token_dev, _) = pair(&rig.server, &key_dev, None).await;
+    // Separate servers: two devices of one user working in the same minutes
+    // would (correctly) also be `multi_device_overlap`.
+    let ci_rig = rig(&url).await;
+    let (key_ci, token_ci, _) = ci_rig.paired(1).await; // presents a CI-signed statement
     let chain_ci = seal_chain(key_ci, 4, honest_buckets);
-    let chain_dev = seal_chain(key_dev, 4, honest_buckets);
-    rig.anchor(&token_ci, &chain_ci, 0..4, 30_000, 0).await;
-    rig.anchor(&token_dev, &chain_dev, 0..4, 30_000, 0).await;
-
-    let ci = submit(&rig, &token_ci, &bundle_bytes(&chain_ci, 4, None)).await;
-    let dev = submit(&rig, &token_dev, &bundle_bytes(&chain_dev, 4, None)).await;
-    let ci = decision(&rig, &ci).await;
-    let dev = decision(&rig, &dev).await;
+    ci_rig.anchor(&token_ci, &chain_ci, 0..4, 30_000, 0).await;
+    let id = submit(&ci_rig, &token_ci, &bundle_bytes(&chain_ci, 4, None)).await;
+    let ci = decision(&ci_rig, &id).await;
     assert_eq!((ci.verdict.as_str(), ci.reasons.len()), ("green", 0));
+
+    let dev_rig = rig(&url).await;
+    let key_dev = device_key(2);
+    let (token_dev, _) = pair(&dev_rig.server, &key_dev, None).await; // no statement
+    let chain_dev = seal_chain(key_dev, 4, honest_buckets);
+    dev_rig
+        .anchor(&token_dev, &chain_dev, 0..4, 30_000, 0)
+        .await;
+    let id = submit(&dev_rig, &token_dev, &bundle_bytes(&chain_dev, 4, None)).await;
+    let dev = decision(&dev_rig, &id).await;
     assert_eq!(dev.verdict, "yellow", "{:?} {:?}", dev.reasons, dev.failure);
-    assert!(dev.reasons.contains(&"self_built".to_owned()));
+    assert_eq!(dev.reasons, ["self_built"]);
 }
