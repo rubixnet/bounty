@@ -396,7 +396,12 @@ async fn linking_needs_push_access_then_stores_only_oids_and_timestamps() {
 
     // No commit message, e-mail, name, diff or token reached any table.
     let mut dump = String::new();
-    for table in ["project_commits", "linked_repos", "github_accounts", "projects"] {
+    for table in [
+        "project_commits",
+        "linked_repos",
+        "github_accounts",
+        "projects",
+    ] {
         let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT t::text FROM {table} t"
         )))
