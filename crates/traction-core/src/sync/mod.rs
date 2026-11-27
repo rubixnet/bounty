@@ -7,17 +7,21 @@
 //! stable, value-free strings: they never echo what a client sent.
 
 mod heartbeat;
+mod overlap;
 mod pairing;
+mod timeline;
 mod validate;
 
 pub use heartbeat::{
     AnchorStatus, ChainTip, ErrorBody, HeartbeatRequest, HeartbeatResponse, ItemKind, ItemRef,
     ProjectMeta, RejectedItem, SyncMode,
 };
+pub use overlap::{MINUTE_CAP_SEC, MergedMinute, MinuteShare, merge_minute};
 pub use pairing::{
     PairingPollRequest, PairingPollResponse, PairingStartRequest, PairingStartResponse,
     PairingStatus,
 };
+pub use timeline::{MAX_MARK_COUNT, TimelineMark, timeline_marks, validate_timeline_mark};
 pub use validate::{
     IngestError, validate_project_id, validate_rollup, validate_ruleset,
     validate_window_not_after_tip, validate_work_bucket,

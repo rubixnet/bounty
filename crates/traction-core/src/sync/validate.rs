@@ -18,6 +18,7 @@ pub enum IngestError {
     MisalignedWindow,
     WindowAfterTip,
     InvalidProjectId,
+    InvalidTimelineMark,
 }
 
 impl IngestError {
@@ -33,6 +34,7 @@ impl IngestError {
             Self::MisalignedWindow => "misaligned_window",
             Self::WindowAfterTip => "window_after_tip",
             Self::InvalidProjectId => "invalid_project_id",
+            Self::InvalidTimelineMark => "invalid_timeline_mark",
         }
     }
 }

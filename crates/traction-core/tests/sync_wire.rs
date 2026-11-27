@@ -7,10 +7,11 @@ use serde_json::{Value, json};
 use traction_core::sync::{
     AnchorStatus, ChainTip, ErrorBody, HeartbeatRequest, HeartbeatResponse, ItemKind, ItemRef,
     PairingPollRequest, PairingPollResponse, PairingStartRequest, PairingStartResponse,
-    PairingStatus, ProjectMeta, RejectedItem, SyncMode,
+    PairingStatus, ProjectMeta, RejectedItem, SyncMode, TimelineMark,
 };
 use traction_core::{
-    ActivityRollup, DeviceSigningKey, StruggleAxes, TelemetryTier, WorkBucket, canonical_json,
+    ActivityRollup, DeviceSigningKey, HarnessId, StruggleAxes, TelemetryTier, WorkBucket,
+    canonical_json,
 };
 use zeroize::Zeroizing;
 
@@ -77,6 +78,15 @@ fn heartbeat() -> HeartbeatRequest {
             project_home_relative_path: Some("~/demo".into()),
             os_username: "u".into(),
         }],
+        timeline_marks: vec![TimelineMark {
+            project_id: project(),
+            minute_start_ms: 1_800_000_000_000 / 60_000 * 60_000,
+            mutations_manual: 1,
+            mutations_harness: 2,
+            turns_started: 3,
+            tool_failures: 0,
+            harnesses: vec![HarnessId::ClaudeCode],
+        }],
     }
 }
 
@@ -132,6 +142,7 @@ fn the_heartbeat_round_trips_and_refuses_unknown_fields_at_every_level() {
             &["activity_rollups", "0"],
             &["activity_rollups", "0", "category_share_milli"],
             &["projects", "0"],
+            &["timeline_marks", "0"],
         ],
     );
 }

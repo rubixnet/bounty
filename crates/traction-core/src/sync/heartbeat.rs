@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sync::TimelineMark;
 use crate::{ActivityRollup, KeyId, WorkBucket};
 
 /// Whether the request was sent close to the windows' end.
@@ -45,6 +46,9 @@ pub struct HeartbeatRequest {
     pub activity_rollups: Vec<ActivityRollup>,
     /// Metadata of the Projects named by `work_buckets`.
     pub projects: Vec<ProjectMeta>,
+    /// Unsigned Timeline Marks (`docs/adr/0005`); absent from older daemons.
+    #[serde(default)]
+    pub timeline_marks: Vec<TimelineMark>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +56,7 @@ pub struct HeartbeatRequest {
 pub enum ItemKind {
     WorkBucket,
     ActivityRollup,
+    TimelineMark,
 }
 
 /// Names one row without echoing its content: the minute or window start,
