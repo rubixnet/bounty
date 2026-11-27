@@ -125,7 +125,7 @@ pub fn webp_to_baseline_jpeg(webp: &[u8]) -> Result<Jpeg, FrameSkip> {
 
 fn flatten_on_white(rgba: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let a = u32::from(px[3]);
         for &c in &px[..3] {
             rgb.push(((u32::from(c) * a + 255 * (255 - a) + 127) / 255) as u8);

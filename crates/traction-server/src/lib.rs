@@ -70,8 +70,30 @@ pub async fn ensure_standard_partitions(
 
 /// Builds the shared state. `clock` is microseconds since the Unix epoch.
 pub fn build_state(pool: PgPool, config: Config, clock: Option<Clock>) -> Result<AppState, String> {
-    let engine: Arc<dyn DecisionEngine> = Arc::new(HeuristicEngine::new(config.heuristic.clone()));
+    let micros = clock.clone().unwrap_or_else(system_clock);
+    let engine = engine_from_config(
+        &config,
+        |name| std::env::var(name).ok(),
+        Arc::new(move || micros() / 1000),
+    )?;
     build_state_with_engine(pool, config, clock, engine)
+}
+
+/// The configured `DecisionEngine`: `HeuristicEngine` (zero network) unless
+/// `[jev] enabled`, then `JevEngine`, which runs Heuristic first and falls
+/// back to it. An enabled Jev without its API key refuses to start.
+/// `clock_ms` is milliseconds since the Unix epoch.
+pub fn engine_from_config(
+    config: &Config,
+    env: impl Fn(&str) -> Option<String>,
+    clock_ms: jev::ClockMs,
+) -> Result<Arc<dyn DecisionEngine>, String> {
+    if config.jev.enabled {
+        let engine = jev::JevEngine::from_config(&config.jev, &config.heuristic, env, clock_ms)?;
+        Ok(Arc::new(engine))
+    } else {
+        Ok(Arc::new(HeuristicEngine::new(config.heuristic.clone())))
+    }
 }
 
 /// [`build_state`] with a chosen `DecisionEngine` (S4 wires `JevEngine`).

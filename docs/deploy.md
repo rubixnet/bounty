@@ -76,7 +76,14 @@ ci_public_keys = ["<64 hex digits>"]
 app_id = "<numeric app id>"
 private_key_file = "/etc/traction/github-app.pem"
 
-[jev]      # filled in by the JevEngine ticket (spend limit, rubrics)
+[jev]
+# Off by default (HeuristicEngine only, no network). Every other key, the
+# questions and colour mappings included, defaults to
+# crates/traction-server/jev.default.toml; set only what you change.
+enabled = false
+api_key_file = "/etc/traction/typesafe-api-key"   # or api_key_env (default TYPESAFE_API_KEY)
+monthly_spend_limit_usd = 40.0
+spend_ledger_file = "/var/lib/traction/jev-spend.json"
 [heuristic]
 [anchor_policy]
 ```

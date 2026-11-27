@@ -780,3 +780,32 @@ async fn many_windows_are_batched_and_capped_at_the_busiest() {
         .collect();
     assert_eq!(counts, [4, 2]);
 }
+
+#[tokio::test]
+async fn the_server_runs_heuristic_only_unless_jev_is_enabled() {
+    let rig = Rig::new().await;
+    let mut config = Config::parse("").unwrap();
+    let engine =
+        traction_server::engine_from_config(&config, |_| None, Arc::new(|| NOW_MS)).unwrap();
+    assert_eq!(
+        engine.engine_id(),
+        "heuristic",
+        "self-hosters need no network"
+    );
+
+    config.jev = rig.config();
+    let refused = traction_server::engine_from_config(&config, |_| None, Arc::new(|| NOW_MS));
+    assert!(refused.is_err(), "enabled without a key refuses to start");
+    // `env` is an injected lookup: the real environment is never read here.
+    let engine = traction_server::engine_from_config(
+        &config,
+        |name| (name == "TYPESAFE_API_KEY").then(|| API_KEY.to_owned()),
+        Arc::new(|| NOW_MS),
+    )
+    .unwrap();
+    assert_eq!(engine.engine_id(), "jev");
+    assert_eq!(
+        decide(engine.as_ref(), &green_input()).await.engine_id,
+        "jev"
+    );
+}
