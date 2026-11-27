@@ -14,11 +14,13 @@ pub mod config;
 pub mod error;
 pub mod fanout;
 pub mod live;
+pub mod merge;
 pub mod pairing;
 pub mod partition;
 pub mod rate_limit;
 pub mod store;
 pub mod token;
+pub mod views;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};

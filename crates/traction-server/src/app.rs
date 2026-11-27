@@ -17,7 +17,7 @@ use crate::fanout::LiveFanout;
 use crate::partition::Month;
 use crate::rate_limit::RateLimiter;
 use crate::token::{bearer, hash_secret};
-use crate::{anchors, live, pairing};
+use crate::{anchors, live, pairing, views};
 
 /// Microseconds since the Unix epoch. Injectable so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -76,6 +76,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/devices/{id}", delete(pairing::revoke_device))
         .route("/v1/anchors", post(anchors::post_anchors))
         .route("/v1/live", get(live::stream))
+        .route("/v1/me", get(views::get_me).delete(views::delete_me))
+        .route("/v1/users/{user_id}/projects", get(views::list_projects))
+        .route(
+            "/v1/users/{user_id}/projects/{project_id}/timeline",
+            get(views::project_timeline),
+        )
         .layer(DefaultBodyLimit::max(cap))
         .with_state(state)
 }

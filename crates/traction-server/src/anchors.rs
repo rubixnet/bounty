@@ -15,24 +15,57 @@ use axum::http::{HeaderMap, StatusCode};
 use sqlx::PgConnection;
 use traction_core::sync::{
     AnchorStatus, HeartbeatRequest, HeartbeatResponse, ItemKind, ItemRef, ProjectMeta,
-    RejectedItem, codes, validate_project_id, validate_rollup, validate_window_not_after_tip,
-    validate_work_bucket,
+    RejectedItem, SyncMode, TimelineMark, codes, validate_project_id, validate_rollup,
+    validate_timeline_mark, validate_window_not_after_tip, validate_work_bucket,
 };
-use traction_core::{ActivityRollup, TRACTION_RULES_1, VerifyingKeyHex, WorkBucket};
+use traction_core::{ActivityRollup, MINUTE_MS, TRACTION_RULES_1, VerifyingKeyHex, WorkBucket};
 
 use crate::app::{AppState, authenticate};
 use crate::config::AnchorPolicy;
 use crate::error::ApiError;
-use crate::fanout::{LiveEvent, Totals};
+use crate::fanout::LiveEvent;
+use crate::merge::user_totals;
 use crate::partition::{self, Month};
-use crate::store::{self, StoreError};
+use crate::store::{self, StoreError, Timing};
 
 /// The result of checking a heartbeat's items against policy.
 #[derive(Debug, Default, PartialEq)]
 pub struct Classified {
     pub buckets: Vec<WorkBucket>,
     pub rollups: Vec<ActivityRollup>,
+    pub marks: Vec<TimelineMark>,
     pub rejected: Vec<RejectedItem>,
+}
+
+/// The timing tags for a bucket whose minute ended at `end_ms`, first
+/// anchored at `received_ms` (spec S2, Q11). `offline_buffered` requests are
+/// tagged as such and are never `late_anchor`: only a `realtime` window can
+/// be late.
+pub fn timing_for(mode: SyncMode, end_ms: u64, received_ms: u64, policy: &AnchorPolicy) -> Timing {
+    match mode {
+        SyncMode::OfflineBuffered => Timing {
+            late_anchor: false,
+            offline_buffered: true,
+        },
+        SyncMode::Realtime => Timing {
+            late_anchor: received_ms > end_ms.saturating_add(policy.max_anchor_lag_ms),
+            offline_buffered: false,
+        },
+    }
+}
+
+/// `server_received_at - sent_at_ms`, in milliseconds.
+pub fn skew_ms(received_ms: u64, sent_at_ms: u64) -> i64 {
+    let (received, sent) = (
+        i64::try_from(received_ms).unwrap_or(i64::MAX),
+        i64::try_from(sent_at_ms).unwrap_or(i64::MAX),
+    );
+    received.saturating_sub(sent)
+}
+
+/// Whether the device is flagged `clock_skew`: `|skew| > MAX_CLOCK_SKEW`.
+pub fn clock_skew_flagged(skew_ms: i64, policy: &AnchorPolicy) -> bool {
+    skew_ms.unsigned_abs() > policy.max_clock_skew_ms
 }
 
 /// Why a whole heartbeat is refused before any item is looked at.
@@ -129,6 +162,32 @@ pub fn classify(request: &HeartbeatRequest, now_ms: u64, policy: &AnchorPolicy) 
             }),
         }
     }
+    for mark in &request.timeline_marks {
+        let item = ItemRef {
+            kind: ItemKind::TimelineMark,
+            start_ms: mark.minute_start_ms,
+            project_id: Some(mark.project_id.clone()),
+        };
+        let verdict = validate_timeline_mark(mark)
+            .and_then(|()| validate_window_not_after_tip(mark.minute_start_ms, tip))
+            .map_err(|e| e.code())
+            .and_then(|()| {
+                if too_old(mark.minute_start_ms, now_ms, policy) {
+                    Err(codes::WINDOW_TOO_OLD)
+                } else if i64::try_from(mark.minute_start_ms).is_err() {
+                    Err("value_out_of_range")
+                } else {
+                    Ok(())
+                }
+            });
+        match verdict {
+            Ok(()) => out.marks.push(mark.clone()),
+            Err(code) => out.rejected.push(RejectedItem {
+                item,
+                code: code.into(),
+            }),
+        }
+    }
     out
 }
 
@@ -146,6 +205,12 @@ fn months_needed(classified: &Classified, received_ms: u64) -> Vec<Month> {
             .rollups
             .iter()
             .map(|r| Month::of_ms(r.window_start_ms)),
+    );
+    months.extend(
+        classified
+            .marks
+            .iter()
+            .map(|m| Month::of_ms(m.minute_start_ms)),
     );
     months.sort();
     months.dedup();
@@ -206,24 +271,6 @@ async fn upsert_project(
     .execute(conn)
     .await?;
     Ok(())
-}
-
-pub async fn user_totals(state: &AppState, user_id: &str) -> Result<Totals, sqlx::Error> {
-    let (human, credit, agent): (i64, i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(human_active_sec), 0)::bigint,
-                COALESCE(SUM(struggle_credit_sec), 0)::bigint,
-                COALESCE(SUM(agent_compute_sec), 0)::bigint
-         FROM work_buckets WHERE user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_one(&state.pool)
-    .await?;
-    let to_u64 = |v: i64| u64::try_from(v).unwrap_or(0);
-    Ok(Totals {
-        human_active_sec: to_u64(human),
-        struggle_credit_sec: to_u64(credit),
-        agent_compute_sec: to_u64(agent),
-    })
 }
 
 pub async fn post_anchors(
@@ -308,11 +355,20 @@ pub async fn post_anchors(
             .fetch_one(&mut *tx)
             .await?;
             let received_us = now_us.max(u64::try_from(last.unwrap_or(0)).unwrap_or(0) + 1);
+            let tip_late = timing_for(
+                request.sync_mode,
+                request.tip.window_start_ms + TRACTION_RULES_1.activity_rollup_ms,
+                received_us / 1000,
+                policy,
+            )
+            .late_anchor;
             sqlx::query(
                 "INSERT INTO anchors (device_id, key_id, seq, entry_hash, window_start_ms,
-                    sync_mode, sent_at_ms, server_received_us, server_received_at)
+                    sync_mode, sent_at_ms, server_received_us, server_received_at,
+                    skew_ms, late_anchor)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
-                         'epoch'::timestamptz + ($8::bigint * interval '1 microsecond'))",
+                         'epoch'::timestamptz + ($8::bigint * interval '1 microsecond'),
+                         $9, $10)",
             )
             .bind(&device.id)
             .bind(request.tip.key_id.as_str())
@@ -325,15 +381,33 @@ pub async fn post_anchors(
             })
             .bind(i64::try_from(request.sent_at_ms).unwrap_or(i64::MAX))
             .bind(i64::try_from(received_us).unwrap_or(i64::MAX))
+            .bind(skew_ms(received_us / 1000, request.sent_at_ms))
+            .bind(tip_late)
             .execute(&mut *tx)
             .await?;
             (AnchorStatus::Stored, received_us)
         }
     };
 
+    // The device is flagged `clock_skew` while its newest heartbeat's skew is
+    // beyond MAX_CLOCK_SKEW (against the server's own receive time).
+    let skew = skew_ms(received_us / 1000, request.sent_at_ms);
+    sqlx::query("UPDATE devices SET skew_ms = $1, clock_skew = $2 WHERE id = $3")
+        .bind(skew)
+        .bind(clock_skew_flagged(skew, policy))
+        .bind(&device.id)
+        .execute(&mut *tx)
+        .await?;
+
     let mut accepted = Vec::new();
     for bucket in &classified.buckets {
-        store::insert_bucket(&mut tx, &device.user_id, &device.id, bucket)
+        let timing = timing_for(
+            request.sync_mode,
+            bucket.minute_start_ms + MINUTE_MS,
+            received_us / 1000,
+            policy,
+        );
+        store::insert_bucket_timed(&mut tx, &device.user_id, &device.id, bucket, timing)
             .await
             .map_err(store_error)?;
         accepted.push(ItemRef {
@@ -350,6 +424,16 @@ pub async fn post_anchors(
             kind: ItemKind::ActivityRollup,
             start_ms: rollup.window_start_ms,
             project_id: None,
+        });
+    }
+    for mark in &classified.marks {
+        store::insert_mark(&mut tx, &device.user_id, &device.id, mark)
+            .await
+            .map_err(store_error)?;
+        accepted.push(ItemRef {
+            kind: ItemKind::TimelineMark,
+            start_ms: mark.minute_start_ms,
+            project_id: Some(mark.project_id.clone()),
         });
     }
     for meta in &request.projects {
@@ -418,6 +502,7 @@ mod tests {
             work_buckets: buckets,
             activity_rollups: vec![],
             projects: vec![],
+            timeline_marks: vec![],
         }
     }
 
@@ -438,6 +523,31 @@ mod tests {
             Err(TipError::WindowTooOld)
         );
         assert_eq!(check_tip(NOW + 1, NOW, &policy), Err(TipError::Misaligned));
+    }
+
+    #[test]
+    fn timing_tags_follow_the_anchor_policy() {
+        let policy = AnchorPolicy::default();
+        let lag = policy.max_anchor_lag_ms;
+        let end = NOW;
+        let tag = |mode, received| timing_for(mode, end, received, &policy);
+        // Exactly MAX_ANCHOR_LAG after the window ended is still on time.
+        assert_eq!(tag(SyncMode::Realtime, end + lag), Timing::default());
+        assert!(tag(SyncMode::Realtime, end + lag + 1).late_anchor);
+        // Offline-buffered is tagged as such and never late.
+        let offline = tag(SyncMode::OfflineBuffered, end + 10 * lag);
+        assert!(offline.offline_buffered && !offline.late_anchor);
+    }
+
+    #[test]
+    fn clock_skew_is_flagged_beyond_the_limit_in_either_direction() {
+        let policy = AnchorPolicy::default();
+        assert_eq!(skew_ms(NOW + 5, NOW), 5);
+        assert_eq!(skew_ms(NOW, NOW + 7), -7);
+        assert!(!clock_skew_flagged(120_000, &policy));
+        assert!(clock_skew_flagged(120_001, &policy));
+        assert!(clock_skew_flagged(-120_001, &policy));
+        assert!(!clock_skew_flagged(-120_000, &policy));
     }
 
     #[test]

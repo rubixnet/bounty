@@ -20,16 +20,23 @@ pub enum Table {
     WorkBuckets,
     ActivityRollups,
     Anchors,
+    TimelineMarks,
 }
 
 impl Table {
-    pub const ALL: [Table; 3] = [Table::WorkBuckets, Table::ActivityRollups, Table::Anchors];
+    pub const ALL: [Table; 4] = [
+        Table::WorkBuckets,
+        Table::ActivityRollups,
+        Table::Anchors,
+        Table::TimelineMarks,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Table::WorkBuckets => "work_buckets",
             Table::ActivityRollups => "activity_rollups",
             Table::Anchors => "anchors",
+            Table::TimelineMarks => "timeline_marks",
         }
     }
 }

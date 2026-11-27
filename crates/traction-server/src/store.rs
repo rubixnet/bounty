@@ -3,6 +3,7 @@
 //! cross-check is plain struct equality. Runtime `sqlx::query` only.
 
 use sqlx::{FromRow, PgConnection};
+use traction_core::sync::TimelineMark;
 use traction_core::{ActivityRollup, CategoryShareMilli, StruggleAxes, TelemetryTier, WorkBucket};
 
 /// A value Postgres' `BIGINT` cannot hold.
@@ -109,6 +110,46 @@ impl From<OutOfRange> for StoreError {
     }
 }
 
+/// The timing tags of a bucket (spec S2, Q11). They are set when the bucket
+/// is first anchored and never change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Timing {
+    /// A `realtime` bucket first anchored later than `MAX_ANCHOR_LAG` after
+    /// its minute ended.
+    pub late_anchor: bool,
+    /// Sent in an `offline_buffered` request: Logged Hours only, never proof
+    /// of timing.
+    pub offline_buffered: bool,
+}
+
+/// Stores one Timeline Mark (unsigned); `false` when already stored.
+pub async fn insert_mark(
+    conn: &mut PgConnection,
+    user_id: &str,
+    device_id: &str,
+    m: &TimelineMark,
+) -> Result<bool, StoreError> {
+    let harnesses: Vec<&str> = m.harnesses.iter().map(|h| h.as_str()).collect();
+    let result = sqlx::query(
+        "INSERT INTO timeline_marks (user_id, device_id, project_id, minute_start_ms,
+            mutations_manual, mutations_harness, turns_started, tool_failures, harnesses)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(device_id)
+    .bind(&m.project_id)
+    .bind(to_i64(m.minute_start_ms)?)
+    .bind(i64::from(m.mutations_manual))
+    .bind(i64::from(m.mutations_harness))
+    .bind(i64::from(m.turns_started))
+    .bind(i64::from(m.tool_failures))
+    .bind(harnesses)
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Stores one bucket; `false` when that `(device, project, minute, ruleset)`
 /// was already stored (stored rows never change).
 pub async fn insert_bucket(
@@ -117,13 +158,25 @@ pub async fn insert_bucket(
     device_id: &str,
     b: &WorkBucket,
 ) -> Result<bool, StoreError> {
+    insert_bucket_timed(conn, user_id, device_id, b, Timing::default()).await
+}
+
+/// [`insert_bucket`] with the timing tags set when the bucket is first anchored.
+pub async fn insert_bucket_timed(
+    conn: &mut PgConnection,
+    user_id: &str,
+    device_id: &str,
+    b: &WorkBucket,
+    timing: Timing,
+) -> Result<bool, StoreError> {
     let result = sqlx::query(
         "INSERT INTO work_buckets (user_id, device_id, project_id, minute_start_ms, ruleset_id,
             agent_compute_sec, idle_autonomous_sec, human_active_sec, permission_wait_ms,
             commits_human, commits_agent, injected_hid_detected, auto_approver_suspected,
             telemetry_tier, tier_limited, axis_steering, axis_specificity, axis_friction,
-            axis_comfort_delta, verified_struggle, struggle_credit_sec)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+            axis_comfort_delta, verified_struggle, struggle_credit_sec,
+            late_anchor, offline_buffered)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
          ON CONFLICT DO NOTHING",
     )
     .bind(user_id)
@@ -147,6 +200,8 @@ pub async fn insert_bucket(
     .bind(i64::from(b.struggle_axes.comfort_delta))
     .bind(i64::from(b.verified_struggle))
     .bind(i64::from(b.struggle_credit_sec))
+    .bind(timing.late_anchor)
+    .bind(timing.offline_buffered)
     .execute(conn)
     .await?;
     Ok(result.rows_affected() == 1)

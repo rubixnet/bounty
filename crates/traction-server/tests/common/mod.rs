@@ -305,6 +305,7 @@ pub fn heartbeat(
             project_home_relative_path: Some("~/demo".into()),
             os_username: "u".into(),
         }],
+        timeline_marks: vec![],
     }
 }
 

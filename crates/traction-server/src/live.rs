@@ -12,10 +12,10 @@ use futures_util::stream::{self, Stream};
 use serde_json::json;
 use tokio::sync::broadcast::Receiver;
 
-use crate::anchors::user_totals;
 use crate::app::{AppState, authenticate};
 use crate::error::ApiError;
 use crate::fanout::{LiveEvent, Totals, next_event};
+use crate::merge::user_totals;
 
 fn totals_event(totals: Totals) -> Event {
     Event::default().event("totals").data(
