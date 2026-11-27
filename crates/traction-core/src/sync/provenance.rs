@@ -101,7 +101,10 @@ impl SignedBuildStatement {
 }
 
 /// The tag for a device that sent `statement` (or nothing).
-pub fn tag_build(statement: Option<&SignedBuildStatement>, ci_keys: &[VerifyingKeyHex]) -> BuildTag {
+pub fn tag_build(
+    statement: Option<&SignedBuildStatement>,
+    ci_keys: &[VerifyingKeyHex],
+) -> BuildTag {
     match statement {
         Some(s) if s.verifies_against(ci_keys) => BuildTag::CiSigned,
         _ => BuildTag::SelfBuilt,
@@ -118,7 +121,8 @@ mod tests {
     }
 
     fn signed(ci: &DeviceSigningKey) -> SignedBuildStatement {
-        SignedBuildStatement::sign(ci, "0.4.0", &"a".repeat(40), "x86_64-unknown-linux-gnu").unwrap()
+        SignedBuildStatement::sign(ci, "0.4.0", &"a".repeat(40), "x86_64-unknown-linux-gnu")
+            .unwrap()
     }
 
     #[test]
@@ -132,7 +136,10 @@ mod tests {
     fn no_statement_an_unknown_key_or_no_configured_keys_is_self_built() {
         let ci = key(7);
         let statement = signed(&ci);
-        assert_eq!(tag_build(None, &[ci.verifying_key().clone()]), BuildTag::SelfBuilt);
+        assert_eq!(
+            tag_build(None, &[ci.verifying_key().clone()]),
+            BuildTag::SelfBuilt
+        );
         assert_eq!(
             tag_build(Some(&statement), &[key(8).verifying_key().clone()]),
             BuildTag::SelfBuilt

@@ -5,6 +5,7 @@
 mod common;
 
 use common::*;
+use serde_json::{Value, json};
 use traction_server::config::Config;
 
 const T0: u64 = 1_800_000_000_000;
@@ -84,4 +85,211 @@ async fn a_config_with_a_malformed_ci_key_is_reported_not_trusted() {
     let mut config = Config::default();
     config.provenance.ci_public_keys = vec!["not-a-key".into()];
     assert!(config.provenance.keys().is_err());
+}
+
+fn parse(reply: &Reply) -> Value {
+    serde_json::from_str(&reply.body).unwrap_or_else(|_| panic!("not JSON: {}", reply.body))
+}
+
+async fn get(server: &TestServer, path: &str, token: &str) -> Reply {
+    http(
+        "GET",
+        format!("{}{path}", server.base),
+        Some(token.to_owned()),
+        vec![],
+        None,
+    )
+    .await
+}
+
+const PROJECT_B: &str = "dir:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// A heartbeat whose buckets (and metadata) belong to `project`.
+fn heartbeat_in(
+    key: &traction_core::DeviceSigningKey,
+    seq: u64,
+    hash: char,
+    window: u64,
+    now: u64,
+    project: &str,
+) -> traction_core::sync::HeartbeatRequest {
+    let mut request = heartbeat(key, seq, hash, window, now);
+    for b in &mut request.work_buckets {
+        b.project_id = project.into();
+    }
+    request.projects[0].project_id = project.into();
+    request.projects[0].project_name = format!("repo-{}", &project[4..8]);
+    request
+}
+
+async fn merge_call(server: &TestServer, token: &str, from: &str, to: &str) -> Reply {
+    post_json(
+        format!("{}/v1/projects/merge", server.base),
+        Some(token.to_owned()),
+        json!({ "from_id": from, "to_id": to }).to_string(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn merging_two_devices_projects_is_alias_only_and_every_read_resolves_it() {
+    let Some(url) = database_url() else { return };
+    let now = T0 + 600_000;
+    let server = start(&url, config_trusting_ci(), Some(fixed_clock(now))).await;
+    let (key_a, key_b) = (device_key(1), device_key(2));
+    let (token_a, _) = pair(&server, &key_a, None).await;
+    let (token_b, _) = pair(&server, &key_b, None).await;
+    // The same repo seen as two Projects from two machines, in different minutes.
+    let hb_a = heartbeat_in(&key_a, 0, 'a', T0, now, PROJECT);
+    let hb_b = heartbeat_in(&key_b, 0, 'b', T0 + 240_000, now, PROJECT_B);
+    assert_eq!(send_heartbeat(&server, &token_a, &hb_a).await.status, 200);
+    assert_eq!(send_heartbeat(&server, &token_b, &hb_b).await.status, 200);
+
+    let user = parse(&get(&server, "/v1/me", &token_a).await)["user_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let list = |token: String| {
+        let (server, path) = (&server, format!("/v1/users/{user}/projects"));
+        async move { parse(&get(server, &path, &token).await) }
+    };
+    let before = list(token_a.clone()).await;
+    assert_eq!(before["projects"].as_array().unwrap().len(), 2);
+    let buckets_before: i64 = sqlx::query_scalar("SELECT count(*) FROM work_buckets")
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+
+    // Merge B's Project into A's.
+    let merged = merge_call(&server, &token_b, PROJECT_B, PROJECT).await;
+    assert_eq!(merged.status, 201, "{}", merged.body);
+
+    let after = list(token_a.clone()).await;
+    let projects = after["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["project_id"], PROJECT);
+    assert_eq!(projects[0]["merged_project_ids"], json!([PROJECT_B]));
+    // 40 + 30 s per window, two windows.
+    assert_eq!(projects[0]["human_active_sec"], 140);
+    let public = parse(
+        &http(
+            "GET",
+            format!("{}/v1/users/{user}/projects", server.base),
+            None,
+            vec![],
+            None,
+        )
+        .await,
+    );
+    assert!(public["projects"][0].get("merged_project_ids").is_none());
+
+    // The timeline of either id is the merged Project's, with both devices.
+    let path = format!(
+        "/v1/users/{user}/projects/{PROJECT_B}/timeline?from_ms={T0}&to_ms={}",
+        T0 + 360_000
+    );
+    let timeline = parse(&get(&server, &path, &token_a).await);
+    assert_eq!(timeline["project_id"], PROJECT);
+    let devices: std::collections::BTreeSet<_> = timeline["minutes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["work_buckets"].as_array().unwrap())
+        .map(|b| b["device_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(devices.len(), 2);
+
+    // Buckets were never rewritten: B's rows still carry B's Project ID.
+    let in_b: i64 = sqlx::query_scalar("SELECT count(*) FROM work_buckets WHERE project_id = $1")
+        .bind(PROJECT_B)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(in_b, 2);
+    let buckets_after: i64 = sqlx::query_scalar("SELECT count(*) FROM work_buckets")
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(buckets_before, buckets_after);
+
+    // Cycles and repeats are refused.
+    assert_eq!(
+        merge_call(&server, &token_a, PROJECT, PROJECT_B)
+            .await
+            .status,
+        409
+    );
+    assert_eq!(
+        merge_call(&server, &token_a, PROJECT, PROJECT).await.status,
+        409
+    );
+    assert_eq!(
+        merge_call(&server, &token_a, PROJECT_B, PROJECT)
+            .await
+            .status,
+        409
+    );
+
+    // Unmerging deletes the alias and restores the two Projects.
+    let unmerge = http(
+        "DELETE",
+        format!("{}/v1/projects/merge/{PROJECT_B}", server.base),
+        Some(token_a.clone()),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(unmerge.status, 204);
+    assert_eq!(list(token_a).await["projects"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn only_the_users_own_projects_can_be_merged() {
+    let Some(url) = database_url() else { return };
+    let now = T0 + 600_000;
+    let server = start(&url, config_trusting_ci(), Some(fixed_clock(now))).await;
+    let key = device_key(1);
+    let (token, _) = pair(&server, &key, None).await;
+    assert_eq!(
+        send_heartbeat(
+            &server,
+            &token,
+            &heartbeat_in(&key, 0, 'a', T0, now, PROJECT)
+        )
+        .await
+        .status,
+        200
+    );
+    // Another account's Project.
+    sqlx::query("INSERT INTO users (id, sub, display_name) VALUES ('u2', 'other', 'o')")
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO projects (user_id, project_id, project_name, root_path, os_username, updated_at_ms)
+         VALUES ('u2', $1, 'x', '/x', 'o', 0)",
+    )
+    .bind(PROJECT_B)
+    .execute(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        merge_call(&server, &token, PROJECT, PROJECT_B).await.status,
+        404
+    );
+    assert_eq!(
+        merge_call(&server, &token, PROJECT_B, PROJECT).await.status,
+        404
+    );
+    // A Project the account has never synced reads as not found too.
+    let unknown = format!("dir:{}", "c".repeat(64));
+    assert_eq!(
+        merge_call(&server, &token, &unknown, PROJECT).await.status,
+        404
+    );
+    let aliases: i64 = sqlx::query_scalar("SELECT count(*) FROM project_aliases")
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(aliases, 0);
 }

@@ -393,11 +393,9 @@ pub async fn post_anchors(
     // beyond MAX_CLOCK_SKEW (against the server's own receive time).
     let skew = skew_ms(received_us / 1000, request.sent_at_ms);
     if let Some(statement) = &request.build {
-        let keys = state
-            .config
-            .provenance
-            .keys()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_misconfigured"))?;
+        let keys = state.config.provenance.keys().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_misconfigured")
+        })?;
         let info = crate::provenance::classify(Some(statement), &keys);
         crate::provenance::record_device_build(&mut tx, &device.id, &info).await?;
     }

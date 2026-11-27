@@ -56,9 +56,11 @@ fn to_u64(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
-/// The user's merged totals per Project. The SQL sums are raw; only minutes
-/// whose raw total exceeds the cap (the only ones the merge can change) are
-/// loaded and replaced by their merged figures.
+/// The user's merged totals per Project, keyed by the Project each stored
+/// Project resolves to (alias-only Project merge: buckets are never
+/// rewritten). The SQL sums are raw; only minutes whose raw total exceeds the
+/// cap (the only ones the merge can change) are loaded and replaced by their
+/// merged figures.
 pub async fn project_totals(
     pool: &PgPool,
     user_id: &str,
@@ -105,7 +107,15 @@ pub async fn project_totals(
                 + u64::from(after.struggle_credit_sec);
         }
     }
-    Ok(totals)
+    let aliases = crate::aliases::load(pool, user_id).await?;
+    let mut resolved: BTreeMap<String, Totals> = BTreeMap::new();
+    for (project, t) in totals {
+        let slot = resolved.entry(aliases.resolve(&project)).or_default();
+        slot.human_active_sec += t.human_active_sec;
+        slot.struggle_credit_sec += t.struggle_credit_sec;
+        slot.agent_compute_sec += t.agent_compute_sec;
+    }
+    Ok(resolved)
 }
 
 /// Merged Logged Hours totals of a user: what live totals report.

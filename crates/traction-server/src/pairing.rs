@@ -52,11 +52,10 @@ pub async fn start(
     if request.device_label.len() > 200 {
         return Err(ApiError::bad_request("label_too_long"));
     }
-    let keys = state
-        .config
-        .provenance
-        .keys()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_misconfigured"))?;
+    let keys =
+        state.config.provenance.keys().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_misconfigured")
+        })?;
     let build = crate::provenance::classify(request.build.as_ref(), &keys);
     let now = state.now_ms();
     let poll_secret = random_hex(32);

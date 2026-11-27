@@ -11,6 +11,7 @@
 //! (`DecisionEngine` seam), `heuristic` and `submission` (bundle upload,
 //! verification and triage).
 
+pub mod aliases;
 pub mod anchors;
 pub mod app;
 pub mod auth;

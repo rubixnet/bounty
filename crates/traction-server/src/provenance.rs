@@ -60,10 +60,7 @@ pub async fn record_device_build(
 }
 
 /// Whether the device is tagged `self_built`.
-pub async fn is_self_built(
-    pool: &sqlx::PgPool,
-    device_id: &str,
-) -> Result<bool, sqlx::Error> {
+pub async fn is_self_built(pool: &sqlx::PgPool, device_id: &str) -> Result<bool, sqlx::Error> {
     let tag: String = sqlx::query_scalar("SELECT build_tag FROM devices WHERE id = $1")
         .bind(device_id)
         .fetch_one(pool)

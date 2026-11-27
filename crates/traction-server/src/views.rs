@@ -177,8 +177,11 @@ pub async fn list_projects(
     .fetch_all(&state.pool)
     .await?;
     let totals = project_totals(&state.pool, &user_id).await?;
+    // A merged-away Project is listed under the Project it resolves to.
+    let aliases = crate::aliases::load(&state.pool, &user_id).await?;
     let projects: Vec<Value> = rows
         .into_iter()
+        .filter(|row| !aliases.is_alias(&row.project_id))
         .map(|row| {
             let t = totals.get(&row.project_id).copied().unwrap_or_default();
             let mut project = json!({
@@ -196,6 +199,12 @@ pub async fn list_projects(
                 );
                 object.insert("os_username".into(), json!(row.os_username));
                 object.insert("linked_repo".into(), json!(row.linked_repo));
+                let merged: Vec<String> = aliases
+                    .members_of(&row.project_id)
+                    .into_iter()
+                    .filter(|id| *id != row.project_id)
+                    .collect();
+                object.insert("merged_project_ids".into(), json!(merged));
             }
             project
         })
@@ -214,6 +223,7 @@ pub struct RangeQuery {
 
 #[derive(sqlx::FromRow)]
 struct BucketDetail {
+    project_id: String,
     device_id: String,
     minute_start_ms: i64,
     agent_compute_sec: i64,
@@ -299,6 +309,10 @@ pub async fn project_timeline(
         i64::try_from(range.to_ms).map_err(|_| ApiError::unprocessable("bad_range"))?,
     );
     let from = minute_of(from);
+    // The Project and every Project merged into it (alias-only merge).
+    let aliases = crate::aliases::load(&state.pool, &user_id).await?;
+    let project_id = aliases.resolve(&project_id);
+    let members = aliases.members_of(&project_id);
 
     // Merge over every Project of the user: the cap is per user and minute.
     let shares: Vec<ShareRow> = sqlx::query_as(
@@ -315,16 +329,16 @@ pub async fn project_timeline(
     let merged = merge_rows(&shares);
 
     let buckets: Vec<BucketDetail> = sqlx::query_as(
-        "SELECT device_id, minute_start_ms, agent_compute_sec, idle_autonomous_sec,
+        "SELECT project_id, device_id, minute_start_ms, agent_compute_sec, idle_autonomous_sec,
                 human_active_sec, permission_wait_ms, commits_human, commits_agent,
                 injected_hid_detected, auto_approver_suspected, telemetry_tier, tier_limited,
                 verified_struggle, struggle_credit_sec, late_anchor, offline_buffered
          FROM work_buckets
-         WHERE user_id = $1 AND project_id = $2 AND minute_start_ms >= $3 AND minute_start_ms < $4
+         WHERE user_id = $1 AND project_id = ANY($2) AND minute_start_ms >= $3 AND minute_start_ms < $4
          ORDER BY minute_start_ms, device_id",
     )
     .bind(&user_id)
-    .bind(&project_id)
+    .bind(&members)
     .bind(from)
     .bind(to)
     .fetch_all(&state.pool)
@@ -333,22 +347,22 @@ pub async fn project_timeline(
         "SELECT device_id, minute_start_ms, mutations_manual, mutations_harness, turns_started,
                 tool_failures, harnesses
          FROM timeline_marks
-         WHERE user_id = $1 AND project_id = $2 AND minute_start_ms >= $3 AND minute_start_ms < $4
+         WHERE user_id = $1 AND project_id = ANY($2) AND minute_start_ms >= $3 AND minute_start_ms < $4
          ORDER BY minute_start_ms, device_id",
     )
     .bind(&user_id)
-    .bind(&project_id)
+    .bind(&members)
     .bind(from)
     .bind(to)
     .fetch_all(&state.pool)
     .await?;
     let commits: Vec<CommitDetail> = sqlx::query_as(
         "SELECT oid, authored_at_ms, committed_at_ms, author_match FROM project_commits
-         WHERE user_id = $1 AND project_id = $2 AND committed_at_ms >= $3 AND committed_at_ms < $4
+         WHERE user_id = $1 AND project_id = ANY($2) AND committed_at_ms >= $3 AND committed_at_ms < $4
          ORDER BY committed_at_ms, oid",
     )
     .bind(&user_id)
-    .bind(&project_id)
+    .bind(&members)
     .bind(from)
     .bind(to)
     .fetch_all(&state.pool)
@@ -368,7 +382,7 @@ pub async fn project_timeline(
 
     let mut minutes: BTreeMap<i64, MinuteEntry> = BTreeMap::new();
     for b in buckets {
-        let key = (b.device_id.clone(), project_id.clone(), b.minute_start_ms);
+        let key = (b.device_id.clone(), b.project_id.clone(), b.minute_start_ms);
         let merged_share = merged.get(&key).copied();
         let entry = minutes.entry(b.minute_start_ms).or_default();
         let (human, credit, overlap) =

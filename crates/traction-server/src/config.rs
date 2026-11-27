@@ -309,10 +309,7 @@ impl Default for Github {
 
 impl Github {
     /// The App private key (PEM) from its file or environment variable.
-    pub fn private_key(
-        &self,
-        env: impl Fn(&str) -> Option<String>,
-    ) -> Result<String, ConfigError> {
+    pub fn private_key(&self, env: impl Fn(&str) -> Option<String>) -> Result<String, ConfigError> {
         if let Some(path) = &self.private_key_file {
             return std::fs::read_to_string(path)
                 .map_err(|_| ConfigError::MissingSecret("private_key_file".into()));
@@ -338,8 +335,9 @@ impl Provenance {
         self.ci_public_keys
             .iter()
             .map(|text| {
-                traction_core::VerifyingKeyHex::parse(text)
-                    .map_err(|_| ConfigError::Parse("`provenance.ci_public_keys` has a malformed key".into()))
+                traction_core::VerifyingKeyHex::parse(text).map_err(|_| {
+                    ConfigError::Parse("`provenance.ci_public_keys` has a malformed key".into())
+                })
             })
             .collect()
     }
