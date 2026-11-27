@@ -218,3 +218,107 @@ async fn a_real_daemon_pairs_syncs_and_the_live_total_goes_up() {
     assert_eq!(modes, ["offline_buffered"]);
     daemon.shutdown().unwrap();
 }
+
+/// `traction submit` from a real daemon's data folder: the daemon sealed and
+/// synced its chain, then the CLI exports, uploads to the local blob store
+/// and completes. The real export must equal the live-synced rows (no false
+/// Red), and the 3-hour-old backlog makes it Yellow `offline_buffered`.
+#[tokio::test]
+async fn traction_submit_sends_a_real_daemons_bundle_and_the_server_triages_it() {
+    let Some(url) = database_url() else { return };
+    let blobs = tempfile::tempdir().unwrap();
+    let mut server_config = Config::default();
+    server_config.blob.local_dir = blobs.path().to_string_lossy().into_owned();
+    let server = start(&url, server_config, None).await;
+    let data = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let t0 = (now - 3 * 60 * 60 * 1000) / WINDOW * WINDOW;
+    let project = dir_project('d');
+
+    let mut config = DaemonConfig::new(data.path().to_path_buf());
+    config.home_dir = Some(home.path().to_path_buf());
+    only_sync(&mut config);
+    #[cfg(unix)]
+    {
+        config.socket_path = data.path().join("daemon.sock");
+    }
+    config.sync.enabled = false;
+    traction_daemon::start(config.clone())
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    seed(data.path(), t0, 4, &project);
+    finalize_settled(
+        data.path(),
+        t0 + 4 * WINDOW + TRACTION_RULES_1.bucket_settle_ms + TRACTION_RULES_1.context_fwd_ms(),
+    )
+    .unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let options = LoginOptions {
+        data_dir: data.path().to_path_buf(),
+        server_url: server.base.clone(),
+        open_browser: true,
+        poll_interval: Duration::from_millis(50),
+        timeout: Duration::from_secs(30),
+    };
+    let login = tokio::task::spawn_blocking(move || {
+        traction_daemon::login(&options, &mut Vec::new(), &move |url| {
+            tx.send(url.to_owned()).unwrap();
+        })
+    });
+    let login_url = tokio::task::spawn_blocking(move || rx.recv().unwrap())
+        .await
+        .unwrap();
+    approve(&server, &login_url).await;
+    login.await.unwrap().expect("login completes");
+
+    config.sync.enabled = true;
+    let daemon = traction_daemon::start(config).unwrap();
+    let mut anchored = 0i64;
+    for _ in 0..200 {
+        anchored = sqlx::query_scalar("SELECT count(*) FROM anchors")
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+        if anchored == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(anchored, 2, "the daemon synced its whole chain");
+    daemon.shutdown().unwrap();
+
+    let dir = data.path().to_path_buf();
+    let id = tokio::task::spawn_blocking(move || traction_daemon::submit_project(&dir, &project))
+        .await
+        .unwrap()
+        .expect("traction submit succeeds");
+    let (verdict, reasons, engine, failure): (String, Vec<String>, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT verdict, reasons, engine_id, failure FROM triage_decisions WHERE bundle_id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(failure, None, "{reasons:?}");
+    assert_eq!(engine, "heuristic");
+    assert_eq!(verdict, "yellow", "{reasons:?}");
+    assert!(
+        reasons.contains(&"offline_buffered".to_owned()),
+        "{reasons:?}"
+    );
+    assert!(
+        blobs
+            .path()
+            .join("bundles")
+            .join(format!("{id}.json"))
+            .exists(),
+        "the bundle is in the blob store"
+    );
+}
